@@ -302,7 +302,21 @@ class TestLeafOnlyPopulationIsRecorded:
     #:   refresh-chain state is never listable from inside the namespace;
     #: * ``redaction-allow`` -- the reader's allowed link hosts, sealed read-only
     #:   so an agent cannot allow the host it wants to send conversation data to.
-    EXPECTED: dict[str, int] = {"standard": 244, "cc": 251, "strict": 252}
+    #:
+    #: Two more landed with the app contribution protocol, both at the data-home
+    #: root for the same reason -- the record has to sit OUTSIDE any app's own
+    #: directory, because it is what bounds that app -- so leaf-only is again the
+    #: only hold available, and 2 x 3 spellings is the +6 per tier below:
+    #:
+    #: * ``app-unit-approvals.json`` -- the operator's per-app unit-kind
+    #:   approvals. ``approved_unit_kinds`` intersects an app's own runtime
+    #:   declaration with this file, so it is the only thing between that
+    #:   declaration and read/append access to a crew member's whole log;
+    #: * ``app-unit-approvals.json.lock`` -- its advisory lock, sealed because the
+    #:   lock IS an inode: a process that can unlink and recreate it leaves two
+    #:   writers locking different inodes, and the loser's read-modify-write then
+    #:   erases the approval the winner just recorded.
+    EXPECTED: dict[str, int] = {"standard": 250, "cc": 257, "strict": 258}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:
