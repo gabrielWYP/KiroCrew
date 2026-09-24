@@ -61,6 +61,12 @@ class TestRebaseConflictTailIsRedactedBeforeTheBound:
             return "origin"
 
         monkeypatch.setattr(repository, "_upstream_remote", _remote)
+        # `_rebase_locked` refuses before it fetches unless the base branch was
+        # STATED by the repository rather than guessed from it. These tests are
+        # about the conflict tail's redaction, so state it and let the flow reach
+        # the rebase -- without this the refusal returns first and the assertion
+        # below reports that nothing was exercised.
+        monkeypatch.setattr(repository, "_BASE_BRANCH_POSITIVE", True)
         out = await worktree_ops._rebase_locked({"path": str(tmp_path)})
         assert rebase_calls, "the rebase was never attempted, so this exercised nothing"
         return out

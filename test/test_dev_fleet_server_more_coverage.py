@@ -651,7 +651,10 @@ async def test_load_trusted_helpers_skips_unverifiable_and_counts(monkeypatch, c
     assert helpers is not None
     values = [v for k, v in helpers.items() if k.startswith("GIT_CONFIG_VALUE_")]
     assert values == ["osxkeychain"]
-    assert helpers["GIT_CONFIG_COUNT"] == "5"
+    # Derived, not spelled: the loader offsets by the neutralizer count
+    # (repository.py reads the same key), so adding a pin must not edit this.
+    base = int(runtime._GIT_ENV_NEUTRALIZERS["GIT_CONFIG_COUNT"])
+    assert helpers["GIT_CONFIG_COUNT"] == str(base + 1)
     assert "store" not in caplog.text
     assert "credential.helper" in caplog.text
 
@@ -668,7 +671,9 @@ async def test_load_trusted_helpers_caps_at_nine_entries(monkeypatch):
     helpers = runtime._GIT_TRUSTED_HELPERS
     assert helpers is not None
     assert len([k for k in helpers if k.startswith("GIT_CONFIG_KEY_")]) == 9
-    assert helpers["GIT_CONFIG_COUNT"] == "13"
+    # Derived for the same reason as above: 9 admitted helpers on top of the pins.
+    base = int(runtime._GIT_ENV_NEUTRALIZERS["GIT_CONFIG_COUNT"])
+    assert helpers["GIT_CONFIG_COUNT"] == str(base + 9)
 
 
 @pytest.mark.asyncio
