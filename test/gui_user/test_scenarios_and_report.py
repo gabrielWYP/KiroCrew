@@ -62,6 +62,7 @@ SHIPPED = SHIPPED_SMOKE | {
     "crewmate-panel-tabs",
     "crewmate-reply-thread",
     "crewmate-team-view",
+    "customize-tabs",
     "knowledge-add-folder-source-and-scan",
     "meet-crewmates-flow",
     "members-dm-hello",
@@ -201,6 +202,7 @@ class TestShippedScenarios:
             "capabilities": [
                 "capabilities-agents-list-and-open-editor",
                 "capabilities-skills-filter-and-open-builtin",
+                "customize-tabs",
             ],
             "connections": ["connections-services-search-and-mcp-list"],
             "memory": ["memory-open-browser-from-overview"],
