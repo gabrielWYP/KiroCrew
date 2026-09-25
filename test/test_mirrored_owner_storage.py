@@ -24,14 +24,14 @@ therefore covered on the commit that introduces it, with no edit here. A list of
 covered modules would be a second thing to remember, which is the same failure the
 rule is about.
 
-Six modules in this package hold such a mapping today, so the rule is enforced as
-a RATCHET rather than as a flat universal. ``_KNOWN_RESOLVED_OWNER_MIRRORS`` names
-those six, and the assertions run in both directions against it: a mirroring
-module OUTSIDE that set must satisfy the rule, and a module INSIDE it must still
-violate the rule, so a module that gets converted has to be de-listed and the set
-can only shrink. A seventh violator reddens on the commit that introduces it, and a
-name that stops violating reddens until it leaves the list. The set is therefore a
-measurement of where the package stands, not permission to stay there.
+No module in this package holds such a mapping any more, so
+``_KNOWN_RESOLVED_OWNER_MIRRORS`` is empty and the rule now binds every module the
+scan finds. The assertions still run in both directions against that set: a mirroring
+module OUTSIDE it must satisfy the rule, and a module INSIDE it must still violate the
+rule, so a module that gets converted has to be de-listed and the set can only shrink.
+Reaching zero is what that ratchet was for. Any violator reddens on the commit that
+introduces it, and a name put back reddens until it leaves the list again. The set is
+therefore a measurement of where the package stands, not permission to stay there.
 
 Two guards keep that generation honest, because a case list derived from a detector
 goes SILENT rather than red when the detector stops matching:
@@ -180,22 +180,14 @@ MIRRORING = _mirroring_modules()
 MIRRORING_IDS = [name for name, _text in MIRRORING]
 
 # The modules in this package that hold a mapping to resolved owner MODULES, as the
-# source scan above finds them. RATCHET: this set may only SHRINK. Converting a module
-# to hold dotted names and resolve them per use means de-listing it here, and a name
-# left behind after its conversion fails ``test_only_baseline_modules_violate_the_rule``
+# source scan above finds them. RATCHET: this set may only SHRINK, and it has reached
+# empty -- every module the scan finds now satisfies the rule outright. Converting a
+# module to hold dotted names and resolve them per use means de-listing it here, and a
+# name left behind after its conversion fails ``test_only_baseline_modules_violate_the_rule``
 # in the other direction. Do NOT add a name here to make a red go away: a new mirroring
 # module that stores resolved owners is the defect this file exists to catch, and the
 # fix is the conversion, which is a handful of lines per module.
-_KNOWN_RESOLVED_OWNER_MIRRORS = frozenset(
-    {
-        "kiro_crew.config",
-        "kiro_crew.crew_log",
-        "kiro_crew.dashboard",
-        "kiro_crew.diag",
-        "kiro_crew.mcp_gateway",
-        "kiro_crew.stt",
-    }
-)
+_KNOWN_RESOLVED_OWNER_MIRRORS: frozenset[str] = frozenset()
 
 #: The mirroring modules the rule binds with no exception, which is every one the scan
 #: finds minus the baseline. The purge cases below run over these, so a module that
