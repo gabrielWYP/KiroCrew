@@ -13,10 +13,10 @@ import socket
 import stat
 import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import quote
 
 from aiohttp import web
@@ -2209,6 +2209,27 @@ def _resolved_bound_port(runner: web.AppRunner, port: int) -> int:
     return 0
 
 
+def _resolved_bound_host(runner: web.AppRunner, requested: str) -> str:
+    """The address actually bound, falling back to the *requested* one.
+
+    A credential is keyed by a listener, and a listener is an address AND a port.
+    Reading the sockname rather than trusting the requested value keeps the key
+    paired with what the kernel bound, which is what a client dials.
+
+    Returns ``""`` when neither is readable, which suppresses the listener-keyed
+    publication rather than filing the credential under a guess. A reader that
+    finds no entry refuses, so the empty case costs an explicit sign-in instead
+    of pointing a client at the wrong listener.
+    """
+    for addr in runner.addresses:
+        # Same sockname shape as _resolved_bound_port; a unix socket's is a str.
+        if isinstance(addr, (tuple, list)) and len(addr) >= 2 and isinstance(addr[1], int):
+            host = addr[0]
+            if isinstance(host, str) and host:
+                return host
+    return requested if isinstance(requested, str) else ""
+
+
 async def _start_site(
     site: web.TCPSite,
     port: int,
@@ -2445,6 +2466,102 @@ def _remove_stale_unix_socket(path: Path) -> None:
         logger.warning("could not remove stale dashboard socket %s: %s", path, exc)
 
 
+SECONDARY_LOOPBACK_FOR = {"127.0.0.1": "::1", "::1": "127.0.0.1"}
+
+
+class SecondaryLoopback(NamedTuple):
+    """The second loopback listener: the address it holds, and its live site.
+
+    The site is carried, not discarded, because the address alone cannot be
+    maintained. A published sidecar asserts that this gateway holds this address
+    NOW, and the only object that can answer whether it still does -- or rebind
+    it when it does not -- is the site's own LISTEN socket. Returning the address
+    by itself made the claim permanent and the listener unguardable at once.
+    """
+
+    address: str
+    site: web.SockSite
+
+
+async def _start_secondary_loopback_site(
+    runner: web.AppRunner, port: int, primary_host: str
+) -> SecondaryLoopback | None:
+    """Additionally serve the OTHER loopback family on the same port.
+
+    A client reaching the gateway by name rather than by address dials
+    ``localhost``, which resolves to BOTH loopback families on an ordinary host.
+    That name therefore identifies a SET of listeners, and whichever family the
+    gateway did not bind is free for a co-resident process to take -- so a
+    credential sent to the name can land on a party the gateway never was. Two
+    ways out: rewrite the name to a literal at every call site, which moves the
+    document's web origin and splits every comparison that holds the configured
+    string; or hold both families, so the name can only reach this gateway.
+
+    This is the second. Binding ``::1`` beside ``127.0.0.1`` (or the reverse)
+    makes the ambiguity harmless rather than routed around, and the evidence a
+    client needs is already published: one ``run/gateway-<port>-<address>.secret``
+    per bound address, so "this gateway holds every family the name reaches" is
+    readable from local disk with nothing asked of the peer.
+
+    Strictly additive, in the sense ``_start_unix_site`` established: same
+    :class:`web.AppRunner`, so both listeners serve the identical app and
+    middleware chain, and ANY failure logs once and leaves the primary listener
+    exactly as it is. Failure is the interesting case and it is safe: without the
+    second entry a client dialling the name finds a family uncovered, refuses to
+    send its secret, and falls through to the token prompt. That is one explicit
+    sign-in, and it is the same cost a single-family gateway already pays.
+
+    Deliberately NOT using the reclaim/retry ladder that guards the primary bind.
+    A process already holding the other family's socket is precisely the threat
+    this exists to exclude; reclaiming it would terminate a stranger's listener,
+    and waiting for it would delay boot for a port the gateway does not need.
+    One attempt, then degrade.
+
+    Only the two loopback literals have a counterpart. A wildcard or an
+    interface-specific bind is not a loopback family pair, and
+    ``KIROCREW_BIND=<something else>`` is an operator naming one listener on
+    purpose, so neither gets a second socket.
+
+    Returns the address actually bound together with its live site, or ``None``
+    when there is no second listener -- which the caller treats as "publish one
+    address, not two". The site goes back to the caller so the listener can be
+    guarded and its sidecar withdrawn if it dies: see
+    :func:`_arm_secondary_listener_guard`.
+    """
+    secondary = SECONDARY_LOOPBACK_FOR.get(primary_host)
+    if secondary is None:
+        return None
+    try:
+        # Offloaded for the same reason as the primary reservation: getaddrinfo
+        # and bind are blocking syscalls (no-blocking-call-on-event-loop).
+        sock = await asyncio.to_thread(_bind_once, secondary, port)
+    except OSError as exc:
+        logger.info(
+            "second loopback listener on [%s]:%d unavailable (%s); clients dialling a "
+            "name that resolves there will sign in explicitly",
+            secondary,
+            port,
+            exc,
+        )
+        return None
+    try:
+        site = web.SockSite(runner, sock)
+        await site.start()
+    except Exception as exc:
+        with contextlib.suppress(OSError):
+            sock.close()
+        logger.info(
+            "second loopback listener on [%s]:%d could not start (%s); the primary "
+            "listener is unaffected",
+            secondary,
+            port,
+            exc,
+        )
+        return None
+    logger.info("dashboard also listening on [%s]:%d", secondary, port)
+    return SecondaryLoopback(secondary, site)
+
+
 async def _start_unix_site(runner: web.AppRunner, port: int) -> Path | None:
     """Additionally serve the internal API on a unix socket (POSIX only).
 
@@ -2533,14 +2650,26 @@ def _live_sibling_port(own_port: int) -> int | None:
     return None
 
 
-def _write_instance_credentials(secret_path: Path, port: int, secret: str) -> None:
+def _write_instance_credentials(
+    secret_path: Path,
+    port: int,
+    host: str,
+    secret: str,
+    extra_hosts: Sequence[str] = (),
+) -> None:
     """Publish this gateway's internal-API credential.
 
-    Writes two files with different lifetimes:
+    Writes up to three files with different lifetimes:
 
-    * ``run/gateway-<port>.secret`` -- ALWAYS. Paired with the listener, so a
-      client that resolved a port reads the credential of the process that owns
-      that port rather than whichever gateway wrote the shared file last.
+    * ``run/gateway-<port>.secret`` -- ALWAYS, and FIRST. Paired with the port
+      rather than the listener, for readers that resolve a port and nothing
+      finer. First because it is load-bearing for boot: a pod waits on it.
+    * ``run/gateway-<port>-<address>.secret`` -- whenever the bound address is
+      known. Names ONE listener, so a client that dialled a specific address
+      either reads the credential of the party it reached or reads nothing. A
+      port number alone cannot carry that: ``KIROCREW_BIND=::1`` leaves IPv4
+      ``127.0.0.1:<port>`` free for a co-resident to take, and a port-keyed
+      lookup would hand that co-resident this gateway's credential.
     * ``.local_secret`` -- only when no other gateway in this data home is
       verifiably alive on a different port. Overwriting it while a sibling is
       serving is the desync this guard exists to prevent: the sibling keeps
@@ -2550,9 +2679,47 @@ def _write_instance_credentials(secret_path: Path, port: int, secret: str) -> No
       is still written in the single-instance case because pre-per-port clients
       (an older CLI, a cron script from a previous install) read only that path.
 
+    The listener-keyed write is CONTAINED rather than fatal, and it is ordered
+    after the credential a booting pod waits on. ``_write_secret_file`` raises
+    ``OSError`` on any failure -- including a Windows DACL apply that cannot
+    resolve the invoking SID -- and the caller answers an ``OSError`` here by
+    tearing the runner down, so letting this one propagate would let an extra
+    artifact stop the gateway from starting at all. Its absence is safe in a way
+    that is not true of the others: a client that finds no entry for the address
+    it dialled refuses and asks for a token, so the cost is one explicit
+    sign-in.
+
+    An empty *host* suppresses the listener-keyed write for the same reason
+    rather than filing the credential under a guessed address.
+
     Blocking fs I/O; the caller offloads this whole function.
     """
     _write_secret_file(run_marker.secret_path(int(port)), secret)
+    # One sidecar per address this generation actually bound. The SET of them is
+    # what a client reads to answer "does this gateway hold every family the host
+    # I am dialling can resolve to?" -- so a gateway holding both loopback
+    # families publishes two, and a name that resolves to either reaches only
+    # this gateway. A single-family gateway publishes one, and a client dialling
+    # the name finds a family uncovered and signs in explicitly instead.
+    for address in dict.fromkeys(a for a in (host, *extra_hosts) if a):
+        listener_path = run_marker.listener_secret_path(int(port), address)
+        try:
+            _write_secret_file(listener_path, secret)
+        except OSError:
+            # Named, not silent: a client dialling this address falls through to
+            # the sign-in prompt, and the operator should be able to see why.
+            # Only the file NAME is logged, never a value read from it.
+            logger.warning(
+                "Could not publish the listener sidecar %s; clients dialling that "
+                "address will sign in explicitly instead.",
+                listener_path.name,
+                exc_info=True,
+            )
+        else:
+            # Recorded only on success, so shutdown deletes exactly what this
+            # generation put on disk and never a sibling's entry (see
+            # run_marker.clear_marker).
+            run_marker.note_published_listener(int(port), address)
     sibling = _live_sibling_port(int(port))
     if sibling is not None:
         logger.warning(
@@ -3964,8 +4131,11 @@ def build_host_canonical_redirect(canonical_host: str) -> Any:
             canonical_host,
             method=request.method,
             sec_fetch_dest=request.headers.get("Sec-Fetch-Dest"),
+            carries_credential=bool(request.query.get("token")),
         ):
-            # Preserve port + path + query (including ?token=) — only host changes.
+            # Preserve port + path + query -- only host changes. A navigation
+            # carrying ?token= never reaches here, so that query cannot be moved
+            # to a host other than the one it was addressed to.
             raise web.HTTPFound(location=str(request.url.with_host(canonical_host)))
         return await handler(request)  # type: ignore[operator]
 
@@ -4091,19 +4261,27 @@ def _register_prevent_sleep_shutdown(app: web.Application, state: DashboardState
 
 
 def _register_listener_guard_shutdown(app: web.Application, state: DashboardState) -> None:
-    """Register the on_cleanup hook that detaches the listener guard.
+    """Register the on_cleanup hook that detaches the listener guard(s).
 
     MUST be called BEFORE ``runner.setup()`` freezes the app's signal lists. The
     guard is created after the TCP site binds (:func:`_arm_listener_guard`) and
     resolved here lazily via ``getattr``. Detaching first matters: cleanup stops
     every site, and a guard still armed would read its own site's closed
     listener as a lost one and try to rebind it mid-shutdown.
+
+    Both guards are detached, SECONDARY FIRST, because that is the reverse of the
+    order they were armed and the order is load-bearing. ``arm()`` captures the
+    handler it displaced and delegates to it, so the secondary guard sits in
+    front of the primary, and each guard restores its neighbour only while it is
+    still the installed handler. Detaching the primary first therefore restores
+    nothing and leaves the secondary's handler installed on the loop for good.
     """
 
     async def _listener_guard_shutdown(app_: web.Application) -> None:
-        guard = getattr(state, "_listener_guard", None)
-        if guard is not None:
-            guard.stop()
+        for attr in ("_secondary_listener_guard", "_listener_guard"):
+            guard = getattr(state, attr, None)
+            if guard is not None:
+                guard.stop()
 
     app.on_cleanup.append(_listener_guard_shutdown)
 
@@ -4139,9 +4317,161 @@ def _arm_listener_guard(
     if not getattr(getattr(site, "_server", None), "sockets", None):
         return
 
-    guard = ListenerGuard(runner, site, shutdown_event, bind_factory=_bind_once)
+    guard = ListenerGuard(
+        runner,
+        site,
+        shutdown_event,
+        bind_factory=_bind_once,
+        # The primary's listener-keyed sidecar is subject to the same invariant
+        # as the secondary's: it claims this gateway holds that address NOW, and
+        # a rebind window is a stretch of time when nobody holds it. The
+        # port-keyed credential is deliberately untouched -- it names the
+        # generation, not a listener, and a booting pod waits on it.
+        on_listener_lost=lambda: _withdraw_listener_sidecar(state, "primary"),
+        on_listener_restored=lambda: _republish_listener_sidecar(state, "primary"),
+    )
     guard.arm()
     state._listener_guard = guard
+
+
+def _withdraw_listener_sidecar(state: DashboardState, which: str) -> None:
+    """Stop advertising one listener's address while this gateway does not hold it."""
+    claim = getattr(state, "_listener_sidecars", {}).get(which)
+    if claim is None:
+        return
+    port, address, _secret = claim
+    if run_marker.withdraw_published_listener(port, address):
+        logger.warning(
+            "Withdrew the %s listener sidecar for [%s]:%d: this gateway no longer holds "
+            "that address, so clients dialling a name that resolves there will sign in "
+            "explicitly instead of sending a credential to whoever takes it.",
+            which,
+            address,
+            port,
+        )
+
+
+def _republish_listener_sidecar(state: DashboardState, which: str) -> None:
+    """Re-advertise a listener's address after a rebind has actually bound it."""
+    claim = getattr(state, "_listener_sidecars", {}).get(which)
+    if claim is None:
+        return
+    port, address, secret = claim
+    if not secret:
+        return
+    try:
+        _write_secret_file(run_marker.listener_secret_path(port, address), secret)
+    except OSError:
+        logger.warning(
+            "Could not re-publish the %s listener sidecar for [%s]:%d after a rebind; "
+            "clients dialling that address will sign in explicitly.",
+            which,
+            address,
+            port,
+            exc_info=True,
+        )
+        return
+    run_marker.note_published_listener(port, address)
+
+
+def _note_listener_sidecar(
+    state: DashboardState, which: str, port: int, address: str, secret: str
+) -> None:
+    """Tell the guards which sidecar each listener owns, so they can maintain it.
+
+    Called AFTER publication, because a claim that was never written must not be
+    withdrawn or re-published. Recorded on *state* rather than captured in the
+    guard's closure because the guard is armed at bind time, before the resolved
+    port and the bound address are known -- the hooks resolve the claim when they
+    fire instead.
+
+    The credential rides along, and that is not a second copy of it: ``secret`` is
+    the same immutable ``str`` object already held as ``app["local_secret"]`` for
+    the auth middleware to compare against, so the process's exposure is
+    unchanged. The alternative -- reading the value back off the port-keyed
+    sidecar at re-publication time -- would make a rebind trust a file instead of
+    the value this generation minted.
+    """
+    if not address:
+        return
+    sidecars = getattr(state, "_listener_sidecars", None)
+    if sidecars is None:
+        sidecars = {}
+        state._listener_sidecars = sidecars
+    sidecars[which] = (int(port), address, secret)
+
+
+def _arm_secondary_listener_guard(
+    state: DashboardState,
+    runner: web.AppRunner,
+    secondary: SecondaryLoopback,
+    port: int,
+) -> None:
+    """Watch the SECOND loopback listener and stop advertising it if it dies.
+
+    The primary listener gets :func:`_arm_listener_guard`; this one needs its own
+    guard for the same Windows defect and a different terminal action. One failed
+    ``accept()`` closes a LISTEN socket for good while the process lives on, so
+    without this the second family's socket can be gone while its sidecar still
+    tells every client that this gateway holds that address -- and a co-resident
+    that then binds the freed address receives the credential a client sends to
+    the name. The sidecar's whole meaning is presence, so an unguarded second
+    listener makes the claim unfalsifiable.
+
+    Two differences from the primary, both deliberate:
+
+    * **Its own attribute.** ``ListenerGuard`` keeps a reference to the handler it
+      displaced and delegates to it, so two guards chain correctly -- but
+      ``state._listener_guard`` is a single slot and reusing it would drop the
+      primary's guard on the floor. Detachment then has to run in the REVERSE of
+      the arming order (see :func:`_register_listener_guard_shutdown`), or the
+      inner guard stays installed on the loop.
+    * **It never exits the process.** The primary's terminal action is right for
+      the listener a gateway exists to serve. Losing an ADDITIONAL family costs a
+      client dialling a name one explicit sign-in, so killing a gateway that is
+      still serving its primary listener would turn a degradation into an outage.
+      The injected action withdraws the sidecar and stops guarding, which lands
+      exactly in the degraded state this feature already handles and tests: a
+      family uncovered, so clients refuse to send and prompt instead.
+    """
+    if not platform_compat.IS_WINDOWS:
+        return
+    if not getattr(getattr(secondary.site, "_server", None), "sockets", None):
+        return
+    guard = ListenerGuard(
+        runner,
+        secondary.site,
+        shutdown_event,
+        bind_factory=_bind_once,
+        on_listener_lost=lambda: _withdraw_listener_sidecar(state, "secondary"),
+        on_listener_restored=lambda: _republish_listener_sidecar(state, "secondary"),
+        on_give_up=lambda reason: _secondary_listener_given_up(state, port, secondary, reason),
+    )
+    guard.arm()
+    state._secondary_listener_guard = guard
+
+
+def _secondary_listener_given_up(
+    state: DashboardState, port: int, secondary: SecondaryLoopback, reason: str
+) -> None:
+    """Terminal state for the second family: uncovered, and the gateway serves on.
+
+    ``on_listener_lost`` has already withdrawn the sidecar by the time a give-up
+    is reached, so this is idempotent by construction -- it repeats the
+    withdrawal because the guard also gives up on the path where a rebind BOUND
+    the address and the listener still answers nothing, and on that path the
+    address was re-advertised in between.
+    """
+    _withdraw_listener_sidecar(state, "secondary")
+    logger.warning(
+        "The second loopback listener on [%s]:%d is not coming back (%s). The gateway "
+        "keeps serving its primary listener; clients dialling a name that resolves to "
+        "[%s] will sign in explicitly.",
+        secondary.address,
+        port,
+        reason,
+        secondary.address,
+    )
 
 
 def _import_stt_engine() -> Any:
@@ -5730,24 +6060,49 @@ async def start_dashboard(
     # Additional kernel-verifiable transport for the internal API (POSIX only;
     # degrades to TCP-only on any failure — see _start_unix_site).
     _unix_socket_holder["path"] = await _start_unix_site(runner, port)
+    # Hold the OTHER loopback family too, so a client dialling a NAME cannot be
+    # answered by anyone else -- see _start_secondary_loopback_site. None when
+    # there is no second listener, and the client then signs in explicitly.
+    # Resolved ONCE, and used for both the second bind and the publication below.
+    # Under `--port auto` the requested port is 0 and stays 0, so binding the
+    # second family on it lands on an unrelated ephemeral port while the sidecar
+    # is filed under the real one -- which would publish coverage for an address
+    # nothing listens on and leave the real one free for anyone to take.
+    _bound_port = _resolved_bound_port(runner, port)
+    _second_loopback = await _start_secondary_loopback_site(runner, _bound_port, _bind_ip)
 
     # Port bind succeeded — now safe to write the secret file. Offloaded:
     # _write_secret_file does blocking fs I/O (os.open/os.close, plus the
     # owner-only lockdown on Windows), so it must not run on the
     # event loop (no-blocking-call-on-event-loop). The port is passed so the
     # credential is published per listener, not only into the shared file every
-    # gateway in this data home writes (see _write_instance_credentials).
+    # gateway in this data home writes (see _write_instance_credentials). The
+    # bound ADDRESS goes with it because a port number names a set of listeners:
+    # the same port on another address is a different party, and a client that
+    # dialled one must not resolve the other's credential.
     try:
         await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
             _write_instance_credentials,
             _secret_path,
-            _resolved_bound_port(runner, port),
+            _bound_port,
+            _bind_ip,
             _internal_secret,
+            (_second_loopback.address,) if _second_loopback else (),
         )
     except OSError:
         await runner.cleanup()
         raise
+
+    # Published -- now the guards may maintain those claims. Recorded after the
+    # write, so a claim that never landed is never withdrawn or re-published, and
+    # the second family's guard is armed only once its sidecar exists.
+    _note_listener_sidecar(state, "primary", _bound_port, _bind_ip, _internal_secret)
+    if _second_loopback is not None:
+        _note_listener_sidecar(
+            state, "secondary", _bound_port, _second_loopback.address, _internal_secret
+        )
+        _arm_secondary_listener_guard(state, runner, _second_loopback, _bound_port)
 
     # Listener is bound and credentials are published — now kick the warm
     # crash-residue scavenge. Deliberately NOT an on_startup hook: those run
@@ -6692,6 +7047,15 @@ async def start_api_server(
     # Additional kernel-verifiable transport for the internal API (parity with
     # start_dashboard; POSIX only, degrades to TCP-only on any failure).
     _unix_socket_holder["path"] = await _start_unix_site(runner, port)
+    # Parity with start_dashboard: hold the other loopback family so a client
+    # dialling a NAME cannot be answered by anyone else.
+    # Same resolve-once rule as start_dashboard: `--port auto` leaves the
+    # requested port at 0, and the second family must bind the port the sidecar
+    # will name.
+    _bound_port = _resolved_bound_port(runner, port)
+    _second_loopback = await _start_secondary_loopback_site(
+        runner, _bound_port, _resolved_bound_host(runner, bind_addr)
+    )
 
     # Port bind succeeded — now safe to persist the secret file (parity with
     # start_dashboard: write deferred so a failed bind can't poison it).
@@ -6699,18 +7063,36 @@ async def start_api_server(
     # on Windows, the owner-only DACL), so it must not run
     # on the event loop (no-blocking-call-on-event-loop). Same per-listener
     # publication as start_dashboard: both surfaces must pair the credential
-    # with the port or a client cannot tell which generation it reached.
+    # with the address AND the port, or a client that dialled one address can
+    # resolve the credential of a listener sharing only the port number.
     try:
         await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
             _write_instance_credentials,
             _secret_path,
-            _resolved_bound_port(runner, port),
+            _bound_port,
+            _resolved_bound_host(runner, bind_addr),
             _internal_secret,
+            (_second_loopback.address,) if _second_loopback else (),
         )
     except OSError:
         await runner.cleanup()
         raise
+
+    # Parity with start_dashboard: record the claims only after the write landed,
+    # then guard the second family so its sidecar cannot outlive its listener.
+    _note_listener_sidecar(
+        state,
+        "primary",
+        _bound_port,
+        _resolved_bound_host(runner, bind_addr),
+        _internal_secret,
+    )
+    if _second_loopback is not None:
+        _note_listener_sidecar(
+            state, "secondary", _bound_port, _second_loopback.address, _internal_secret
+        )
+        _arm_secondary_listener_guard(state, runner, _second_loopback, _bound_port)
 
     # Listener is bound — kick the warm crash-residue scavenge (parity with
     # start_dashboard: never an on_startup hook, which would run the deferred

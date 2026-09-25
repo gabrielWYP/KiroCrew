@@ -246,6 +246,9 @@ class ListenerGuard:
         max_unverified: int = DEFAULT_MAX_UNVERIFIED_RECOVERIES,
         probe: Callable[..., Any] | None = None,
         bind_factory: Callable[[str, int], socket.socket] | None = None,
+        on_listener_lost: Callable[[], None] | None = None,
+        on_listener_restored: Callable[[], None] | None = None,
+        on_give_up: Callable[[str], None] | None = None,
     ) -> None:
         self._runner = runner
         self._site = site
@@ -258,6 +261,19 @@ class ListenerGuard:
         self._max_backoff = max_backoff
         self._max_unverified = max(1, max_unverified)
         self._probe = probe if probe is not None else http_probe
+        # Listener-lifecycle hooks. The guard's own recovery is unchanged by
+        # them; they exist because something OUTSIDE the guard publishes "this
+        # gateway holds this address" on disk, and that claim has to track the
+        # listener rather than the process. ``on_listener_lost`` fires once a
+        # death is confirmed and BEFORE the first rebind attempt, so the address
+        # stops being advertised while it is free for anyone to take;
+        # ``on_listener_restored`` fires after a rebind actually binds.
+        # ``on_give_up`` REPLACES the default terminal action -- see
+        # :meth:`_give_up` -- which is what lets a best-effort listener degrade
+        # to uncovered instead of exiting a gateway that is still serving.
+        self._on_listener_lost = on_listener_lost
+        self._on_listener_restored = on_listener_restored
+        self._on_give_up = on_give_up
         # Bind parameters are captured from the live site so the rebind lands on
         # the SAME host and the port that was REALLY bound (``--port auto`` binds
         # 0 and reads the OS-assigned port back; rebinding 0 would move it).
@@ -340,10 +356,33 @@ class ListenerGuard:
         if self._probe_task is not None:
             self._probe_task.cancel()
             self._probe_task = None
+        self._detach_handler()
+
+    def _detach_handler(self) -> None:
+        """Restore the handler this guard displaced, if it is still the installed one.
+
+        Guards CHAIN: :meth:`arm` captures whatever handler is installed and
+        delegates to it, so a second guard armed on the same loop sits in front
+        of the first. The equality check is what keeps that chain intact -- an
+        inner guard restores its outer neighbour, and a guard that is no longer
+        the installed handler restores nothing rather than tearing a live
+        neighbour out of the chain. Hence the ordering rule at the call sites:
+        guards must be detached in the REVERSE of the order they were armed, or
+        the inner one stays installed for the life of the loop.
+        """
         loop = self._loop
         if loop is not None and loop.get_exception_handler() == self._on_loop_exception:
             loop.set_exception_handler(self._previous_handler)
         self._loop = None
+
+    def _notify(self, hook: Callable[..., Any] | None, what: str, *args: Any) -> None:
+        """Run one lifecycle hook. A hook must never break the recovery path."""
+        if hook is None:
+            return
+        try:
+            hook(*args)
+        except Exception:
+            logger.warning("listener guard %s hook raised", what, exc_info=True)
 
     def listener_open(self) -> bool:
         """Whether the current site still holds an open LISTEN socket.
@@ -457,6 +496,14 @@ class ListenerGuard:
             self._port,
             reason,
         )
+        # BEFORE the first attempt, not after the last. From here until a rebind
+        # lands, this address is one nobody holds -- so any on-disk claim that
+        # this gateway covers it is false for the whole of the recovery window,
+        # and a co-resident that takes the freed address during it would receive
+        # whatever a client sends to the name. Withdrawing first costs a client
+        # one explicit sign-in during a recovery that usually succeeds, which is
+        # the degradation this design already accepts everywhere else.
+        self._notify(self._on_listener_lost, "on_listener_lost")
         for attempt in range(1, self._max_attempts + 1):
             if self._stopped or self._shutdown_event.is_set():
                 return False
@@ -485,6 +532,12 @@ class ListenerGuard:
                     continue
             self._site = new_site
             self.recoveries += 1
+            # The bind is what makes the claim true again: this generation holds
+            # the address once more, whatever the app then answers on it. The
+            # verify pass below tests a different property (does it SERVE), and
+            # its failure path ends in _give_up, which is where a listener that
+            # binds and answers nothing stops being advertised.
+            self._notify(self._on_listener_restored, "on_listener_restored")
             logger.warning(
                 "Gateway listener rebound on %s:%d after %d attempt(s) "
                 "(recovery #%d this process); existing connections were kept",
@@ -532,7 +585,30 @@ class ListenerGuard:
         return True
 
     def _give_up(self, reason: str) -> None:
-        """Record the non-zero exit status and ask the process to shut down."""
+        """Terminal action: exit non-zero by default, or run the injected one.
+
+        The default is right for the listener a gateway EXISTS to serve: alive
+        but unreachable is worse than dead, so the exit status hands the problem
+        to a supervisor that will relaunch.
+
+        It is wrong for a best-effort listener whose loss is supposed to degrade.
+        An additional loopback family is one of those: losing it costs a client
+        dialling a name one explicit sign-in, and killing a gateway that is still
+        serving its primary listener to avoid that would turn a degradation into
+        an outage. Such a caller injects *on_give_up*, which REPLACES this --
+        neither the exit code nor the shutdown event is touched on that path.
+
+        Either way the guard stops here: without it the probe loop would keep
+        rediscovering the same dead listener and rebinding it forever. The task
+        is not cancelled, because this can run INSIDE that task; ``_stopped`` is
+        what the loop and every recovery entry point check, so setting it is
+        enough and cancelling would raise inside the caller.
+        """
+        if self._on_give_up is not None:
+            self._stopped = True
+            self._notify(self._on_give_up, "on_give_up", reason)
+            self._detach_handler()
+            return
         self._exit_code = LISTENER_LOST_EXIT_CODE
         logger.critical(
             "Gateway listener on %s:%d cannot be restored (%s); exiting with "
