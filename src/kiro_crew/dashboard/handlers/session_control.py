@@ -24,6 +24,7 @@ from kiro_crew.dashboard.handlers._shared import (
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.sel import sel
+from kiro_crew.validation import MAX_BROADCAST_TARGETS, MAX_SHORT_STRING
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +367,101 @@ async def api_session_control_send(request: web.Request) -> web.Response:
             target=_target(body),
             message=message,
             steer=steer,
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_broadcast(request: web.Request) -> web.Response:
+    """POST /api/session-control/broadcast — deliver one message to several sessions."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        message = body.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise sc.SessionControlError("message is required", code="message_required")
+        # The MODE is required and typed, never inferred. A missing or misspelled
+        # mode must not fall back to either delivery: defaulting to the queue would
+        # silently swallow a caller's request to interrupt, and defaulting to the
+        # steer would interrupt sessions a caller only meant to leave a note for.
+        mode = body.get("mode")
+        if not isinstance(mode, str) or mode not in sc.BROADCAST_MODES:
+            raise sc.SessionControlError(
+                f"mode must be one of {', '.join(sc.BROADCAST_MODES)}",
+                code="invalid_broadcast_mode",
+            )
+        targets = body.get("targets")
+        if targets is not None:
+            # Strictly typed for the reason `fork`'s index is: this body is
+            # model-controlled. A bare string would iterate as its characters and
+            # broadcast to one session per letter.
+            if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
+                raise sc.SessionControlError(
+                    "targets must be an array of strings", code="invalid_field_type"
+                )
+            # BOUNDED HERE, at the point of retention, before anything resolves.
+            # The MCP schema's `maxItems` is not this boundary: an in-sandbox agent
+            # shell reaches this route directly with a body of its own, so a bound
+            # that exists only in the client is no bound at all.
+            #
+            # The count first. `broadcast_to_targets` refuses an oversized audience
+            # too, but reaching that refusal means resolving every name on the way,
+            # and each resolution copies the authorized-slot set and walks it twice
+            # (`_resolve_slot`) with nothing awaited in between. A list of a million
+            # short strings is therefore millions of synchronous passes that occupy
+            # the event loop first and are refused second. Refusing the length here
+            # makes the cost of an oversized list one integer comparison.
+            if len(targets) > MAX_BROADCAST_TARGETS:
+                raise sc.SessionControlError(
+                    f"a broadcast reaches at most {MAX_BROADCAST_TARGETS} sessions "
+                    f"and this one names {len(targets)}; send to a named subset "
+                    "instead",
+                    code="too_many_targets",
+                )
+            # Then each element. A target is a session key, transcript stem, or
+            # exact title -- all short by construction -- and an unresolved name is
+            # RETAINED in the audience and echoed back in its own refusal row, so
+            # without this a single 60 MiB string is casefolded, compared against
+            # every candidate title, and then held for the report.
+            for element in targets:
+                if len(element) > MAX_SHORT_STRING:
+                    raise sc.SessionControlError(
+                        f"a target name exceeds {MAX_SHORT_STRING} characters; pass "
+                        "a session key, transcript name, or exact title",
+                        code="target_too_long",
+                    )
+        result = await sc.broadcast_to_targets(
+            state,
+            caller_session_key=_read_session_key(request),
+            message=message,
+            mode=mode,
+            targets=targets,
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_status(request: web.Request) -> web.Response:
+    """GET /api/session-control/status — the sessions this caller stood up, and their state."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # At the top like `read`: there is no body to parse. The awaited coroutine's
+    # synchronous gate runs before its first suspension, so nothing yields between
+    # this prewarm and that gate; its history scan suspends only after the gate.
+    await sc.prewarm_enabled_check()
+    state: DashboardState = request.app["state"]
+    try:
+        result = await sc.created_session_status(
+            state,
+            caller_session_key=_read_session_key(request),
             caller_fenced=_carried_fence(request),
         )
     except sc.SessionControlError as exc:

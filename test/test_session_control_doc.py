@@ -2,7 +2,7 @@
 
 ``scripts/docs_lint.py`` gates a doc's links, its reachability from an index, and the
 paths it cites. None of that asks the question this page's whole value rests on: does
-it still describe the 14 tools the server actually advertises? A tool added to
+it still describe every tool the server actually advertises? A tool added to
 ``_tool_definitions`` and absent from the page is a capability an agent reading the
 shipped docs cannot find, and a tool the page names after the server drops it is worse
 — the agent calls it and gets ``Error: unknown tool``.
@@ -141,14 +141,19 @@ def test_the_page_matches_the_session_control_group_and_the_channel_block(
     from kiro_crew.channel import CHANNEL_AGENT_BLOCKED_TOOLS
     from kiro_crew.mcp_dashboard import SESSION_CONTROL_TOOLS
 
-    assert len(SESSION_CONTROL_TOOLS) == 8
+    assert len(SESSION_CONTROL_TOOLS) == 10
     for tool in SESSION_CONTROL_TOOLS:
         assert f"`{tool}`" in doc_text
         assert tool in CHANNEL_AGENT_BLOCKED_TOOLS, (
             f"{tool} left the channel containment list; the page tells a channel agent "
-            "it is blocked from all eight"
+            "it is blocked from every session tool"
         )
-    assert "all eight\nsession tools" in doc_text or "all eight session tools" in doc_text
+    # The claim is phrased WITHOUT a number on purpose: a count in the prose is a
+    # second place to update when a tool is added, and the page was already stale
+    # once that way. The set equality above is what pins the membership.
+    assert "blocked from every\nsession tool" in doc_text or (
+        "blocked from every session tool" in doc_text
+    )
 
 
 def test_every_tabulated_refusal_code_is_one_the_source_raises(doc_text: str) -> None:
@@ -294,3 +299,14 @@ def test_the_documented_limits_match_their_constants(doc_text: str) -> None:
     assert (
         f"({int(STOP_WINDOW_SECS)} seconds)" in doc_text
     ), "the stop-retry window the page quotes must be stop_retry.WINDOW_SECS"
+    # The broadcast cap is quoted TWICE -- once in prose, once in the refusal
+    # table -- and both are pinned, because this page shipped `32` after the
+    # constant rose to 50: an agent reading it named a subset it never needed.
+    from kiro_crew.validation import MAX_BROADCAST_TARGETS
+
+    assert (
+        f"at most **{MAX_BROADCAST_TARGETS}** sessions are reachable" in doc_text
+    ), "the prose cap must be validation.MAX_BROADCAST_TARGETS"
+    assert (
+        f"A broadcast reaches at most {MAX_BROADCAST_TARGETS} sessions" in doc_text
+    ), "the refusal table's cap must be validation.MAX_BROADCAST_TARGETS"

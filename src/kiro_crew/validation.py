@@ -73,6 +73,65 @@ MAX_SHORT_STRING = 500  # names, IDs, categories
 MAX_SKILL_KEY_CHARS = 32768  # nested catalog keys, transported in JSON for exact reads
 MAX_MEDIUM_STRING = 5_000  # messages, rules
 MAX_LONG_STRING = 50_000  # task specs, inline content
+# How many sessions one broadcast may reach. A fan-out bound, not a taste
+# judgement: every delivery runs the full ``send_to_target`` path -- a gate, an
+# audit write, and for a steer an RPC that suspends -- so an unbounded audience is
+# a way to occupy the event loop for as long as the caller likes.
+#
+# The VALUE is tied to ``dashboard.state.MAX_SLOTS_PER_CREATOR`` (50) and must
+# never fall below it. The broadcast's DEFAULT audience is "every live session
+# this caller created" (``broadcast_audience``), and that set is bounded by the
+# per-creator slot cap and by nothing else -- so a cap under it makes the
+# documented default path refuse itself with ``too_many_targets`` as soon as a
+# conductor holds more workers than the cap, which is a refusal the caller cannot
+# act on: it did not name those targets, the fence did. Sitting at the per-creator
+# cap makes the default audience structurally unable to exceed this bound instead
+# of merely unlikely to.
+#
+# It is a literal rather than an import because ``kiro_crew.dashboard.state``
+# imports this module (a derived value here would be a cycle), so the relation is
+# held by a test instead: ``test_session_broadcast.py`` asserts
+# ``MAX_BROADCAST_TARGETS >= MAX_SLOTS_PER_CREATOR``. Raise that cap and the test
+# names this line; lower this one and it names it too. Note the second consumer of
+# this number: ``mcp_dashboard`` sizes its one HTTP request as
+# ``cap * BROADCAST_TARGET_ALLOWANCE_SECS + BROADCAST_RESPONSE_MARGIN_SECS``, so
+# the worst-case broadcast request budget moves with it (50 -> 260s).
+#
+# It lives HERE, with the other input bounds, because the argument schema and the
+# verb must refuse at the same number: two literals would let one layer enforce a
+# stale cap while the other's refusal code and documentation named a different one.
+MAX_BROADCAST_TARGETS = 50
+
+# Maximum session-status rows retained for a caller. Unlike the live-slot cap,
+# this bounds the durable transcript roster left by sessions that were created
+# and closed, so one long-running conductor cannot grow a model-visible reply
+# without limit. Applied where source rows and response rows are retained.
+MAX_SESSION_STATUS_ROWS = 256
+
+# Maximum characters retained from one session-status title. Transcript metadata
+# is editable by an agent's own file tools, so this bounds attacker-controlled
+# text before it enters a retained roster row and, later, a model's context.
+MAX_SESSION_STATUS_TITLE_CHARS = 500
+
+# Seconds ONE broadcast delivery may take before the loop stops waiting for it and
+# moves to the next target. Enforced per delivery, never over the fan-out: the
+# bound exists so a single unresponsive session cannot starve the ones behind it,
+# and a shared budget the early targets could spend would do exactly that.
+#
+# It lives beside the cap because the two bound the same fan-out from opposite
+# ends and BOTH layers read it: the backend enforces it per delivery, and the MCP
+# client multiplies it by the cap to size its one HTTP request. A client budget
+# below the enforced bound would let a full audience expire the request and
+# discard the per-target report the verb exists to produce, so the two must move
+# together -- which is what one name guarantees and two literals only hope for.
+BROADCAST_TARGET_ALLOWANCE_SECS = 5.0
+
+# Seconds the one broadcast request allows beyond the backend's worst-case
+# delivery time. This covers the per-target gate and audit work, the broadcast's
+# own audit write, and the HTTP response itself. It is an allowance, not a value
+# derived from measurement: the client budget must EXCEED the sequential delivery
+# bound, never merely equal it, so the per-target report still reaches the caller.
+BROADCAST_RESPONSE_MARGIN_SECS = 10.0
 # Longest backend-authored ACP session id Kiro Crew RETAINS in a store of its
 # own: the native-child rosters and a created slot's frozen creator id (held in
 # memory only, never written to the transcript), and through it the crew log's
@@ -3428,6 +3487,41 @@ SESSION_SEND_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_BROADCAST_SCHEMA = ToolSchema(
+    tool_name="session_broadcast",
+    fields=[
+        FieldSpec("message", str, required=True, max_len=MAX_LONG_STRING),
+        # REQUIRED and enumerated, with no default. The two modes are different
+        # instructions, not a setting with a safe side: a caller that meant "tell
+        # them when they next come up for air" must not interrupt eight turns
+        # because it omitted a field, and one that meant "stop, now" must not have
+        # its urgency silently downgraded to the queue. So the caller states which.
+        FieldSpec(
+            "mode",
+            str,
+            required=True,
+            allowed=frozenset({"queue", "steer"}),
+            max_len=MAX_SHORT_STRING,
+        ),
+        # Omitted means every session this caller created. Bounded to the same
+        # number the API enforces, so an oversized list is refused at the schema
+        # with the field named rather than after a round trip.
+        FieldSpec(
+            "targets",
+            list,
+            required=False,
+            item_type=str,
+            item_max_len=MAX_SHORT_STRING,
+            max_items=MAX_BROADCAST_TARGETS,
+        ),
+    ],
+)
+
+SESSION_STATUS_SCHEMA = ToolSchema(
+    tool_name="session_status",
+    fields=[],
+)
+
 SESSION_ADOPT_SCHEMA = ToolSchema(
     tool_name="session_adopt",
     fields=[
@@ -3691,6 +3785,8 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_stop": SESSION_STOP_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
     "session_send": SESSION_SEND_SCHEMA,
+    "session_broadcast": SESSION_BROADCAST_SCHEMA,
+    "session_status": SESSION_STATUS_SCHEMA,
     "session_adopt": SESSION_ADOPT_SCHEMA,
     "session_release": SESSION_RELEASE_SCHEMA,
     "session_read_message": SESSION_READ_MESSAGE_SCHEMA,

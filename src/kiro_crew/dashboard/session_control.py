@@ -6,14 +6,19 @@ a target at all. The operations are deliberately thin: they reuse the same
 creation, stop, close and history paths the dashboard itself uses, so a controlled
 session behaves exactly like one a human is typing into.
 
-**One verb here writes into another session's conversation: ``session_send``.**
+**Two verbs here write into another session's conversation: ``session_send`` and
+``session_broadcast``.**
 Reading returns a transcript tail; stopping cancels an in-flight turn the way the
 Stop button does; closing archives the session the way the tab ✕ does (the
 conversation is saved to history and can be reopened — closing is not deletion);
 creating opens an empty session in the user's sidebar; sending
 delivers a message the target runs as its next turn, redacted through
-``sanitize_outbound`` and prefixed with a ``[sent by session … via session_send]``
-envelope so it can never render as something the person typed. An IDLE target runs
+``sanitize_outbound`` and prefixed with a ``[sent by session … via <verb>]``
+envelope so it can never render as something the person typed — and the verb is
+named in it, so a worker can tell a message addressed to it alone from one every
+sibling also received. Broadcasting is not a second write path: it resolves an
+audience and hands each target to the same delivery, so every bound below holds
+per target unchanged. An IDLE target runs
 it under the authorization that admitted it; a BUSY target queues it, and the
 generic drain re-asserts the target-side containment before the entry becomes a
 turn: producers stamp the constraints that held at admission
@@ -41,7 +46,7 @@ import logging
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.config.loader import (
@@ -52,6 +57,7 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.config.resolution import DEGRADED_WHOLE_CONFIG
 from kiro_crew.crew_log import emit as crew_log_emit
+from kiro_crew.crew_log.session_tree_projection import projection
 from kiro_crew.dashboard.chat_delivery import sanitize_outbound
 from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_fork import (
@@ -62,6 +68,9 @@ from kiro_crew.dashboard.chat_fork import (
     resolve_fork_source,
 )
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
+from kiro_crew.dashboard.chat_persistence import (
+    _recent_session_slot_name,
+)
 from kiro_crew.dashboard.chat_utils import (
     _normalize_model,
     drained_to_thread,
@@ -93,8 +102,12 @@ from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.validation import (
     _MODEL_NAME_RE,
+    BROADCAST_TARGET_ALLOWANCE_SECS,
     MAX_ACP_SESSION_ID_LEN,
+    MAX_BROADCAST_TARGETS,
     MAX_LONG_STRING,
+    MAX_SESSION_STATUS_ROWS,
+    MAX_SESSION_STATUS_TITLE_CHARS,
     MAX_SHORT_STRING,
 )
 
@@ -1573,7 +1586,12 @@ def _refuse_ineligible_creator(state: "DashboardState", caller_slot: "_ChatSlot"
             )
 
 
-def _resolve_slot(state: "DashboardState", target: str) -> "_ChatSlot | None":
+def _resolve_slot(
+    state: "DashboardState",
+    target: str,
+    *,
+    candidates: "list[_ChatSlot] | None" = None,
+) -> "_ChatSlot | None":
     """Find the live slot *target* names: by slot key, transcript stem, or title.
 
     All three forms are things a caller actually holds. ``list_sessions`` reports
@@ -1590,17 +1608,22 @@ def _resolve_slot(state: "DashboardState", target: str) -> "_ChatSlot | None":
     function must never produce — ``session_stop`` discards a live turn's work.
     The doctrine is already the module's own for title-vs-title collisions; it
     applies no less when the collision crosses forms.
+
+    ``candidates`` restricts every form, including direct key lookup, to a set the
+    caller already proved safe to name. Broadcast uses that form so resolving a
+    guessed private title cannot reveal the slot key that carries it.
     """
     found: list[_ChatSlot] = []
+    pool = list(state._slots.values()) if candidates is None else list(candidates)
 
     def _add(candidate: "_ChatSlot") -> None:
         if not any(c is candidate for c in found):
             found.append(candidate)
 
     slot = state.get_slot(target)
-    if slot is not None:
+    if slot is not None and any(candidate is slot for candidate in pool):
         _add(slot)
-    for candidate in list(state._slots.values()):
+    for candidate in pool:
         try:
             if transcript_stem(slot_history_key(candidate)) == target:
                 _add(candidate)
@@ -1608,7 +1631,7 @@ def _resolve_slot(state: "DashboardState", target: str) -> "_ChatSlot | None":
             continue
     wanted = target.strip().casefold()
     if wanted:
-        for candidate in list(state._slots.values()):
+        for candidate in pool:
             if (candidate.display_title or "").strip().casefold() == wanted:
                 _add(candidate)
 
@@ -1620,6 +1643,55 @@ def _resolve_slot(state: "DashboardState", target: str) -> "_ChatSlot | None":
             code="ambiguous_target",
         )
     return found[0] if found else None
+
+
+def _broadcast_resolution_slots(
+    state: "DashboardState",
+    *,
+    caller_key: str,
+    caller_slot: "_ChatSlot",
+    ownership_fenced: bool,
+) -> "list[_ChatSlot]":
+    """Live slots whose names *caller_key* may safely resolve before delivery.
+
+    This mirrors :func:`authorize_target`'s target containment clauses without
+    replacing that gate: every retained key is authorized again at delivery.
+    Building the set BEFORE reading a candidate's title prevents an ownership-
+    fenced caller from using title resolution to learn a private slot key: a name
+    outside the set stays the caller's own string all the way into its refusal row,
+    so a guessed title is never answered with the slot key that carries it.
+
+    THE KEY IS WHAT THIS WITHHOLDS, NOT EXISTENCE. The unresolved name is still
+    delivered to :func:`authorize_target`, whose ``_resolve_slot`` call is
+    UNRESTRICTED -- so a guessed title that happens to match a slot the caller may
+    not touch comes back as that slot's containment class (``not_creator``,
+    ``mirrored_target``, ``ephemeral_target``, ``app_scoped_target``,
+    ``workspace_mismatch``) rather than ``target_not_found``, and the difference
+    tells the caller something is there. That is not a leak this function opened
+    and not one it can close: ``session_send`` on the same name answers identically,
+    which is the documented contract ("this can reach nothing a session_send
+    could not"). The codes are also the only guidance a caller gets about a target
+    it named legitimately, so collapsing them here would cost a conductor the
+    reason its own worker is unreachable. The narrow property this set buys is the
+    one that matters for a guessing caller: a refusal row never hands back a
+    durable handle it did not already hold.
+    """
+    out: list[_ChatSlot] = []
+    for slot in list(state._slots.values()):
+        if slot.key == caller_key or slot.key.startswith(UNATTENDED_SLOT_PREFIXES):
+            continue
+        if getattr(slot, "memory_mode", "persistent") != "persistent":
+            continue
+        if getattr(slot, "_app", "") or getattr(slot, "linked_session_key", ""):
+            continue
+        if _has_channel_mirror(state, slot):
+            continue
+        if getattr(slot, "workspace", "default") != getattr(caller_slot, "workspace", "default"):
+            continue
+        if ownership_fenced and _created_by_other(slot, caller_key):
+            continue
+        out.append(slot)
+    return out
 
 
 async def create_session(
@@ -2822,6 +2894,183 @@ async def fork_session(
     }
 
 
+#: The refusal factory's product: it RETURNS the error to raise rather than raising,
+#: so the audit write happens exactly once at the point of refusal and a caller
+#: collecting per-target outcomes can record one without aborting its own loop.
+Deny = Callable[..., SessionControlError]
+
+
+def _deny_factory(*, caller_session_key: str, operation: str, target: str) -> Deny:
+    """Build the ``deny`` used by every gate in this module.
+
+    Lifted out of :func:`authorize_target` so the verbs that have NO target
+    (:func:`created_session_status`) refuse through the same audited path rather
+    than growing a second one. ``target`` is the audit's ``resources`` field and is
+    empty for a targetless verb, which reads in the trail as "this refusal was not
+    about a particular session".
+    """
+
+    def deny(reason: str, code: str, status: int = 403) -> SessionControlError:
+        # Off the loop for the same reason `_audit` is: this can be the process's
+        # FIRST `sel()`, which constructs the log. A denial is the likeliest
+        # first-ever session-control call on a fresh gateway -- the feature refuses
+        # before it ever allows -- so this path is not the rare one.
+        #
+        # Redacted BEFORE the write, because the audit sink is durable and served
+        # back: `sel.py` documents that on-disk records are not redacted by the
+        # writer, and `/api/sel/events` returns `recent()` rows verbatim to the
+        # dashboard. `target` is raw MCP input, and `target_not_found` interpolates
+        # it into `reason`, so both carry caller text. Redacting at this chokepoint
+        # rather than at the one interpolating call site keeps a future `deny`
+        # caller from reopening it. `redact` is what `sel._forward_event` already
+        # applies to events on the forward path; this closes the same gap on the
+        # path the dashboard reads.
+        #
+        # Only the audit copy is redacted: the returned message goes to the caller
+        # that supplied the string, so it keeps naming the target it was given.
+        _audit_target = redact(target)
+        _audit_reason = redact(reason)
+        _sel_off_loop(
+            lambda: sel().log_api_access(
+                caller=f"session:{caller_session_key or 'unknown'}",
+                operation=f"session_control.{operation}",
+                outcome="denied",
+                source="mcp",
+                resources=f"target={_audit_target}:{code}",
+                error=_audit_reason,
+            ),
+            "session-control denial audit",
+        )
+        return SessionControlError(reason, status=status, code=code)
+
+    return deny
+
+
+def refuse_caller_identity(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    deny: Deny,
+    skip_enabled_check: bool = False,
+) -> str:
+    """The caller-side gate that runs BEFORE any target is resolved.
+
+    Returns the caller's slot key. Extracted from :func:`authorize_target` so the
+    targetless verbs share ONE copy of these three refusals rather than a second
+    sequence that can drift from this one; every check and every code is the same
+    text it was inline, and :func:`authorize_target` still calls it at the same
+    point in its own order, so no precedence the suite pins has moved.
+
+    Why these three are on this side of the resolution is the existence-oracle
+    argument the ``_app_owned_cron_refusal`` comment gives: a caller refused for
+    its OWN identity must learn nothing from the attempt, and a gate that resolves
+    first answers ``target_not_found`` (404) for a session that does not exist and
+    a 403 for one that does.
+    """
+    caller_key = caller_slot_key(state, caller_session_key)
+    if not caller_key:
+        # Without a resolved caller the self-target guard is blind, and a session
+        # that can reach every peer while being unidentifiable is exactly the
+        # shape this surface must not have.
+        raise deny("caller session could not be identified", "caller_unidentified")
+    # Resolved before the config gate: a member DM session is authorized
+    # WITHOUT `agent.session_control` — dispatching and patrolling workers is
+    # its operating model — while the operator ceiling `agent.member_dispatch`
+    # (default true = today's behaviour) is on. Turn that ceiling off and the
+    # member falls back under the switch. The member's reach stays bounded by
+    # the ownership check below, which restricts it to slots it created itself.
+    if (
+        not skip_enabled_check
+        and not session_control_enabled()
+        and not _member_bypass(state, caller_key)
+    ):
+        raise deny(
+            "session control is disabled in config (agent.session_control)",
+            "session_control_disabled",
+        )
+    if caller_key.startswith(UNATTENDED_SLOT_PREFIXES) and not _cron_caller(caller_key):
+        raise deny(
+            "unattended sessions (scheduled runs) cannot control other sessions",
+            "unattended_caller",
+        )
+    if (refusal := _app_owned_cron_refusal(state, caller_key)) is not None:
+        # The app-confinement refusal, reached through an app's cron rather than
+        # its session -- a cron tab carries no ``_app`` tag for the check further
+        # down to read. See :func:`_app_owned_cron_refusal`.
+        raise deny(refusal[0], refusal[1])
+    return caller_key
+
+
+def refuse_caller_surface(
+    state: "DashboardState",
+    *,
+    caller_key: str,
+    deny: Deny,
+) -> "_ChatSlot":
+    """The caller-side gate about the caller's own SURFACE. Returns its slot.
+
+    The caller's own isolation gates it too, and for the same reasons the target's
+    does: an incognito or temporary session is one the user asked to leave no
+    trace, and an app-scoped session belongs to its app. Either one reaching a
+    persistent peer would launder content across the boundary it was created to
+    have — in the direction the target-side checks cannot see.
+
+    A second helper rather than one with :func:`refuse_caller_identity`, because
+    :func:`authorize_target` runs these two on OPPOSITE sides of its target
+    resolution and merging them would move a refusal's precedence. A targetless
+    verb resolves nothing, so it calls both back to back.
+    """
+    caller_slot = state.get_slot(caller_key)
+    if caller_slot is None:
+        raise deny("caller session is no longer open", "caller_gone")
+    if getattr(caller_slot, "_app", ""):
+        raise deny("app-scoped sessions cannot control other sessions", "app_scoped_caller")
+    if getattr(caller_slot, "memory_mode", "persistent") != "persistent":
+        raise deny(
+            "incognito and temporary sessions cannot control other sessions",
+            "ephemeral_caller",
+        )
+    # The one exemption from both caller-side channel refusals below, shared with
+    # `_refuse_ineligible_creator` so the two halves cannot drift on WHO is exempt:
+    # :func:`owner_dm_refusal` answering ``""``, a 1:1 DM whose only human is the
+    # configured owner and whose mirror (if any) is that same DM. It waives both
+    # refusals together, because it has already established that the mirror IS
+    # the DM -- waiving the link alone would refuse every owner DM on the origin
+    # mirror its dispatcher binds each turn. An admitted DM is creator-fenced
+    # further down. The refusal names the clause that failed, code unchanged.
+    if why := owner_dm_refusal(state, caller_slot):
+        if _channel_link_of(caller_slot):
+            # The exfiltration direction, and the reason this is not merely the
+            # mirror of the target-side check: a linked caller's own conversation
+            # is a channel thread, so anything it reads lands in front of whoever
+            # is in that channel. `session_read_message` would hand a private
+            # dashboard transcript to Slack/Discord readers who were never party
+            # to it.
+            #
+            # `CHANNEL_AGENT_BLOCKED_TOOLS` already blocks these tools for channel
+            # AGENTS, but that guard keys on the agent identity; a linked SLOT is
+            # a second route to the same surface and has to be closed on its own.
+            #
+            # A cron tab's link is exempt because it is not a channel: it names
+            # the job's own run transcript and republishes to nobody, so a read
+            # through it reaches no audience the caller did not already have. See
+            # CRON_LINK_PREFIX.
+            raise deny(
+                "channel-linked sessions cannot control other sessions; the owner-DM "
+                f"exemption is withheld because {why}",
+                "linked_session_caller",
+            )
+        if _has_channel_mirror(state, caller_slot):
+            # The exfiltration direction again, via the outbound mechanism: a
+            # mirrored caller republishes its own turns to a channel, so a peer's
+            # transcript it reads lands in front of that channel's audience.
+            raise deny(
+                "sessions mirrored to a channel cannot control other sessions",
+                "mirrored_caller",
+            )
+    return caller_slot
+
+
 def authorize_target(
     state: "DashboardState",
     *,
@@ -2877,79 +3126,14 @@ def authorize_target(
     still judged by every rule above.
     """
 
-    def deny(reason: str, code: str, status: int = 403) -> SessionControlError:
-        # Off the loop for the same reason `_audit` is: this can be the process's
-        # FIRST `sel()`, which constructs the log. A denial is the likeliest
-        # first-ever session-control call on a fresh gateway -- the feature refuses
-        # before it ever allows -- so this path is not the rare one.
-        #
-        # Redacted BEFORE the write, because the audit sink is durable and served
-        # back: `sel.py` documents that on-disk records are not redacted by the
-        # writer, and `/api/sel/events` returns `recent()` rows verbatim to the
-        # dashboard. `target` is raw MCP input, and `target_not_found` interpolates
-        # it into `reason`, so both carry caller text. Redacting at this chokepoint
-        # rather than at the one interpolating call site keeps a future `deny`
-        # caller from reopening it. `redact` is what `sel._forward_event` already
-        # applies to events on the forward path; this closes the same gap on the
-        # path the dashboard reads.
-        #
-        # Only the audit copy is redacted: the returned message goes to the caller
-        # that supplied the string, so it keeps naming the target it was given.
-        _audit_target = redact(target)
-        _audit_reason = redact(reason)
-        _sel_off_loop(
-            lambda: sel().log_api_access(
-                caller=f"session:{caller_session_key or 'unknown'}",
-                operation=f"session_control.{operation}",
-                outcome="denied",
-                source="mcp",
-                resources=f"target={_audit_target}:{code}",
-                error=_audit_reason,
-            ),
-            "session-control denial audit",
-        )
-        return SessionControlError(reason, status=status, code=code)
+    deny = _deny_factory(caller_session_key=caller_session_key, operation=operation, target=target)
 
-    caller_key = caller_slot_key(state, caller_session_key)
-    if not caller_key:
-        # Without a resolved caller the self-target guard is blind, and a session
-        # that can reach every peer while being unidentifiable is exactly the
-        # shape this surface must not have.
-        raise deny("caller session could not be identified", "caller_unidentified")
-    # Resolved before the config gate: a member DM session is authorized
-    # WITHOUT `agent.session_control` — dispatching and patrolling workers is
-    # its operating model — while the operator ceiling `agent.member_dispatch`
-    # (default true = today's behaviour) is on. Turn that ceiling off and the
-    # member falls back under the switch. The member's reach stays bounded by
-    # the ownership check below, which restricts it to slots it created itself.
-    if (
-        not skip_enabled_check
-        and not session_control_enabled()
-        and not _member_bypass(state, caller_key)
-    ):
-        raise deny(
-            "session control is disabled in config (agent.session_control)",
-            "session_control_disabled",
-        )
-    if caller_key.startswith(UNATTENDED_SLOT_PREFIXES) and not _cron_caller(caller_key):
-        raise deny(
-            "unattended sessions (scheduled runs) cannot control other sessions",
-            "unattended_caller",
-        )
-    if (refusal := _app_owned_cron_refusal(state, caller_key)) is not None:
-        # The app-confinement refusal, reached through an app's cron rather than
-        # its session -- a cron tab carries no ``_app`` tag for the check further
-        # down to read. See :func:`_app_owned_cron_refusal`.
-        #
-        # Placed BEFORE `_resolve_slot`, unlike the other caller-side refusals: a
-        # caller refused for its own identity must not learn anything from the
-        # attempt, and resolving first makes the refusal an existence oracle -- a
-        # guessed target answers `target_not_found` (404) when it does not exist
-        # and this refusal (403) when it does, so a caller allowed to touch
-        # NOTHING could enumerate the user's session keys and titles by the shape
-        # of the error. The prefix gate above is already on this side of the
-        # resolution for the same reason.
-        raise deny(refusal[0], refusal[1])
+    caller_key = refuse_caller_identity(
+        state,
+        caller_session_key=caller_session_key,
+        deny=deny,
+        skip_enabled_check=skip_enabled_check,
+    )
 
     try:
         slot = _resolve_slot(state, target)
@@ -2989,59 +3173,7 @@ def authorize_target(
         # other people are party to.
         raise deny("sessions mirrored to a channel are not addressable", "mirrored_target")
 
-    # The caller's own isolation gates it too, and for the same reasons the
-    # target's does: an incognito or temporary session is one the user asked to
-    # leave no trace, and an app-scoped session belongs to its app. Either one
-    # reaching a persistent peer would launder content across the boundary it
-    # was created to have — in the direction the target-side checks cannot see.
-    caller_slot = state.get_slot(caller_key)
-    if caller_slot is None:
-        raise deny("caller session is no longer open", "caller_gone")
-    if getattr(caller_slot, "_app", ""):
-        raise deny("app-scoped sessions cannot control other sessions", "app_scoped_caller")
-    if getattr(caller_slot, "memory_mode", "persistent") != "persistent":
-        raise deny(
-            "incognito and temporary sessions cannot control other sessions",
-            "ephemeral_caller",
-        )
-    # The one exemption from both caller-side channel refusals below, shared with
-    # `_refuse_ineligible_creator` so the two halves cannot drift on WHO is exempt:
-    # :func:`owner_dm_refusal` answering ``""``, a 1:1 DM whose only human is the
-    # configured owner and whose mirror (if any) is that same DM. It waives both
-    # refusals together, because it has already established that the mirror IS
-    # the DM -- waiving the link alone would refuse every owner DM on the origin
-    # mirror its dispatcher binds each turn. An admitted DM is creator-fenced
-    # further down. The refusal names the clause that failed, code unchanged.
-    if why := owner_dm_refusal(state, caller_slot):
-        if _channel_link_of(caller_slot):
-            # The exfiltration direction, and the reason this is not merely the
-            # mirror of the target-side check: a linked caller's own conversation
-            # is a channel thread, so anything it reads lands in front of whoever
-            # is in that channel. `session_read_message` would hand a private
-            # dashboard transcript to Slack/Discord readers who were never party
-            # to it.
-            #
-            # `CHANNEL_AGENT_BLOCKED_TOOLS` already blocks these tools for channel
-            # AGENTS, but that guard keys on the agent identity; a linked SLOT is
-            # a second route to the same surface and has to be closed on its own.
-            #
-            # A cron tab's link is exempt because it is not a channel: it names
-            # the job's own run transcript and republishes to nobody, so a read
-            # through it reaches no audience the caller did not already have. See
-            # CRON_LINK_PREFIX.
-            raise deny(
-                "channel-linked sessions cannot control other sessions; the owner-DM "
-                f"exemption is withheld because {why}",
-                "linked_session_caller",
-            )
-        if _has_channel_mirror(state, caller_slot):
-            # The exfiltration direction again, via the outbound mechanism: a
-            # mirrored caller republishes its own turns to a channel, so a peer's
-            # transcript it reads lands in front of that channel's audience.
-            raise deny(
-                "sessions mirrored to a channel cannot control other sessions",
-                "mirrored_caller",
-            )
+    caller_slot = refuse_caller_surface(state, caller_key=caller_key, deny=deny)
 
     if getattr(slot, "workspace", "default") != getattr(caller_slot, "workspace", "default"):
         # Workspaces are the memory boundary; reaching across one would let a
@@ -3954,7 +4086,21 @@ MAX_SEND_MESSAGE_CHARS = MAX_LONG_STRING
 #: something the person typed — the same reason auto-nudge tags its injected
 #: turns ``[auto-nudge cycle N]``. The model in the target session sees it too,
 #: so it can weigh the instruction as coming from a peer session, not its user.
-_SEND_PROVENANCE = "[sent by session {caller} via session_send]\n\n"
+_SEND_PROVENANCE = "[sent by session {caller} via {via}]\n\n"
+
+#: What the envelope names for a broadcast. The verb is part of the message's
+#: meaning, not decoration: "the base moved, rebase before you push" addressed to
+#: one worker is a fact about that worker's branch, and the same words addressed to
+#: eight are a fact about the base. A worker that cannot tell which it received
+#: cannot judge whether a sibling is about to make the same change.
+BROADCAST_VIA = "session_broadcast"
+
+
+@dataclass
+class _DeliveryProgress:
+    """Delivery-call-owned facts that survive cancellation into the caller."""
+
+    steer_await_entered: bool = False
 
 
 async def send_to_target(
@@ -3965,8 +4111,16 @@ async def send_to_target(
     message: str,
     steer: bool = False,
     caller_fenced: bool | None = None,
+    via: str = "session_send",
+    _delivery_progress: "_DeliveryProgress | None" = None,
 ) -> dict[str, Any]:
     """Deliver *message* to *target* as its next agent turn.
+
+    ``via`` names the VERB in the provenance envelope the target reads. It exists
+    because :func:`broadcast_to_targets` delivers through this function, and a
+    worker told something every sibling was also told must be able to see that:
+    the same sentence means one thing addressed to one session and another
+    addressed to eight. It never affects authorization or delivery.
 
     The delivery path is the same queue-vs-run decision the dashboard composer
     uses (``enqueue_or_run_prompt``): an idle target starts a turn immediately,
@@ -4017,6 +4171,13 @@ async def send_to_target(
     that cap only binds unattended (app-owned) slots, and every target this
     function can authorize is attended — see the comment at the delivery call.
     """
+    # A broadcast passes its own instance so the timeout handler can read facts
+    # this delivery recorded before cancellation erased its stack. A plain send
+    # needs the same local state even though no outer timeout reads it.
+    delivery_progress = (
+        _delivery_progress if _delivery_progress is not None else _DeliveryProgress()
+    )
+
     # Same prewarm ordering as `stop_target`, for the same reasons: the SEL
     # write inside `authorize_target`'s deny path must be a cache hit, and the
     # config warm must be the LAST suspension before the synchronous gate.
@@ -4060,6 +4221,28 @@ async def send_to_target(
             status=409,
         )
 
+    # Cancellation can only enter at an await. Route every await below the
+    # authorization through this helper so no authorized cancellation loses its
+    # target-level permission trail.
+    async def _await_authorized_delivery(awaitable: Any) -> Any:
+        try:
+            return await awaitable
+        except asyncio.CancelledError:
+            # `cancelled` means authorization was granted, delivery was cancelled
+            # mid-flight, and whether the message landed is unknown.
+            _audit(
+                caller_session_key=caller_session_key,
+                operation="send",
+                slot_key=slot.key,
+                outcome="cancelled",
+                detail={
+                    "steer_requested": bool(steer),
+                    "chars": len(body),
+                    "delivery_result": "unknown",
+                },
+            )
+            raise
+
     # Deferred for the same import cycle `stop_target` documents.
     from kiro_crew.dashboard.chat_runner import _run_chat
 
@@ -4070,7 +4253,9 @@ async def send_to_target(
     # reach that surface. The length gate above deliberately measures the RAW body:
     # redaction can only shrink the text, so validating the raw form is the honest
     # limit and keeps the error keyed to what the caller actually sent.
-    prompt = _SEND_PROVENANCE.format(caller=caller_key or "unknown") + sanitize_outbound(body)
+    prompt = _SEND_PROVENANCE.format(
+        caller=caller_key or "unknown", via=via or "session_send"
+    ) + sanitize_outbound(body)
 
     steered = False
     requeued = False
@@ -4138,9 +4323,13 @@ async def send_to_target(
         # `user_origin=False`: this text was not typed into the target's own
         # surface. The requeue reads it to decide `directive_user_origin`, and a
         # peer must not inherit the composer's exemption from the LINKED drop.
-        outcome = await steer_into_running_turn(
-            state, slot, prompt, user_origin=False, admission=admission
-        )
+        async def _steer_delivery() -> str:
+            return await steer_into_running_turn(
+                state, slot, prompt, user_origin=False, admission=admission
+            )
+
+        delivery_progress.steer_await_entered = True
+        outcome = await _await_authorized_delivery(_steer_delivery())
         steered = outcome == STEER_STEERED
         # The turn ended while the steer RPC was suspended and its teardown moved
         # the text onto the queue: it WILL run, and taking the queue arm below
@@ -4225,11 +4414,13 @@ async def send_to_target(
                     # the audience fence recorded before the RPC, so containment does
                     # not depend on this stop succeeding.
                     try:
-                        await stop_slot_turn(
-                            state,
-                            slot,
-                            source="session_send_steer_containment",
-                            escalate=False,
+                        await _await_authorized_delivery(
+                            stop_slot_turn(
+                                state,
+                                slot,
+                                source="session_send_steer_containment",
+                                escalate=False,
+                            )
                         )
                     except Exception:
                         logger.exception(
@@ -4261,7 +4452,10 @@ async def send_to_target(
             # stalling every other session while a file is read and validated. Warming
             # again here is what `prewarm_enabled_check`'s own docstring prescribes for
             # a gate that sits after an await.
-            await prewarm_enabled_check()
+            async def _prewarm_regate() -> None:
+                await prewarm_enabled_check()
+
+            await _await_authorized_delivery(_prewarm_regate())
             regated = authorize_target(
                 state,
                 caller_session_key=caller_session_key,
@@ -4341,6 +4535,726 @@ async def send_to_target(
         },
     )
     return {"ok": True, "target": slot.key, "started": started, "steered": steered}
+
+
+#: The two broadcast modes, named rather than a boolean. ``queue`` waits for each
+#: target's current turn; ``steer`` cuts into it. They are separate names because
+#: the choice is not a refinement of one delivery — "tell everyone when they next
+#: come up for air" and "interrupt everyone now" are different instructions, and a
+#: caller that means the first must not reach the second by defaulting.
+BROADCAST_MODES = ("queue", "steer")
+
+#: The per-delivery bound this module ENFORCES, and the MCP client's one request
+#: budget, are one name in ``kiro_crew.validation`` rather than two literals that
+#: must be remembered together -- the same reason ``MAX_BROADCAST_TARGETS`` lives
+#: there. See that definition for why a client budget below this bound would
+#: discard the per-target report.
+
+#: The refusal code a timed-out delivery reports. Distinct from
+#: ``delivery_failed`` because a timeout is classified from delivery-owned
+#: progress plus any exact text the target still retains: pre-authorization,
+#: retained text, ambiguous or completed hand-over, and an unavailable target
+#: each need different caller guidance. See :func:`broadcast_to_targets`.
+BROADCAST_TIMEOUT_CODE = "delivery_timeout"
+
+_TIMEOUT_RETAINED = "retained"
+_TIMEOUT_NOT_HANDED_OVER = "not_handed_over"
+_TIMEOUT_UNKNOWN = "unknown"
+
+
+def _timeout_delivery_observation(
+    state: "DashboardState",
+    slot: Any | None,
+    prompt: str,
+    delivery_progress: _DeliveryProgress,
+) -> str:
+    """Classify a cancelled delivery from its own progress and retained text."""
+    if slot is None or state._slots.get(slot.key) is not slot:
+        return _TIMEOUT_UNKNOWN
+    if prompt in slot._pending_steers or any(
+        isinstance(entry, dict) and entry.get("content") == prompt for entry in slot._queue
+    ):
+        return _TIMEOUT_RETAINED
+    if delivery_progress.steer_await_entered:
+        return _TIMEOUT_UNKNOWN
+    return _TIMEOUT_NOT_HANDED_OVER
+
+
+def broadcast_audience(state: "DashboardState", caller_key: str) -> list[str]:
+    """The slot keys *caller_key* created and can still address, sorted.
+
+    The DEFAULT audience of a broadcast: a conductor's own workers. Read from the
+    live slots' ``_created_by`` — the same field the ownership fence
+    (:func:`_created_by_other`) reads — so the default audience is by construction
+    a subset of what the fence would admit, and an audience this returns can still
+    be refused per target (a worker that went incognito, gained a channel mirror,
+    or is an app's) by the gate each delivery runs. Nothing here authorizes.
+
+    The caller itself is excluded: ``authorize_target`` refuses a self-target, and
+    silently collecting a refusal the caller could not have avoided would make
+    every broadcast report one failure.
+
+    Sorted by key so the delivery order is stable across calls. A broadcast is not
+    atomic — deliveries land one at a time — so a caller reading two reports needs
+    the same order in both to compare them.
+    """
+    out = [
+        key
+        for key, slot in list(state._slots.items())
+        if key != caller_key and not _created_by_other(slot, caller_key)
+    ]
+    return sorted(out)
+
+
+def _too_many_targets(count: int) -> SessionControlError:
+    """The audience-cap refusal, from one place because it is raised from two.
+
+    Refused rather than truncated. A silently-cut audience is a broadcast the
+    caller believes reached everyone, and the sessions past the cut are the ones it
+    will never think to check.
+    """
+    return SessionControlError(
+        f"a broadcast reaches at most {MAX_BROADCAST_TARGETS} sessions and this "
+        f"one names {count}; send to a named subset instead",
+        code="too_many_targets",
+        status=400,
+    )
+
+
+async def broadcast_to_targets(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    message: str,
+    mode: str,
+    targets: "list[str] | None" = None,
+    caller_fenced: bool | None = None,
+) -> dict[str, Any]:
+    """Deliver *message* to several sessions at once, one at a time.
+
+    Two modes, and they are the whole point of the verb being separate from a loop
+    of :func:`send_to_target` calls the model writes itself: ``queue`` lets every
+    target finish what it is doing, ``steer`` cuts into every running turn. A
+    conductor telling eight workers "the base moved, rebase before you push" wants
+    the first; one telling them "stop, the issue was already fixed" wants the
+    second, and the difference is worth eight turns of latency.
+
+    ``targets`` omitted means :func:`broadcast_audience` — the sessions this caller
+    created. Naming them explicitly is for the subset case, and every named target
+    goes through the same :func:`authorize_target` gate, so an explicit list can
+    only ever be as permissive as one send at a time.
+
+    PARTIAL DELIVERY IS THE NORMAL OUTCOME and the return shape says so per
+    target. A target closed between the audience read and its own delivery, one
+    that went incognito, one bound to a remote crew: each is one row with its
+    refusal ``code``, and the remaining deliveries still happen. The alternative —
+    abort on the first refusal — would leave a broadcast half-delivered with
+    nothing saying which half, which is the one outcome a caller cannot recover
+    from.
+
+    Deliveries are SEQUENTIAL, never gathered. Each one takes the same slot locks,
+    runs the same containment re-checks and (for a steer) suspends on an RPC, and
+    running them concurrently would interleave those windows across sessions for
+    no gain a caller can observe — the report is only read once all of them are
+    done either way.
+
+    Which is exactly why each delivery carries its own bound
+    (``BROADCAST_TARGET_ALLOWANCE_SECS``): sequential delivery means one target
+    that never answers is one target that starves every target behind it, and the
+    urgent mode is the one that suspends on an RPC with no ceiling under it. On
+    expiry that delivery is cancelled, reported as a ``delivery_timeout`` row, and
+    the loop continues. The delivery records when it enters the steer await and
+    when that await returns. Cancellation before either marker is provably before
+    hand-over, so re-sending is safe. Cancellation inside the steer await is
+    ambiguous, and cancellation after it returns is post-hand-over; both are
+    unknown and must not invite a retry. The target's ``_pending_steers`` and queue
+    still add useful information when they retain the exact text, but their shared
+    absence cannot reconstruct delivery history. A target whose slot disappeared
+    or was replaced also gets an unknown row. None of the rows claims delivery or
+    certain execution.
+    """
+    if mode not in BROADCAST_MODES:
+        raise SessionControlError(
+            f"mode must be one of {', '.join(BROADCAST_MODES)}",
+            code="invalid_broadcast_mode",
+            status=400,
+        )
+    body = message.strip()
+    if not body:
+        raise SessionControlError("message is empty", code="message_empty", status=400)
+    if len(body) > MAX_SEND_MESSAGE_CHARS:
+        raise SessionControlError(
+            f"message exceeds {MAX_SEND_MESSAGE_CHARS} characters",
+            code="message_too_long",
+            status=400,
+        )
+
+    # The caller gate runs ONCE, here, before any audience is read: a caller that
+    # may not control sessions at all must be refused without learning how many it
+    # created. The per-target gate below re-runs it for each delivery, which is
+    # what actually binds every send — this one is the early, cheap refusal.
+    await prewarm_enabled_check()
+    deny = _deny_factory(caller_session_key=caller_session_key, operation="broadcast", target="")
+    caller_key = refuse_caller_identity(state, caller_session_key=caller_session_key, deny=deny)
+    caller_slot = refuse_caller_surface(state, caller_key=caller_key, deny=deny)
+    ownership_fenced = (
+        _caller_is_ownership_fenced(state, caller_key) if caller_fenced is None else caller_fenced
+    )
+    resolution_slots = _broadcast_resolution_slots(
+        state,
+        caller_key=caller_key,
+        caller_slot=caller_slot,
+        ownership_fenced=ownership_fenced,
+    )
+
+    explicit = targets is not None
+    if explicit:
+        # THE CAP, CHECKED BEFORE ANYTHING RESOLVES. Below the resolution loop this
+        # check is correct and useless: reaching it costs one `_resolve_slot` per
+        # name -- a copy of the authorized-slot set and two full passes over it,
+        # with nothing awaited between them -- so an oversized list does the work
+        # the refusal exists to prevent and is refused afterwards. Here the cost of
+        # an oversized list is one integer comparison.
+        #
+        # Counted on the caller's RAW list rather than on the deduplicated audience,
+        # so the bound is on what the caller submitted. A list of `cap + 1`
+        # duplicate spellings of one session is therefore refused even though it
+        # would collapse under the cap, and that is the intended reading: the cap
+        # bounds the work this call asks for, and deduplication is that work.
+        #
+        # The route bounds this too, and both are deliberate: the route is the
+        # boundary an in-sandbox shell reaches, this is the boundary every
+        # in-process caller reaches.
+        if len(targets or []) > MAX_BROADCAST_TARGETS:
+            raise _too_many_targets(len(targets or []))
+        # De-duplicated by an AUTHORIZED resolved slot while PRESERVING the
+        # caller's order, so two spellings of one session still deliver once.
+        # Resolution is restricted to slots the caller may address; a private
+        # title therefore remains the caller's own string and cannot turn into a
+        # slot key in the refusal row. This loses no real target because
+        # ``authorize_target`` would refuse every slot outside this set anyway,
+        # and every retained key still goes through that gate at delivery.
+        # A name that cannot be resolved, or is ambiguous within the authorized
+        # set, remains in the audience so the gate can return its refusal row.
+        seen: set[tuple[str, str]] = set()
+        audience: list[str] = []
+        for raw in targets or []:
+            name = str(raw).strip()
+            if not name:
+                continue
+            try:
+                slot = _resolve_slot(state, name, candidates=resolution_slots)
+            except SessionControlError:
+                slot = None
+            identity = ("slot", slot.key) if slot is not None else ("unresolved", name)
+            if identity not in seen:
+                seen.add(identity)
+                audience.append(slot.key if slot is not None else name)
+        if not audience:
+            # The caller named targets and not one of them is usable. Both silent
+            # answers are wrong here: falling back to the default audience turns a
+            # malformed argument into an accidental fleet-wide send, and reporting
+            # "delivered 0 of 0" hides a call that never had a chance of working.
+            raise SessionControlError(
+                "targets was given but names no session; omit it to reach every "
+                "session you created",
+                code="target_required",
+                status=400,
+            )
+    else:
+        audience = broadcast_audience(state, caller_key)
+
+    if len(audience) > MAX_BROADCAST_TARGETS:
+        # The DEFAULT audience's own bound. An explicit list was already refused
+        # above, before resolution, and deduplication only ever shrinks it -- so
+        # this now guards the fence-built audience, whose size the caller did not
+        # choose. It should be unreachable: ``broadcast_audience`` returns the live
+        # slots this caller created, which ``MAX_SLOTS_PER_CREATOR`` bounds at or
+        # below this cap (see ``MAX_BROADCAST_TARGETS``). Kept because "unreachable
+        # because two constants are ordered correctly" is a property a later edit
+        # can break, and truncating a fleet-wide send is the failure that must not
+        # be the fallback.
+        raise _too_many_targets(len(audience))
+
+    results: list[dict[str, Any]] = []
+    timeout_prompt = _SEND_PROVENANCE.format(
+        caller=caller_key or "unknown", via=BROADCAST_VIA
+    ) + sanitize_outbound(body)
+    for name in audience:
+        try:
+            timeout_slot = _resolve_slot(state, name)
+        except SessionControlError:
+            timeout_slot = None
+        delivery_progress = _DeliveryProgress()
+        try:
+            # Each delivery gets its OWN bound. Without one a single unresponsive
+            # target starves every target behind it: the steer arm suspends on
+            # `client.steer` -> `stdin.drain()` with no `wait_for` anywhere beneath
+            # it, so a session whose process is wedged blocks this loop
+            # indefinitely and targets 3-8 of a "stop, the issue was already fixed"
+            # never hear it. The client's request budget then expires and the
+            # caller is told the whole broadcast failed, discarding the per-target
+            # report that is the only thing that could have said which half landed.
+            # Bounding here and continuing turns that into one refused row.
+            #
+            # The bound wraps the WHOLE call rather than the steer RPC alone, which
+            # is what gives the queue arm the same protection: that arm also
+            # suspends before it delivers (`asyncio.to_thread(sel)`,
+            # `prewarm_enabled_check`, and the config load that can sit behind it),
+            # and a queue broadcast stalled on a config read starves the fleet just
+            # as thoroughly as a wedged steer does.
+            #
+            # The bound wraps two pre-authorization awaits as well as the
+            # delivery arms. A cancel at `asyncio.to_thread(sel)` or
+            # `prewarm_enabled_check()` happens before `authorize_target`, so it
+            # cannot leave this text pending or queued. A cancel at the steer RPC
+            # can leave the exact prompt in `_pending_steers`, and turn teardown can
+            # move it into a queue entry's `content` while cancellation unwinds.
+            #
+            # Capture the resolved slot and a delivery-owned progress marker before
+            # the call. After cancellation, retained text still proves it may run,
+            # but empty target containers prove nothing: consumption and a send that
+            # never started both empty them. The progress marker distinguishes a
+            # pre-authorization cancellation from the ambiguous steer await and every
+            # post-return await. If the object disappeared or was replaced, the
+            # outcome is unknown regardless.
+            #
+            # `send_to_target` records its `cancelled` audit only after
+            # authorization. Cancellation at either earlier await therefore leaves
+            # no target-level permission row, while cancellation in an authorized
+            # delivery keeps that row unchanged.
+            sent = await asyncio.wait_for(
+                send_to_target(
+                    state,
+                    caller_session_key=caller_session_key,
+                    target=name,
+                    message=body,
+                    steer=(mode == "steer"),
+                    caller_fenced=caller_fenced,
+                    via=BROADCAST_VIA,
+                    _delivery_progress=delivery_progress,
+                ),
+                timeout=BROADCAST_TARGET_ALLOWANCE_SECS,
+            )
+        except asyncio.TimeoutError:
+            # A timeout says only that this side stopped waiting. Delivery-owned
+            # progress decides whether retry advice is safe; target containers only
+            # add the stronger fact that an exact retained copy may still run.
+            observation = _timeout_delivery_observation(
+                state, timeout_slot, timeout_prompt, delivery_progress
+            )
+            if observation == _TIMEOUT_RETAINED:
+                error = (
+                    f"this target did not finish its delivery within "
+                    f"{BROADCAST_TARGET_ALLOWANCE_SECS:.3g}s, so the broadcast "
+                    "stopped waiting and moved on; whether the message has run is "
+                    "UNKNOWN. The same text is pending or queued on that target and "
+                    "may still run. Do NOT re-send it: a duplicate could run too"
+                )
+            elif observation == _TIMEOUT_NOT_HANDED_OVER:
+                error = (
+                    f"this target did not finish its delivery within "
+                    f"{BROADCAST_TARGET_ALLOWANCE_SECS:.3g}s, so the broadcast "
+                    "stopped waiting and moved on; the target has neither a pending "
+                    "steer nor a queued copy, so the delivery did not reach the "
+                    "hand-over. Re-sending the same text is safe"
+                )
+            else:
+                if timeout_slot is not None and state._slots.get(timeout_slot.key) is timeout_slot:
+                    error = (
+                        f"this target did not finish its delivery within "
+                        f"{BROADCAST_TARGET_ALLOWANCE_SECS:.3g}s, so the broadcast "
+                        "stopped waiting and moved on; cancellation reached the steer "
+                        "await or a later await, so whether the message has run is "
+                        "UNKNOWN. Re-sending could execute it twice"
+                    )
+                else:
+                    error = (
+                        f"this target did not finish its delivery within "
+                        f"{BROADCAST_TARGET_ALLOWANCE_SECS:.3g}s, so the broadcast "
+                        "stopped waiting and moved on; the target is unavailable, so "
+                        "whether the message has run or is pending or queued is UNKNOWN"
+                    )
+            logger.warning(
+                "session_broadcast: delivery to %s exceeded %.3gs and was "
+                "cancelled mid-flight; post-cancel observation=%s",
+                name,
+                BROADCAST_TARGET_ALLOWANCE_SECS,
+                observation,
+            )
+            results.append(
+                {
+                    "target": name,
+                    "ok": False,
+                    "code": BROADCAST_TIMEOUT_CODE,
+                    "error": error,
+                }
+            )
+            continue
+        except SessionControlError as exc:
+            # Collected, not raised. This target is out of reach; the rest are not,
+            # and the caller needs to know which is which. The refusal was already
+            # audited by the gate that produced it.
+            results.append(
+                {
+                    "target": name,
+                    "ok": False,
+                    "code": exc.code,
+                    "error": exc.message,
+                }
+            )
+            continue
+        except Exception:
+            # An unexpected failure on ONE delivery must not take the broadcast
+            # down with it, and it must not be reported as a refusal either: a
+            # refusal has a code the caller can act on, this has none. Logged with
+            # its traceback and reported as the internal failure it is.
+            logger.exception("session_broadcast: delivery to %s failed", name)
+            results.append(
+                {
+                    "target": name,
+                    "ok": False,
+                    "code": "delivery_failed",
+                    "error": "delivery failed unexpectedly; see the gateway log",
+                }
+            )
+            continue
+        results.append(
+            {
+                "target": sent.get("target", name),
+                "ok": True,
+                "started": bool(sent.get("started")),
+                "steered": bool(sent.get("steered")),
+            }
+        )
+
+    delivered = sum(1 for row in results if row.get("ok"))
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="broadcast",
+        slot_key=caller_key,
+        outcome="allowed",
+        detail={
+            "mode": mode,
+            # WHERE the audience came from, because the two are different acts: an
+            # explicit list is a caller naming sessions, the default is the fence's
+            # own set. A trail that cannot tell them apart cannot answer "who chose
+            # these targets".
+            "audience": "explicit" if explicit else "created",
+            "requested": len(audience),
+            "delivered": delivered,
+            "chars": len(body),
+        },
+    )
+    return {
+        "ok": True,
+        "mode": mode,
+        "requested": len(audience),
+        "delivered": delivered,
+        # True only for the DEFAULT audience: the caller has created nothing that
+        # is still open, which is a real state and not an error. An explicit list
+        # that names nothing is refused before delivery, so it cannot reach here.
+        **({"audience_empty": True} if not audience and not explicit else {}),
+        "results": results,
+    }
+
+
+def _created_tree_roster(caller_key: str) -> "tuple[list[str], str]":
+    """Slots the crew log says hang under *caller_key*, and how good that read was.
+
+    The DURABLE half of :func:`created_session_status`. ``state._slots`` knows only
+    what is open right now, so a worker that was closed, or whose session was lost
+    to a crash, disappears from it entirely — and "I dispatched eight and can see
+    six" is exactly the question this verb exists to answer. The crew log's session
+    tree is written when a session is opened and survives both, so it is what
+    supplies the roster while the live slots supply the status.
+
+    The second value is the read's own quality, and it is returned rather than
+    folded into the list because the three answers are not interchangeable:
+
+    * ``readable`` — the fold saw every unit the store holds.
+    * ``incomplete`` — a unit's bytes could not be read, or the population was
+      capped, so rows may be MISSING. The fold is still served: this reader
+      DISPLAYS lineage rather than deciding on it, which is the case
+      :class:`~kiro_crew.crew_log.session_tree.TreeReading` documents as free to
+      ignore the flag — but a caller counting its workers must be told the count
+      is a floor.
+    * ``unreadable`` — the crew log is off, or the projection is not seeded for the
+      store configured now. There is no roster at all and the answer is live-only.
+
+    Reads the in-memory fold and does NO I/O, so it is safe on the event loop. An
+    unseeded projection answers ``unreadable`` rather than seeding itself here,
+    for the reason :func:`_slot_tree_parent` gives: a seed is a disk read.
+
+    The parent edge it follows is the CURRENT one, so an adopted session is listed
+    under whoever holds it now rather than under whoever opened it. That is the
+    right answer for this verb — it reports the sessions the caller is answerable
+    for — and it cannot widen the caller's reach, because an adoption is itself
+    gated by :func:`authorize_target`.
+    """
+    try:
+        if not crew_log_emit.enabled():
+            return [], "unreadable"
+        proj = projection()
+        if not proj.seeded_for_current_store:
+            return [], "unreadable"
+        reading = proj.reading()
+    except Exception:
+        logger.debug("session tree roster could not be read", exc_info=True)
+        return [], "unreadable"
+    children: list[str] = []
+    overflow = False
+    for slot, node in reading.nodes.items():
+        if getattr(node, "parent_slot", None) != caller_key or slot == caller_key:
+            continue
+        if len(children) < MAX_SESSION_STATUS_ROWS:
+            children.append(slot)
+        else:
+            overflow = True
+    children.sort()
+    return children, ("incomplete" if reading.incomplete or overflow else "readable")
+
+
+def _bounded_status_title(value: object) -> str:
+    """A display-safe title bounded before it is retained in a status row."""
+    return sanitize_outbound(str(value or ""))[:MAX_SESSION_STATUS_TITLE_CHARS]
+
+
+def _created_history_roster(
+    state: "DashboardState", caller_key: str, caller_workspace: str
+) -> tuple[dict[str, dict[str, Any]], str, int]:
+    """Persisted birth metadata for sessions created by *caller_key*.
+
+    This is the transcript-meta half of :func:`created_session_status`. It is a
+    weaker source than the fenced crew log: ``created_by`` is already trusted by
+    the member ownership boundary, but it is not gateway-authored lineage. Rows
+    retain that distinction through their ``source`` value.
+
+    The scan is read-only. ``list_sessions`` supplies the catalog and
+    ``get_metadata_status`` supplies both the creator edge and a readability
+    verdict for each candidate. A bad metadata row or a matching population past
+    :data:`MAX_SESSION_STATUS_ROWS` makes the result ``incomplete`` rather than
+    disappearing behind a claim of completeness. Only the bounded title needed
+    by the response is retained; the full editable metadata dict is not.
+    """
+    log = state.conversation_log
+    if log is None:
+        return {}, "unreadable", 0
+    try:
+        sessions = log.list_sessions()
+    except Exception:
+        logger.debug("session history roster could not be listed", exc_info=True)
+        return {}, "unreadable", 0
+
+    rows: dict[str, dict[str, Any]] = {}
+    incomplete = False
+    omitted = 0
+    for session in sessions:
+        history_key = str(session.get("key", ""))
+        slot_key = _recent_session_slot_name(history_key)
+        if slot_key is None or slot_key == caller_key:
+            continue
+        try:
+            meta, readable = log.get_metadata_status(history_key)
+        except Exception:
+            logger.debug("session history metadata could not be read", exc_info=True)
+            incomplete = True
+            continue
+        if not readable:
+            incomplete = True
+            continue
+        if str(meta.get("created_by", "")) != caller_key:
+            continue
+        if str(meta.get("workspace", "default")) != caller_workspace:
+            continue
+        if len(rows) >= MAX_SESSION_STATUS_ROWS:
+            # Keep scanning only to report the exact overflow count. No metadata
+            # or title beyond the cap is retained in this request.
+            omitted += 1
+            incomplete = True
+            continue
+        rows[slot_key] = {
+            "title": _bounded_status_title(meta.get("title") or slot_key),
+        }
+    return rows, ("incomplete" if incomplete else "readable"), omitted
+
+
+async def created_session_status(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    caller_fenced: bool | None = None,
+) -> dict[str, Any]:
+    """Every session this caller stood up, and what each one is doing now.
+
+    The roster and the status come from THREE sources because none can answer
+    every half. The crew log's session tree is durable and gateway-attested, while
+    persisted history metadata records a birth before the first turn can write a
+    tree edge. Live slots know exactly what is running but forget a session the
+    moment it is gone. The union covers all three windows, and each row says which
+    source placed it.
+
+    ``status`` per row, and the five are distinct answers a patrol acts on
+    differently:
+
+    * ``working`` — a turn is in flight. Wait.
+    * ``queued`` — idle, but messages are waiting to run. Also wait, but nothing is
+      happening yet, so a steer would land on nothing.
+    * ``idle`` — open and doing nothing. This is the one that needs a decision.
+    * ``gone`` — the crew log names it and the dashboard does not hold it: closed,
+      archived, or lost with the process that ran it. Re-dispatch or drop it; there
+      is nothing here to message, and :func:`authorize_target` would answer
+      ``target_not_found``.
+    * ``unknown`` — history records the creator but neither a live slot nor an
+      attested tree edge exists. The row proves the session was created without
+      claiming whether it finished or was lost.
+
+    READ-ONLY. The history catalog and metadata reads touch disk; callers keep the
+    operation informational and expose their quality separately from the crew-log
+    tree quality.
+
+    The union is bounded at :data:`MAX_SESSION_STATUS_ROWS`, and that cut gets its
+    OWN field: ``roster_omitted`` counts the rows dropped, zero when the whole
+    union was retained. It is deliberately not expressed by degrading ``history``,
+    which describes the transcript scan alone — a union cut is not a read fault in
+    any source, and spelling it that way blames a read that completed while
+    ``history_omitted`` still reports nothing cut.
+
+    The ownership fence applies to the rows, not just to the verb: a fenced caller
+    (a crew member, a cron, an agent-created session) sees the live sessions it
+    created and nothing else, so this verb cannot become a way to enumerate the
+    user's own sessions by their titles. A ``gone`` row carries only a slot key the
+    caller already knew, and no title, so it is listed either way.
+    """
+    deny = _deny_factory(caller_session_key=caller_session_key, operation="status", target="")
+    caller_key = refuse_caller_identity(state, caller_session_key=caller_session_key, deny=deny)
+    caller_slot = refuse_caller_surface(state, caller_key=caller_key, deny=deny)
+    ownership_fenced = (
+        _caller_is_ownership_fenced(state, caller_key) if caller_fenced is None else caller_fenced
+    )
+    tree_children, tree_state = _created_tree_roster(caller_key)
+
+    # The first suspension in this verb, deliberately AFTER the complete
+    # synchronous caller gate and fence resolution above. The route prewarms the
+    # config cache immediately before entering this coroutine, so moving an await
+    # into that window would let an intervening config edit put blocking config IO
+    # back on the loop. The scan itself globs, stats and reads transcript metadata,
+    # so run the complete operation in one worker-thread hop.
+    caller_workspace = str(getattr(caller_slot, "workspace", "default"))
+    history_children, history_state, history_omitted = await asyncio.to_thread(
+        _created_history_roster, state, caller_key, caller_workspace
+    )
+
+    # Live slot state stays on the event loop and is read only after the history
+    # worker returns. Reading it inside the worker would let the result go stale
+    # before these rows are built.
+    live_children = broadcast_audience(state, caller_key)
+
+    rows: list[dict[str, Any]] = []
+    roster = set(tree_children) | set(history_children) | set(live_children)
+    # The UNION cut is its own fact, with its own field and its own count. It must
+    # not be signalled by degrading ``history_state``, which describes the
+    # transcript scan alone: a union cut is not a read fault in any source, so that
+    # spelling says two false things at once -- it blames a transcript read that
+    # completed, and it leaves ``history_omitted`` reporting nothing cut while rows
+    # are dropped. Neither is actionable, because re-reading history cannot recover
+    # a row the union bound cut.
+    #
+    # Zero when nothing was cut, so a reader distinguishes "no overflow" from a
+    # cut whose size it must know to judge the roster it was handed.
+    roster_omitted = max(0, len(roster) - MAX_SESSION_STATUS_ROWS)
+    for key in sorted(roster)[:MAX_SESSION_STATUS_ROWS]:
+        slot = state.get_slot(key)
+        from_tree = key in tree_children
+        from_history = key in history_children
+        sources = [
+            source
+            for source, present in (
+                ("crew_log", from_tree),
+                ("history", from_history),
+                ("live", slot is not None),
+            )
+            if present
+        ]
+        if slot is None:
+            if from_tree:
+                # The attested tree still owns this status. History may corroborate
+                # the birth, but it does not turn editable metadata into lineage.
+                rows.append({"target": key, "status": "gone", "source": "+".join(sources)})
+                continue
+            meta = history_children[key]
+            rows.append(
+                {
+                    "target": key,
+                    "title": meta["title"],
+                    "status": "unknown",
+                    "source": "history",
+                }
+            )
+            continue
+        if ownership_fenced and _created_by_other(slot, caller_key):
+            # The tree placed this row (an adoption), and the fence does not admit
+            # it. Dropped rather than reported without a title, because a fenced
+            # caller learning that a session it may not touch exists is the
+            # enumeration this fence prevents everywhere else.
+            continue
+        if getattr(slot, "workspace", "default") != getattr(caller_slot, "workspace", "default"):
+            # Workspaces are the memory boundary, and it is the same boundary
+            # `authorize_target` refuses across. A row the caller could not then
+            # message would be a listing of work it cannot see.
+            continue
+        queue_depth = len(slot._queue)
+        # `slot.running` alone is not "busy": between a multi-stage plan's stages
+        # each stage closes its own turn, so it reads False while the plan is live
+        # -- the same reason `read_messages` ors in `_in_stage_execution`.
+        running = bool(slot.running or getattr(slot, "_in_stage_execution", False))
+        rows.append(
+            {
+                "target": key,
+                "title": _bounded_status_title(slot.display_title),
+                "status": "working" if running else ("queued" if queue_depth else "idle"),
+                "running": running,
+                "queue_depth": queue_depth,
+                "source": "+".join(sources),
+            }
+        )
+
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="status",
+        slot_key=caller_key,
+        outcome="allowed",
+        detail={
+            "rows": len(rows),
+            "tree": tree_state,
+            "history": history_state,
+            "history_omitted": history_omitted,
+            "roster_omitted": roster_omitted,
+        },
+    )
+    return {
+        "ok": True,
+        "caller": caller_key,
+        # How much of the durable roster this answer rests on. A caller that reads
+        # only `sessions` and gets a short list cannot tell "you created three" from
+        # "I could read three", and for a patrol deciding whether a worker was lost
+        # those are opposite conclusions.
+        "tree": tree_state,
+        # History metadata is a separate, weaker roster source. Its quality must
+        # not be folded into `tree`, whose value describes only the crew-log fold.
+        "history": history_state,
+        # Exact count of matching transcript rows not retained due to the bound.
+        # Kept separate from ``history`` so callers can distinguish a read fault
+        # from deliberate overflow while old clients still see ``incomplete``.
+        "history_omitted": history_omitted,
+        # Exact count of rows the UNION of the three sources lost to
+        # ``MAX_SESSION_STATUS_ROWS``. Separate from ``history_omitted`` because it
+        # is a different cut with a different remedy: this one is not a read fault
+        # in any source, and no source's quality field describes it. Zero when the
+        # whole union was retained.
+        "roster_omitted": roster_omitted,
+        "sessions": rows,
+    }
 
 
 def read_messages(
