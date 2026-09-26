@@ -54,6 +54,7 @@ from kiro_crew.slack.allowlist import (
     persist_allowed_user,
     persist_tracking_channel,
 )
+from kiro_crew.slack.blocks import STOP_KEY_SEP
 from kiro_crew.slack.format import (
     LINK_DASHBOARD_ACTION,
     OPTIONS_ACTION_PREFIX,
@@ -2130,9 +2131,16 @@ async def _handle_allowlist(
         if not _orch:
             logger.error("Allowlist approve: orchestrator not initialized")
             return
+        # Persist BEFORE publishing. ``run_config_write`` raises out of
+        # ``update_config_locked`` on an IO failure. Publishing first would admit a
+        # guest with no durable record: the live set is already mutated, the raise
+        # skips the SEL approve row below so nothing records the grant, and the
+        # owner's own ``format_allowlist`` reads config, so the owner cannot see the
+        # guest they are now answering. Publishing last means a raise leaves the
+        # grant absent everywhere rather than present in memory only.
+        await run_config_write(persist_allowed_user, new_user_id, name=display_name)
         _orch._allowed_users.add(new_user_id)
         set_allowed_users(_orch._allowed_users)
-        await run_config_write(persist_allowed_user, new_user_id, name=display_name)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.allowlist.approve",
@@ -2156,10 +2164,20 @@ async def _handle_allowlist(
         if not _orch:
             logger.error("Allowlist deny: orchestrator not initialized")
             return
-        # Remove from in-memory set and persisted config
+        # Persist BEFORE publishing, the same order as the approve branch above
+        # and for the sharper reason: the durable record is the AUTHORITY for
+        # guest standing. Discarding first makes a failed write look like a
+        # completed revocation -- the live set rejects them, the raise
+        # out of ``update_config_locked`` skips the SEL deny row below so nothing
+        # records the removal, and config still carries the grant. The gateway
+        # then restores it, and not only at the next restart: the
+        # ``slack.allowed_users`` applier rebuilds the live set FROM CONFIG on any
+        # change to that key, so admitting some other guest silently un-revokes
+        # this one. Publishing last means a raise leaves the grant present
+        # everywhere rather than absent in memory only.
+        await run_config_write(persist_allowed_user, new_user_id, remove=True)
         _orch._allowed_users.discard(new_user_id)
         set_allowed_users(_orch._allowed_users)
-        await run_config_write(persist_allowed_user, new_user_id, remove=True)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.allowlist.deny",
@@ -2536,8 +2554,12 @@ async def _handle_stop_kill_now(
             error="unauthorized user",
         )
         return
-    session_key = action.get("value", "")
-    if not session_key:
+    # Every target the cooperative stop covered, not just the first. The value is
+    # packed by ``blocks.build_stopping_blocks``; splitting on the separator makes a
+    # BARE key the one-element case, so an ephemeral posted before this shipped stays
+    # clickable rather than erroring.
+    stop_keys = [k for k in action.get("value", "").split(STOP_KEY_SEP) if k]
+    if not stop_keys:
         return
 
     response_url = payload.get("response_url", "")
@@ -2567,14 +2589,29 @@ async def _handle_stop_kill_now(
                 channel, "⛔ Execution stopped — session reset.", thread_ts
             )
 
-    outcome = await _orch.sessions.stop_turn(session_key, force=True, on_hard=_on_hard)
+    # Each key gets its own force-stop. ``_on_hard`` is passed to the FIRST only:
+    # it posts the user-facing "session reset" notice and replaces the ephemeral, so
+    # running it per key would repeat both for one click.
+    outcomes = []
+    for _i, _key in enumerate(stop_keys):
+        outcomes.append(
+            await _orch.sessions.stop_turn(_key, force=True, on_hard=_on_hard if _i == 0 else None)
+        )
+    outcome = outcomes[0] if outcomes else ""
     sel().log_tool_invocation(
-        session_key=session_key,
+        session_key=stop_keys[0],
         source="slack",
         tool_name="stop_kill_now",
         tool_kind="command",
         outcome=outcome,
-        metadata={"user": user_id, "channel": channel},
+        metadata={
+            "user": user_id,
+            "channel": channel,
+            # Both sides of the boundary record the full set, so an audit reader can
+            # see the escalation covered the guest turn and not only the thread key.
+            "keys": ",".join(stop_keys),
+            "outcomes": ",".join(str(o) for o in outcomes),
+        },
     )
 
 
@@ -2588,9 +2625,15 @@ async def _handle_allowlist_remove(
     if not target_id:
         return
 
+    # Persist BEFORE publishing, for the reason spelled out in the deny branch:
+    # the durable record is the authority, and the ``slack.allowed_users`` applier
+    # rebuilds the live set from config on any change to that key, so a discard
+    # that was never persisted is undone by the next grant rather than surviving
+    # until a restart. This is the path an EXISTING guest reaches -- re-nominating
+    # one renders Keep/Remove -- so it is the revocation that matters most.
+    await run_config_write(persist_allowed_user, target_id, remove=True)
     _orch._allowed_users.discard(target_id)
     set_allowed_users(_orch._allowed_users)
-    await run_config_write(persist_allowed_user, target_id, remove=True)
 
     from kiro_crew.slack.blocks import allowlist_list_block
 

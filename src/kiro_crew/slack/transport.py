@@ -10,7 +10,9 @@ Direction of dependency is ``slack -> messaging`` (allowed): the neutral
 ``messaging`` package never imports Slack.
 
 Security note: :meth:`SlackTransport.authorize` is **deny-by-default** and
-owner-only. An unconfigured transport (empty ``allowed_users``) authorizes
+allow-list-only, NOT owner-only: the Slack gateway loads ``slack.allowed_users``
+into the set it hands here, so an allow-listed guest passes it like any other
+allowed sender. An unconfigured transport (empty ``allowed_users``) authorizes
 nobody. Bot-authored events are dropped unless their ``bot_id`` positively
 matches the ``trusted_bot_ids`` allow-list (empty by default, so an
 unconfigured transport drops every bot), mirroring the Socket Mode drop site
@@ -148,7 +150,8 @@ class SlackTransport(MessagingTransport):
         Slack remains absent from the shared transport registry, so ordinary
         proactive traffic still uses the gateway's existing route. The gateway
         creates this adapter only for inbound-spool replay and supplies a fresh
-        snapshot of its owner roster. ``conversation_id`` is an opaque channel
+        snapshot of its allow-list, which holds every permitted sender rather
+        than the owner alone. ``conversation_id`` is an opaque channel
         id, so the persisted sender principal is the only identity this gate can
         recheck; empty or revoked principals fail closed.
         """
@@ -156,7 +159,14 @@ class SlackTransport(MessagingTransport):
 
     # -- Inbound adapter ----------------------------------------------------
     def authorize(self, msg: InboundMessage) -> bool:
-        """Owner-only, deny-by-default. Empty allow-list authorizes nobody."""
+        """Allow-list-only, deny-by-default. Empty allow-list authorizes nobody.
+
+        NOT owner-only: the Slack gateway loads ``slack.allowed_users`` into the
+        set handed here, so an allow-listed guest passes this check like any other
+        allowed sender. What keeps a guest off the transport path is
+        ``handle_message_transport``'s own refusal of a non-empty ``guest_user``,
+        plus ``_route_message`` excluding an admitted guest from ``_use_transport``.
+        """
         allowed = bool(msg.user_id) and msg.user_id in self._allowed_users
         if not allowed:
             # Audit ALL denials, including empty/missing user_id (deny-by-default
@@ -182,7 +192,7 @@ class SlackTransport(MessagingTransport):
         # A bot-authored event is admitted ONLY on a positive match of its
         # bot_id against the trusted_bot_ids allow-list (deny-by-default:
         # the empty default drops every bot-authored event). That second
-        # allow-list exists precisely to admit bot ids, which the owner-only
+        # allow-list exists precisely to admit bot ids, which the HUMAN
         # user allow-list never contains. Mirrors the Socket Mode drop site
         # (slack/events.py) so the two inbound paths agree:
         # - The gateway's own bot id is never trusted even when listed --
@@ -237,7 +247,7 @@ class SlackTransport(MessagingTransport):
         )
         if from_trusted_bot:
             # The positive allow-list match IS the bot's authorization (a
-            # bot id is never in the owner-only allow-list); audit the
+            # bot id is never in the human user allow-list); audit the
             # admission so the decision basis stays traceable.
             sel().log_api_access(
                 caller=msg.user_id,

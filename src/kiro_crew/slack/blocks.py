@@ -7,6 +7,10 @@ Action IDs follow the mc_<command>_<action>[_<id>] convention.
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _MAX_MSG_CHARS = 4000
 _MAX_MESSAGES = 5
@@ -496,8 +500,26 @@ REVIEW_ACTION_REVISE = "mc_review_revise"
 REVIEW_ACTION_CANCEL = "mc_review_cancel"
 
 
-def build_stopping_blocks(session_key: str) -> list[dict]:
-    """Ephemeral 'Stopping…' message with a Kill Now escalation button."""
+#: Separator packing several stop targets into one Slack action value. A session
+#: key is ``slack:<ts>``, ``slack:guest-<uid>-<ts>`` or ``dashboard:<slot>``, none
+#: of which contain a pipe, and splitting on it makes a SINGLE key the degenerate
+#: one-element case for free -- which is what keeps an ephemeral already posted in
+#: Slack, whose value holds one bare key, clickable after this ships.
+STOP_KEY_SEP = "|"
+
+
+def build_stopping_blocks(session_keys: "str | Sequence[str]") -> list[dict]:
+    """Ephemeral 'Stopping…' message with a Kill Now escalation button.
+
+    Takes every key the cooperative stop covers, because the button is the ONLY
+    stop target that leaves this process: it crosses into Slack and comes back to
+    ``interactions._handle_stop_kill_now`` as an action value. A single key here
+    meant the owner's escalation force-stopped the owner-side thread key while a
+    guest turn kept running under ``slack:guest-<uid>-<ts>``.
+
+    A bare string is accepted so existing callers with one key read naturally.
+    """
+    keys = [session_keys] if isinstance(session_keys, str) else [k for k in session_keys if k]
     return [
         {
             "type": "section",
@@ -505,14 +527,16 @@ def build_stopping_blocks(session_key: str) -> list[dict]:
         },
         {
             "type": "actions",
-            "block_id": f"stop-actions-{session_key}",
+            # First key only: this is an identifier for the block, it is not parsed
+            # by any consumer, and the full set travels in the button's value.
+            "block_id": f"stop-actions-{keys[0] if keys else ''}",
             "elements": [
                 {
                     "type": "button",
                     "action_id": "stop_kill_now",
                     "style": "danger",
                     "text": {"type": "plain_text", "text": "Kill Now"},
-                    "value": session_key,
+                    "value": STOP_KEY_SEP.join(keys),
                 }
             ],
         },

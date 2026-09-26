@@ -4876,6 +4876,7 @@ class ContextBuilder:
         execution_context: Any = None,
         context_provider: "ContextPromptProvider | None" = None,
         steering_dirs: tuple[str, ...] = (),
+        hooks: Any = None,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -4942,7 +4943,19 @@ class ContextBuilder:
                 if is_new_session and not resumed and not needs_reinjection:
                     native_documents = context_provider.native_context_documents
         is_custom = agent and agent != "kirocrew"
-        hook_result = self.hooks.on_message(text)
+        # The caller's manager when it supplied one, else this builder's own.
+        #
+        # A caller that has SCOPED its hooks for the turn must have that scoping
+        # apply here too. A Slack guest turn builds a restricted manager and runs
+        # it for the auto-reply intercept, but this call read ``self.hooks`` -- the
+        # owner's unscoped manager -- so the owner's ``transforms`` could rewrite
+        # the text that becomes ``_trigger_text`` below, and that text selects the
+        # memory this turn retrieves. Owner-configured rewriting steering an
+        # untrusted turn's memory retrieval is the thing the scoping exists to
+        # stop. ``None`` keeps every existing caller, including every owner path,
+        # on exactly the manager it used before.
+        _hooks = hooks if hooks is not None else self.hooks
+        hook_result = _hooks.on_message(text)
 
         parts: list[str] = []
         # Set together with the user's text part when user_text_range is given.

@@ -23,7 +23,7 @@ import os
 import re
 import tempfile
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, NamedTuple
 
 import aiohttp
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -39,6 +39,7 @@ from kiro_crew.agent_spec_format import (
     parse_agent_spec_text,
 )
 from kiro_crew.config.loader import (
+    ACTIVATION_ALWAYS,
     ACTIVATION_MENTION,
     ACTIVATION_OBSERVE,
     ACTIVATION_OFF,
@@ -54,10 +55,12 @@ from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.mcp_discovery import list_servers
 from kiro_crew.messaging.commands import note_user_stop
-from kiro_crew.messaging.dispatch import admit_inbound_callback
+from kiro_crew.messaging.dispatch import admit_inbound_callback, toolless_turns_supported
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.platform import current_context, safe_context_call
+from kiro_crew.platform.context import redact_log_via_context
+from kiro_crew.platform.defaults import DefaultSlackEnterpriseGate
 from kiro_crew.platform.interfaces import InterceptDecision
 from kiro_crew.safety_override import safety_override, yolo_policy_permits
 from kiro_crew.security import (
@@ -68,7 +71,7 @@ from kiro_crew.security import (
 from kiro_crew.sel import sel
 from kiro_crew.session import unlink_queued_temp_paths
 from kiro_crew.skills import SkillsLoader
-from kiro_crew.slack.allowlist import prompt_track_channel, send_dashboard_link
+from kiro_crew.slack.allowlist import prompt_allowlist, prompt_track_channel, send_dashboard_link
 from kiro_crew.slack.blocks import (
     build_stopping_blocks,
     channels_modal,
@@ -90,10 +93,16 @@ from kiro_crew.slack.handler import (
     APPROVAL_AUTO,
     APPROVAL_INTERACTIVE,
     describe_grant_lifetime,
+    format_allowlist,
+    guest_member_configured,
+    guest_session_key,
     handle_message,
     is_allowed_user,
+    is_guest_user,
     is_owner,
+    is_tracked_channel,
     is_yolo_mode,
+    resolve_guest_agent,
     set_allowed_users,
     set_dashboard_state,
     set_open_channels,
@@ -484,8 +493,7 @@ async def _handle_yolo(
         if orch.dashboard_state:
             orch.dashboard_state.push_slots_update()
         await respond(
-            f"🟢 YOLO mode *ON* ({describe_grant_lifetime()})"
-            f" — all tools auto-approved."
+            f"🟢 YOLO mode *ON* ({describe_grant_lifetime()})" f" — all tools auto-approved."
         )
     elif arg == "off":
         from kiro_crew.slack.handler import (
@@ -592,9 +600,13 @@ register_slash_command("config", _handle_config, "manage users and channels (own
 async def _handle_allowlist_cmd(
     orch: GatewayOrchestrator, caller_id: str, args: str, respond: Callable
 ) -> None:
-    """Multi-user access disabled — user management is blocked."""
+    """List who has Slack access. Read-only; nomination is ``/<cmd> @user``."""
+    if not is_owner(caller_id):
+        await respond("⛔ Only the owner can view the allowlist.")
+        return
     await respond(
-        "⛔ Multi-user access is disabled for security. Only the owner can use Kiro Crew via Slack."
+        f"{format_allowlist(orch._cfg)}\n\n"
+        f"_Use `/{orch.slack_command} @user` to nominate someone._"
     )
 
 
@@ -791,16 +803,22 @@ async def _handle_restart(
     """Restart the gateway process (owner-only, requires systemd supervisor)."""
     if not is_owner(caller_id):
         sel().log_tool_invocation(
-            session_key="", source="slack", tool_name="/kirocrew restart",
-            outcome="denied", resources=f"user={caller_id}",
+            session_key="",
+            source="slack",
+            tool_name="/kirocrew restart",
+            outcome="denied",
+            resources=f"user={caller_id}",
         )
         await respond("⛔ Only the owner can restart the gateway.")
         return
 
     if not os.environ.get("INVOCATION_ID"):
         sel().log_tool_invocation(
-            session_key="", source="slack", tool_name="/kirocrew restart",
-            outcome="denied", resources=f"user={caller_id},reason=no_supervisor",
+            session_key="",
+            source="slack",
+            tool_name="/kirocrew restart",
+            outcome="denied",
+            resources=f"user={caller_id},reason=no_supervisor",
         )
         await respond(
             "⛔ Restart requires a process supervisor (systemd). "
@@ -809,8 +827,11 @@ async def _handle_restart(
         return
 
     sel().log_tool_invocation(
-        session_key="", source="slack", tool_name="/kirocrew restart",
-        outcome="approved", resources=f"user={caller_id}",
+        session_key="",
+        source="slack",
+        tool_name="/kirocrew restart",
+        outcome="approved",
+        resources=f"user={caller_id}",
     )
     try:
         await respond("♻️ Restarting gateway…")
@@ -850,9 +871,7 @@ async def _handle_restart(
             # NOT catch CancelledError (propagates to keep this 5s deadline
             # honest); a still-held lock from a pathological overrun is recovered
             # by the orphan reaper on next startup.
-            await asyncio.wait_for(
-                orch.sessions.close_all(drain_timeout=2.0), timeout=5.0
-            )
+            await asyncio.wait_for(orch.sessions.close_all(drain_timeout=2.0), timeout=5.0)
     except Exception:
         logger.debug("Session cleanup before restart failed", exc_info=True)
     # Flush the SEL audit queue: logging is async (background writer thread +
@@ -912,10 +931,9 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
         orch.slack = None
         return
 
-    # Invariant: _allowed_users contains only the owner (multi-user disabled)
     assert orch._owner_id, "owner_id must be set"
 
-    # Share owner-only allowlist and tracking channels with handler modules
+    # Share the owner + guest allowlist and tracking channels with handler modules
     set_allowed_users(orch._allowed_users)
     set_tracking_channels(orch._tracking_channels)
     set_open_channels(orch._open_channels)
@@ -1138,9 +1156,7 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
             # list (e.g. 100+ skills) would overflow and make views.publish fail
             # with invalid_arguments, breaking the whole Home tab. Mirrors the
             # cron block's jobs[:15] guard below.
-            def _capped_names_section(
-                label: str, names: list[str], budget: int = 2900
-            ) -> dict:
+            def _capped_names_section(label: str, names: list[str], budget: int = 2900) -> dict:
                 total = len(names)
                 prefix = f"*{label} ({total}):* "
                 suffix_room = 24  # reserve for "  _…and N more_"
@@ -1160,13 +1176,9 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
                 return {"type": "section", "text": {"type": "mrkdwn", "text": line}}
 
             if servers:
-                blocks.append(
-                    _capped_names_section("MCP Integrations", [s.name for s in servers])
-                )
+                blocks.append(_capped_names_section("MCP Integrations", [s.name for s in servers]))
             if skills:
-                blocks.append(
-                    _capped_names_section("Skills", [s["name"] for s in skills])
-                )
+                blocks.append(_capped_names_section("Skills", [s["name"] for s in skills]))
             if not servers and not skills:
                 blocks.append(
                     {
@@ -1546,12 +1558,18 @@ async def _handle_slash(orch: GatewayOrchestrator, payload: dict) -> None:
         _spawn(handler(orch, caller_id, args, _respond))
         return
 
-    # Fallback: @user mention — multi-user access disabled for security
+    # Fallback: @user mention — nominate a guest for the allowlist. Owner-only,
+    # because the caller check at the top of this handler is owner-only. The
+    # nomination itself changes nothing: it DMs the owner an Allow / Deny prompt,
+    # and the Allow button is what adds the user and persists them.
     user_match = re.search(r"<@([A-Z0-9]+)(?:\|([^>]+))?>", cmd_text)
     if user_match:
-        _spawn(
-            _respond("⛔ Multi-user access is disabled. Only the owner can use Kiro Crew via Slack.")
-        )
+        target_id = user_match.group(1)
+        if is_owner(target_id):
+            _spawn(_respond("ℹ️ That is you — the owner always has access."))
+            return
+        _spawn(prompt_allowlist(orch.slack, orch._owner_id, target_id))
+        _spawn(_respond(f"📨 Check your DM to allow or deny <@{target_id}>."))
         return
 
     # Fallback: #channel mention — Slack sends <#C1234|name> or <#C1234>
@@ -1587,9 +1605,7 @@ def _maybe_prompt_owner(orch: GatewayOrchestrator, event: dict) -> None:
 # cannot disagree about what is audio.
 
 
-def _voice_memo_context(
-    text: str, memos: int, transcribed: int, *, available: bool
-) -> str:
+def _voice_memo_context(text: str, memos: int, transcribed: int, *, available: bool) -> str:
     """*text* plus one visible note per voice memo that produced no words.
 
     A memo whose transcription is unavailable or failed would otherwise be dropped
@@ -1796,12 +1812,20 @@ async def _handle_message_deleted(orch: GatewayOrchestrator, event: dict) -> Non
         )
 
 
-def _resolve_approval_mode(orch: "GatewayOrchestrator") -> str:
+def _resolve_approval_mode(orch: "GatewayOrchestrator", *, guest: bool = False) -> str:
     """Slack dispatch approval mode: CLI --approval flag wins, else config.
 
     Normalized to handle_message's auto/interactive contract; reads/yolo are
     gated separately (gateway approval-event path, global YOLO/trust).
+
+    A guest turn never resolves to auto. YOLO is an owner's standing instruction
+    about the owner's own turns, and a guest is not the one who granted it, so a
+    live grant must not widen what an allow-listed non-owner can run. This is one
+    of two independent block points: the guest tool gate refuses a
+    non-allowlisted tool even if a caller reaches it with auto anyway.
     """
+    if guest:
+        return APPROVAL_INTERACTIVE
     # Runtime YOLO (owner-toggled via the `yolo` slash command, TTL-capped safety_override)
     # auto-approves all tools. The native loop checks is_yolo_mode() inline; the
     # transport TurnDriver only sees this resolved mode, so fold YOLO in here at
@@ -1834,9 +1858,76 @@ async def _dispatch_queued(
     # to native). Review-mode channels stay on native (privacy gate), matching
     # the _route_message gate.
     _activation = slack_cfg(orch).channel_config(channel).activation
+    _guest_user = str(kwargs.get("guest_user") or "")
+    # The member this turn runs as. For an owner turn it is the stored per-channel
+    # or per-thread override; for a guest it is REPLACED below by the one the
+    # re-authorization returns, because a queue entry carries the member that was
+    # authorized at enqueue and the owner may have repointed the channel since.
+    _dispatch_agent = kwargs.get("agent_override")
+    if _guest_user:
+        # RE-AUTHORIZE, because this turn is starting now and was admitted then.
+        # Between the two the owner may have revoked the grant, untracked the
+        # channel, changed its activation, repointed the member or switched the
+        # backend -- and a queued item carries the OLD answer to all of those.
+        # Revocation persists through the config write and the applier reconcile,
+        # so the live allowlist is authoritative here; this is the one path that
+        # would otherwise run a turn the owner has already taken away.
+        _re = await decide_guest_admission(
+            orch,
+            sender_id=str(kwargs.get("sender_id", "") or ""),
+            channel=channel,
+            activation=_activation,
+            thread_ts=thread_ts,
+            # A fact of the message, stored at enqueue; everything else above is
+            # re-read live.
+            is_mention=bool(kwargs.get("is_mention", False)),
+        )
+        if not _re.admitted:
+            sel().log_api_access(
+                caller=str(kwargs.get("sender_id", "") or ""),
+                operation="slack.message",
+                outcome="denied",
+                source="slack",
+                resources=channel,
+                error=f"queued_guest_turn:{_re.deny_reason}",
+            )
+            logger.warning(
+                "Dropping queued guest turn for %s in %s (%s)",
+                redact_log_via_context(_guest_user),
+                channel,
+                _re.deny_reason,
+            )
+            if orch.slack:
+                try:
+                    await orch.slack.post_ephemeral(
+                        channel,
+                        str(kwargs.get("sender_id", "") or ""),
+                        _denial_ephemeral(True, _re.deny_reason),
+                        thread_ts=thread_ts or msg_ts,
+                    )
+                except Exception:
+                    logger.debug("queued guest denial post failed", exc_info=True)
+            # Through the SAME cleanup a dispatched turn uses, so the queued
+            # attachment temp files are unlinked rather than left behind.
+            unlink_queued_temp_paths(kwargs)
+            return
+        # The authorization a turn runs under IS the one just computed -- every
+        # field of it, not only its yes/no. The member is the field that can
+        # differ: the entry stores the member authorized at enqueue, so a guest
+        # who queued under member A while the owner then repointed the channel to
+        # B would be authorized as B and run as A, keeping A's memory store.
+        #
+        # The resolution in handler.py re-applies ``guest_member_configured`` to
+        # the config it loads, but it applies it to whichever member it is HANDED,
+        # so a stale member that is still a validly configured guest member passes
+        # it cleanly. That check cannot see the staleness; only this line can.
+        _dispatch_agent = _re.agent
     _use_transport = (
         getattr(getattr(slack_cfg(orch), "messaging", None), "use_transport", False) is True
         and _activation != ACTIVATION_REVIEW
+        # A queued guest turn takes the same native-only route its immediate
+        # dispatch would have taken.
+        and not _guest_user
     )
     try:
         if _use_transport:
@@ -1851,6 +1942,13 @@ async def _dispatch_queued(
                 context_builder=orch.ctx_builder,
                 conversation_log=orch.conv_log,
                 approval_mode=_resolve_approval_mode(orch),
+                # Always "" while the guard above holds, and passed anyway for the
+                # same reason the immediate dispatch passes it: the refusal inside
+                # handle_message_transport exists so a future caller cannot route a
+                # guest there by accident, and a caller that passes nothing gets the
+                # parameter's default instead -- which silences that refusal on
+                # exactly this one of the two call sites. Belt and braces on both.
+                guest_user=_guest_user,
                 agent_override=kwargs.get("agent_override"),
                 subagent_manager=orch.subagent_mgr,
                 task_runner=orch.task_runner,
@@ -1882,16 +1980,22 @@ async def _dispatch_queued(
             msg_ts,
             kwargs.get("sender_id", ""),
             team_id=kwargs.get("team_id", ""),
-            approval_mode=_resolve_approval_mode(orch),
+            approval_mode=_resolve_approval_mode(orch, guest=bool(_guest_user)),
             context_builder=orch.ctx_builder,
             cron_service=orch.cron_svc,
             conversation_log=orch.conv_log,
             consolidator=orch.consolidator,
             subagent_manager=orch.subagent_mgr,
             task_runner=orch.task_runner,
-            channel_agent=kwargs.get("agent_override"),
+            # The member the re-authorization returned for a guest turn, the stored
+            # override for an owner turn. No ``guest_cfg`` rides along: a turn that
+            # arrives without one is re-verified against a config the resolution
+            # loads itself (handler.py:3538-3539), which is at least as current as
+            # anything this path could hand over.
+            channel_agent=_dispatch_agent,
             user_display_name=kwargs.get("user_display_name"),
             from_trusted_bot=bool(kwargs.get("from_trusted_bot", False)),
+            guest_user=_guest_user,
         )
     finally:
         # The enqueue path deferred temp-image cleanup to here so the queued
@@ -1983,23 +2087,17 @@ def _extract_blocks_text(blocks: list[dict]) -> str:
                         sub_els = child.get("elements", [])
                         if not isinstance(sub_els, list):
                             sub_els = []
-                        inline = "".join(
-                            _render_rich_text_element(el) for el in sub_els
-                        )
+                        inline = "".join(_render_rich_text_element(el) for el in sub_els)
                         if inline:
                             parts.append(f"- {inline}")
                 elif el_type == "rich_text_quote":
                     # Quote blocks: prefix with "> "
-                    inline = "".join(
-                        _render_rich_text_element(el) for el in child_els
-                    )
+                    inline = "".join(_render_rich_text_element(el) for el in child_els)
                     if inline:
                         parts.append(f"> {inline}")
                 else:
                     # rich_text_section, rich_text_preformatted
-                    inline = "".join(
-                        _render_rich_text_element(el) for el in child_els
-                    )
+                    inline = "".join(_render_rich_text_element(el) for el in child_els)
                     if inline:
                         parts.append(inline)
         elif block_type == "section":
@@ -2028,10 +2126,12 @@ def _extract_blocks_text(blocks: list[dict]) -> str:
 # NOTE: These are best-effort, undocumented, English-only Slack placeholder strings.
 # They may change or be localized — recovery is best-effort for non-English workspaces.
 # No fuzzy/structural detection is attempted (out of scope; would change behavior broadly).
-_SLACK_BLOCK_FALLBACKS = frozenset({
-    "This message contains interactive elements.",
-    "This content can't be displayed.",
-})
+_SLACK_BLOCK_FALLBACKS = frozenset(
+    {
+        "This message contains interactive elements.",
+        "This content can't be displayed.",
+    }
+)
 
 
 def _normalize_message_blocks(raw: list) -> list[dict]:
@@ -2107,6 +2207,272 @@ def _extract_shared_text(event: dict) -> str:
             if extracted:
                 return extracted
     return "\n\n".join(part for part in parts if part).strip()
+
+
+#: What a refused sender is told, keyed by the guest gate's own deny reason. Each
+#: string names the condition that actually failed, so the advice is followable:
+#: telling an already-allow-listed guest to ask for the allowlist sends them to
+#: the owner for something the owner has already done.
+_GUEST_DENIAL_TEXT = {
+    "guest_dm_not_supported": (
+        "⛔ I answer allow-listed guests in channels the owner tracks, not in DMs. "
+        "Mention me in one of those channels instead."
+    ),
+    "guest_channel_not_tracked": (
+        "⛔ You are on the allowlist, but this channel is not one the owner tracks. "
+        "Ask the owner to track it."
+    ),
+    "guest_thread_not_own": (
+        "⛔ You are on the allowlist, but inside a thread I only answer the person "
+        "who started it. Post a new message in the channel and mention me there to "
+        "open your own thread."
+    ),
+    "guest_member_not_configured": (
+        "⛔ You are on the allowlist, but the guest agent for this channel is not "
+        "set up, so I cannot answer you yet. Ask the owner to check it."
+    ),
+    "guest_config_unreadable": (
+        "⛔ You are on the allowlist, but I could not read my own configuration "
+        "just now, so I am not answering rather than guessing. Try again shortly."
+    ),
+    "guest_backend_cannot_gate_tools": (
+        "⛔ You are on the allowlist, but this install runs a model backend where "
+        "I cannot limit a guest's tools, so I do not answer guests here. Ask the "
+        "owner to check the backend setting."
+    ),
+    "guest_access_revoked": (
+        "⛔ Your access was removed while this message was waiting, so I am not "
+        "answering it. Ask the owner if that was not intended."
+    ),
+    "guest_mention_required": (
+        "⛔ You are on the allowlist, but I open a thread for a guest only when "
+        "you mention me. Mention me in your message and I will answer there."
+    ),
+    "guest_denied_composed_interceptor": (
+        "⛔ You are on the allowlist, but this workspace runs an access gate that "
+        "guests are not routed through, so I cannot answer you here."
+    ),
+}
+
+#: Shown when no more specific reason applies: a sender who is not on the
+#: allowlist at all, and a guest refused by an activation mode.
+_DENIAL_TEXT_UNAUTHORIZED = (
+    "⛔ You are not authorized to use this bot. Ask the owner to add you to the allowlist."
+)
+_DENIAL_TEXT_ACTIVATION = (
+    "⛔ You are on the allowlist, but the owner has this channel set to a mode "
+    "that does not answer guests."
+)
+
+
+def composed_interceptor_registered() -> bool:
+    """True when the message interceptor is a COMPOSED gate, not the shipped default.
+
+    A guest turn is refused while one is registered, and the reason is what
+    ``InterceptDecision.REDIRECTED`` is documented to do: the gate "minted + posted
+    a presigned dashboard-session challenge link". A dashboard session is the
+    OWNER's whole surface -- memory, files, shell -- so routing a guest through the
+    interceptor would hand an allow-listed non-owner a one-time link to it. That is
+    strictly worse than the gap it would close, and it is the same presigned-link
+    control every other site on this surface refuses a guest.
+
+    Tested on the METHOD, not the class: a subclass that overrides
+    ``intercept_message`` is composed, while one that inherits it behaves exactly
+    like the default and is not. Any failure to read the gate answers True --
+    deny-by-default, matching the seam's own fail-closed contract, which degrades an
+    erroring gate to ``DROPPED`` rather than to ``PROCESS``.
+    """
+    try:
+        gate = current_context().slack_gate
+        shipped = DefaultSlackEnterpriseGate.intercept_message
+        return getattr(type(gate), "intercept_message", None) is not shipped
+    except Exception:
+        logger.debug("Interceptor composition check failed; treating as composed", exc_info=True)
+        return True
+
+
+class GuestAdmission(NamedTuple):
+    """The guest admission decision, and what a caller needs to act on it."""
+
+    admitted: bool
+    agent: str
+    deny_reason: str
+    cfg: Any | None
+
+
+async def decide_guest_admission(
+    orch: GatewayOrchestrator,
+    *,
+    sender_id: str,
+    channel: str,
+    activation: str,
+    thread_ts: str | None,
+    is_mention: bool,
+) -> GuestAdmission:
+    """Whether *sender_id* may run a guest turn RIGHT NOW, and on which member.
+
+    A UNIT rather than a block inside the inbound path, because a guest turn must
+    be authorized at the moment it RUNS and not at the moment it arrived. A queued
+    follow-up is started from stored kwargs minutes later, by which time the owner
+    may have revoked the grant, untracked the channel, changed the channel's
+    activation, repointed the member or switched the backend -- and the arrival
+    decision knows none of that. Every condition here is re-read live for that
+    reason; the caller supplies only facts of the MESSAGE, which cannot change.
+
+    ``is_mention`` is such a fact: whether this message mentioned the bot is fixed
+    when it was posted. Thread OWNERSHIP is not, so it is re-read from the index
+    on every call rather than carried.
+
+    Returns ``admitted`` plus the resolved member, the reason when refused, and the
+    config object the decision was made ON -- which execution then runs against, so
+    an operator editing the member between this call and the turn cannot pass here
+    and execute elsewhere.
+    """
+    if not is_guest_user(sender_id):
+        # Only reachable from a RE-check: the inbound path tests candidacy before
+        # it calls this. So the grant existed and is gone, which is its own reason
+        # rather than a bare "unauthorized".
+        return GuestAdmission(False, "", "guest_access_revoked", None)
+    if channel.startswith("D"):
+        # A channel is observable by the owner; a DM is not. Guest DMs are
+        # refused by an explicit check rather than as a side effect of a
+        # DM channel never appearing in tracking_channels.
+        return GuestAdmission(False, "", "guest_dm_not_supported", None)
+    if not is_tracked_channel(channel):
+        return GuestAdmission(False, "", "guest_channel_not_tracked", None)
+    if activation not in (ACTIVATION_MENTION, ACTIVATION_ALWAYS, ACTIVATION_OBSERVE):
+        return GuestAdmission(False, "", f"guest_denied_in_activation_{activation}", None)
+    if composed_interceptor_registered():
+        # A composed edition's interceptor can mint and post a presigned
+        # dashboard-session link (``InterceptDecision.REDIRECTED``). The
+        # interceptor block in the inbound path is gated on ``_user_authorized``,
+        # which excludes guest candidates, so an admitted guest's turn would run
+        # UN-intercepted -- and the alternative, putting guests through it, would
+        # hand a non-owner a link to the owner's dashboard. Refusing while such a
+        # gate is registered is the only option that widens nothing. The OSS
+        # default is not composed, so a standalone install is unaffected.
+        return GuestAdmission(False, "", "guest_denied_composed_interceptor", None)
+    if not thread_ts:
+        # Top level, and not a mention -- an ``activation=always`` channel answers
+        # without one, so this is reachable. It is NOT the own-thread failure: the
+        # sender is in no thread at all, and telling them "inside a thread I only
+        # answer the person who started it" describes a place they never were.
+        # A guest opens their own thread by mentioning the bot, so that is what
+        # the reason says.
+        if not is_mention:
+            return GuestAdmission(False, "", "guest_mention_required", None)
+    if not (
+        # A guest starts a NEW thread, or continues one they already own.
+        #
+        # A bare ``is_mention`` admitted neither: it also admitted a mention
+        # typed INSIDE a thread somebody else owns, which is the reachability
+        # premise under the whole downstream class -- that turn is the one that
+        # would key to the owner's session, deliver into the owner's dashboard
+        # slot, and answer in the owner's thread. A top-level message has no
+        # ``thread_ts``, so it can own no thread yet and cannot collide with one.
+        # Anything inside a thread must prove the thread is the guest's, by the
+        # index entry the guest's own self-link wrote. An unowned thread -- a
+        # human-to-human conversation the guest now mentions the bot in -- is
+        # refused too: answering would self-link it to the guest, and the owner
+        # replying there later would find their own thread claimed.
+        (is_mention and not thread_ts)
+        or (
+            orch.sessions is not None
+            and thread_ts
+            # Read AS the sender, so the index returns a claim only when it
+            # is this guest's own. The comparison below then restates that
+            # rather than being the only thing enforcing it.
+            and orch.sessions.get_session_for_thread(thread_ts, guest_user=sender_id)
+            == guest_session_key(sender_id, thread_ts)
+        )
+    ):
+        return GuestAdmission(False, "", "guest_thread_not_own", None)
+
+    agent = resolve_guest_agent(orch._cfg, channel)
+    # ONE config object decides admission AND execution. ``orch._cfg`` is
+    # a boot snapshot for everything outside ``_SLACK_OWNED_FIELDS``, and
+    # ``agents`` is not in that tuple -- it is not Slack's section to own,
+    # so it carries no reload semantics here. Admitting on the snapshot
+    # while the turn executed against a freshly loaded config let an
+    # operator repoint the member's ``kiro_agent`` or reset its
+    # ``memory_store`` in between: admission passed on the stale object
+    # and the turn ran on the new one, which is how a guest reaches a
+    # spec with its own pre-approvals, or the owner's Global memory.
+    #
+    # The channel lookup above deliberately stays on ``orch._cfg``: the
+    # Slack channel table IS Slack-owned and hot-reloaded, so reading it
+    # from a fresh load would ignore a reload the operator just made.
+    try:
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    except Exception:
+        logger.warning("Guest admission: config load failed", exc_info=True)
+        cfg = None
+    if cfg is None:
+        return GuestAdmission(False, "", "guest_config_unreadable", None)
+    if not guest_member_configured(cfg, agent):
+        # The refusal that keeps a guest turn off the owner's memory: an
+        # unconfigured member resolves to the DEFAULT store, which is the
+        # owner's, so the turn does not run at all.
+        return GuestAdmission(False, "", "guest_member_not_configured", None)
+    if not toolless_turns_supported(str(getattr(cfg.agent, "acp_backend", "") or "")):
+        # The whole tool posture assumes the harness mounts what the spec
+        # names. ``messaging.dispatch.toolless_turns_supported`` is the
+        # existing answer to exactly this question, and it is reused rather
+        # than re-derived so a backend added later is classified in one place.
+        #
+        # Off that routing the guest spec decides nothing: a harness that reads
+        # no agent spec keeps its own native tools, so ``mcpServers: {}`` and the
+        # single ``tools`` entry mount whatever that harness ships; and a
+        # project-preapproved harness raises no permission request, which is the
+        # ONLY place the guest tool gate runs. Both leave a non-owner on the
+        # owner's machine with the owner's tools.
+        return GuestAdmission(False, "", "guest_backend_cannot_gate_tools", None)
+
+    # LAST POINT BEFORE THE ADMIT. Everything above decided on state read
+    # before ``await asyncio.to_thread(KiroCrewConfig.load)``, and that await
+    # yields the loop: ``GatewayOrchestrator._on_slack_config_change`` is an
+    # ``async def`` on the same loop, and it rewrites the live allowlist, the
+    # tracked-channel set and the channel table while this coroutine is parked
+    # in the thread. A value read before an await decides nothing after it
+    # without re-validation, so each condition that the load can outrun is
+    # re-asked here against live state rather than trusted from above.
+    #
+    # ``thread_ts`` and ``is_mention`` are NOT re-asked: they are facts of the
+    # message, so no reload can change them. The own-thread check is not re-asked
+    # either -- it reads the session index, which this await does not race.
+    if not is_guest_user(sender_id):
+        # The grant went away mid-admission. Same reason string the queue drain
+        # uses, because it is the same event seen from a different place.
+        return GuestAdmission(False, "", "guest_access_revoked", None)
+    if not is_tracked_channel(channel):
+        return GuestAdmission(False, "", "guest_channel_not_tracked", None)
+    _activation_now = slack_cfg(orch).channel_config(channel).activation
+    if _activation_now not in (ACTIVATION_MENTION, ACTIVATION_ALWAYS, ACTIVATION_OBSERVE):
+        return GuestAdmission(False, "", f"guest_denied_in_activation_{_activation_now}", None)
+    # Re-resolved, not re-checked: this value is RETURNED as the member the turn
+    # runs as, so a repoint during the load would otherwise hand the caller the
+    # superseded member -- the same defect as the queued turn's, one layer in.
+    # Re-read from ``orch._cfg`` for the reason stated above: the channel table is
+    # Slack-owned and hot-reloaded, so a fresh load would ignore an operator's
+    # reload rather than see it.
+    agent_now = resolve_guest_agent(orch._cfg, channel)
+    if agent_now != agent and not guest_member_configured(cfg, agent_now):
+        return GuestAdmission(False, "", "guest_member_not_configured", None)
+    return GuestAdmission(True, agent_now, "", cfg)
+
+
+def _denial_ephemeral(guest_candidate: bool, deny_reason: str) -> str:
+    """Return the rejection text for a sender the message gate refused.
+
+    A sender who is not allow-listed is told to ask for the allowlist, which is
+    now actionable. An allow-listed guest is told which condition failed instead,
+    because the allowlist is not what is missing.
+    """
+    if not guest_candidate:
+        return _DENIAL_TEXT_UNAUTHORIZED
+    if deny_reason.startswith("guest_denied_in_activation_"):
+        return _DENIAL_TEXT_ACTIVATION
+    return _GUEST_DENIAL_TEXT.get(deny_reason, _DENIAL_TEXT_UNAUTHORIZED)
 
 
 async def _route_message(
@@ -2202,6 +2568,20 @@ async def _route_message(
         and slack_cfg(orch).channel_config(channel).activation != ACTIVATION_REVIEW
     )
     _user_authorized = _owner_authorized or _trusted_bot_admitted
+    # Guest candidacy is deliberately NOT folded into _user_authorized. Everything
+    # that predicate guards stays owner-and-trusted-bot only: the observe-mode
+    # history push (guest text must never enter the context an owner turn reads)
+    # and voice-memo transcription. The final admission decision below is the one
+    # place a guest is added, after the channel, activation and thread conditions
+    # have been applied on top.
+    _guest_candidate = is_guest_user(sender_id)
+    _guest_admitted = False
+    _guest_agent = ""
+    _guest_deny_reason = ""
+    # The ONE config object a guest turn is admitted on and executed against.
+    # Set only on the admitted path; see the admission block for why a second
+    # load would be a hole rather than a duplicate.
+    _guest_cfg: Any = None
     if _user_authorized:
         sel().log_api_access(
             caller=sender_id,
@@ -2211,20 +2591,25 @@ async def _route_message(
             resources="" if _owner_authorized else "trusted_bot",
         )
     else:
-        logger.warning("Ignoring message from unauthorized user %s", sender_id)
-        if not from_trusted_bot:
-            _deny_error = "unauthorized sender"
-        elif slack_cfg(orch).channel_config(channel).activation == ACTIVATION_REVIEW:
-            _deny_error = "trusted_bot_denied_in_review_channel"
-        else:
-            _deny_error = "trusted_bot_turn_limit_reached"
-        sel().log_api_access(
-            caller=sender_id,
-            operation="slack.message",
-            outcome="denied",
-            source="slack",
-            error=_deny_error,
-        )
+        # A guest candidate's verdict is not known yet — the channel, activation
+        # and thread conditions decide it further down. Auditing here would record
+        # a denial for a sender who goes on to be admitted, so the guest path
+        # emits its own row at the final decision instead.
+        if not _guest_candidate:
+            logger.warning("Ignoring message from unauthorized user %s", sender_id)
+            if not from_trusted_bot:
+                _deny_error = "unauthorized sender"
+            elif slack_cfg(orch).channel_config(channel).activation == ACTIVATION_REVIEW:
+                _deny_error = "trusted_bot_denied_in_review_channel"
+            else:
+                _deny_error = "trusted_bot_turn_limit_reached"
+            sel().log_api_access(
+                caller=sender_id,
+                operation="slack.message",
+                outcome="denied",
+                source="slack",
+                error=_deny_error,
+            )
 
     # ── Message-interceptor seam (Default: PROCESS = inline, OSS-identical) ──
     # An edition may intercept the message here and turn it into an out-of-band
@@ -2425,7 +2810,10 @@ async def _route_message(
                 and orch.sessions
                 and (
                     orch.sessions.has_session(thread_ts)
-                    or orch.sessions.get_session_for_thread(thread_ts)
+                    # Keyed to the SENDER: a guest's own claim must still make
+                    # their thread active for a non-mention follow-up, while an
+                    # owner (or a second guest) is shown nothing.
+                    or orch.sessions.get_session_for_thread(thread_ts, guest_user=sender_id)
                     or (orch.conv_log and orch.conv_log.has_log(thread_ts))
                 )
             )
@@ -2451,7 +2839,10 @@ async def _route_message(
             and orch.sessions
             and (
                 orch.sessions.has_session(thread_ts)
-                or orch.sessions.get_session_for_thread(thread_ts)
+                # Keyed to the SENDER, as in the observe branch above: a guest's
+                # own claim keeps their thread active for a follow-up, and an
+                # owner's thread-follow never adopts a guest's claim.
+                or orch.sessions.get_session_for_thread(thread_ts, guest_user=sender_id)
                 or (orch.conv_log and orch.conv_log.has_log(thread_ts))
             )
         )
@@ -2466,17 +2857,53 @@ async def _route_message(
             )
             return
 
+    # ── Guest admission: the ONE place an allow-listed non-owner is let in ──
+    # Reached only for a message the bot would answer, so the activation and
+    # thread conditions above have already been applied. Every condition here is
+    # a positive requirement: an unmet one leaves _guest_admitted False and the
+    # rejection below names which.
+    if _guest_candidate and not _user_authorized:
+        # ONE decision function, called here and again by the queue drain: a
+        # guest turn must be authorized when it RUNS, and the drain starts one
+        # from stored kwargs long after this point.
+        _admission = await decide_guest_admission(
+            orch,
+            sender_id=sender_id,
+            channel=channel,
+            activation=activation,
+            thread_ts=thread_ts,
+            is_mention=is_mention,
+        )
+        _guest_admitted = _admission.admitted
+        _guest_agent = _admission.agent
+        _guest_deny_reason = _admission.deny_reason
+        _guest_cfg = _admission.cfg
+        sel().log_api_access(
+            caller=sender_id,
+            operation="slack.message",
+            outcome="allowed" if _guest_admitted else "denied",
+            source="slack",
+            resources=f"guest:{_guest_agent}" if _guest_admitted else channel,
+            error="" if _guest_admitted else _guest_deny_reason,
+        )
+        if not _guest_admitted:
+            logger.warning(
+                "Ignoring guest message from %s in %s (%s)",
+                sender_id,
+                channel,
+                _guest_deny_reason,
+            )
+
     # ── Access control: send ephemeral rejection ──
     # Only reached for messages the bot would actually respond to,
     # preventing notification spam in observe/mention channels.
-    if not _user_authorized:
+    if not (_user_authorized or _guest_admitted):
         if orch.slack:
             try:
                 await orch.slack.post_ephemeral(
                     channel,
                     sender_id,
-                    "⛔ You are not authorized to use this bot. "
-                    "Ask the owner to add you to the allowlist.",
+                    _denial_ephemeral(_guest_candidate, _guest_deny_reason),
                 )
             except Exception:
                 logger.debug("Failed to send ephemeral rejection", exc_info=True)
@@ -2555,7 +2982,17 @@ async def _route_message(
 
     # Record messages in channel history buffer (observe channels already
     # pushed above, so skip them here to avoid duplicates).
-    if activation != ACTIVATION_OBSERVE:
+    #
+    # A guest's text is never recorded. The buffer is channel context the OWNER's
+    # next top-level turn reads (``context.py`` injects it on every message), and
+    # that turn runs with the owner's hooks, whose ``auto_approve_tools`` the guest
+    # hook manager exists to drop -- so recording guest text here would carry it
+    # into the one turn where it is auto-approved. The observe branch above already
+    # refuses non-owner text for exactly this reason; before guest admission
+    # existed, this branch was unreachable by a non-owner because the unauthorized
+    # sender returned upstream of it. The guest's own turn is unaffected: its
+    # message reaches the agent as the turn's text, not through this buffer.
+    if activation != ACTIVATION_OBSERVE and not _guest_admitted:
         if orch.channel_history is None:
             logger.error("channel_history not initialised — skipping history push")
         else:
@@ -2638,15 +3075,50 @@ async def _route_message(
         # session that owns it, and that is the key the replay reads. For a flat
         # DM session_key is already the channel-scoped owning key, so the lookup
         # falls back to it unchanged.
-        note_user_stop(orch.sessions, orch.sessions.get_session_for_thread(session_key) or session_key)
-        has_session = orch.sessions.has_session(session_key)
-        active_task = orch._session_tasks.pop(session_key, None)
+        # An owner's ``!stop`` in a guest-claimed thread must reach the GUEST's
+        # turn. Every routing read hides a guest's claim, which is correct -- a
+        # reader that adopted it would run its own turn on the guest's session --
+        # but ``!stop`` is cancelling, not routing. Without an explicit non-hiding
+        # read the resolution above lands on the bare thread key while the live
+        # task is keyed ``slack:guest-<uid>-<ts>``, so the owner is told "Nothing
+        # running." and the untrusted turn continues. That is the emergency brake
+        # failing, which is the worst outcome this design has, so the bypass is a
+        # method of its own whose name refuses to be read as a routing lookup.
+        #
+        # Both keys, not one: the owner's own turns in that thread run under the
+        # ordinary key the resolution already found, so replacing it would trade
+        # one unstoppable turn for another.
+        _stop_keys = [session_key]
+        if thread_ts:
+            # Probed with ``getattr`` and type-narrowed, like ``note_user_stop``
+            # one line below: ``orch.sessions`` is typed loosely and the focused
+            # doubles in the channel suites predate this method, so an attribute
+            # that is not there, or a stand-in returning an auto-attribute mock,
+            # must read as "no guest claim" rather than becoming a key. Every
+            # consumer below treats these as strings -- ``_session_tasks.pop``,
+            # ``has_session``, ``stop_turn``, and the ``","``-join into the audit
+            # record -- so accepting a non-``str`` turns a missing double into a
+            # TypeError in the owner's emergency brake.
+            _claim_read = getattr(orch.sessions, "guest_claim_for_thread", None)
+            _guest_claim = _claim_read(thread_ts) if callable(_claim_read) else None
+            if isinstance(_guest_claim, str) and _guest_claim and _guest_claim not in _stop_keys:
+                _stop_keys.append(_guest_claim)
+        for _stop_key in _stop_keys:
+            note_user_stop(
+                orch.sessions, orch.sessions.get_session_for_thread(_stop_key) or _stop_key
+            )
+        # Popped for every key before the liveness test, so a guest task is
+        # removed from the registry even when only the owner's key has a session.
+        _active_tasks = {k: orch._session_tasks.pop(k, None) for k in _stop_keys}
+        has_session = any(orch.sessions.has_session(k) for k in _stop_keys)
+        active_task = next((t for t in _active_tasks.values() if t is not None), None)
         if has_session or active_task:
-            orch.sessions.clear_queue(session_key)
-            # Dropped pending (pre-session) entries never reach
-            # _dispatch_queued's cleanup, so unlink their temp files here.
-            for _item in orch._pending_queue.pop(session_key, None) or []:
-                unlink_queued_temp_paths(_item[2])
+            for _stop_key in _stop_keys:
+                orch.sessions.clear_queue(_stop_key)
+                # Dropped pending (pre-session) entries never reach
+                # _dispatch_queued's cleanup, so unlink their temp files here.
+                for _item in orch._pending_queue.pop(_stop_key, None) or []:
+                    unlink_queued_temp_paths(_item[2])
 
             # Post ephemeral "Stopping…" block with Kill Now button
             if orch.slack:
@@ -2654,23 +3126,38 @@ async def _route_message(
                     channel,
                     sender_id,
                     "Stopping…",
-                    blocks=build_stopping_blocks(session_key),
+                    blocks=build_stopping_blocks(_stop_keys),
                     thread_ts=stop_post_ts,
                 )
 
+            # One ack per ``!stop``, not one per key: stopping an owner turn and a
+            # guest turn in the same thread is still a single command, and the
+            # hard-stop wording supersedes the soft one.
+            _acked: set[str] = set()
+
             async def _on_soft() -> None:
-                if orch.slack:
+                if orch.slack and "soft" not in _acked and "hard" not in _acked:
+                    _acked.add("soft")
                     await orch.slack.post_message(channel, "⏹ Execution stopped.", stop_post_ts)
 
             async def _on_hard() -> None:
-                if orch.slack:
+                # Not gated on "soft": a hard stop supersedes a soft one, so the
+                # reset wording still lands if a sibling key stopped softly first.
+                if orch.slack and "hard" not in _acked:
+                    _acked.add("hard")
                     await orch.slack.post_message(
                         channel, "⛔ Execution stopped — session reset.", stop_post_ts
                     )
 
-            outcome = await orch.sessions.stop_turn(session_key, on_soft=_on_soft, on_hard=_on_hard)
-            if active_task and not active_task.done():
-                active_task.cancel()
+            _outcomes = [
+                await orch.sessions.stop_turn(k, on_soft=_on_soft, on_hard=_on_hard)
+                for k in _stop_keys
+            ]
+            for _task in _active_tasks.values():
+                if _task is not None and not _task.done():
+                    _task.cancel()
+            # "idle" only when EVERY key was idle: one live turn stopped is a stop.
+            outcome = next((o for o in _outcomes if o != "idle"), "idle")
             # If stop_turn returned "idle" (no active turn), neither callback
             # fired — dismiss the stale "Stopping…" ephemeral explicitly.
             if outcome == "idle" and orch.slack:
@@ -2681,7 +3168,7 @@ async def _route_message(
                 tool_name="!stop",
                 tool_kind="command",
                 outcome=outcome,
-                metadata={"user": sender_id, "channel": channel},
+                metadata={"user": sender_id, "channel": channel, "keys": ",".join(_stop_keys)},
             )
         else:
             sel().log_tool_invocation(
@@ -2701,6 +3188,7 @@ async def _route_message(
     #    (_handle_restart) which owns owner-check + supervisor guard, keeping
     #    a single source of truth for the restart logic. ──
     if clean_text.strip().lower() == "!restart":
+
         async def _restart_respond(text: str, **_kw: Any) -> None:
             if orch.slack:
                 await orch.slack.post_message(channel, text, thread_ts or msg_ts)
@@ -2710,6 +3198,11 @@ async def _route_message(
 
     # Per-channel agent override
     agent_override = ch_cfg.agent or None
+    if _guest_admitted:
+        # A guest turn runs as the guest member and as nothing else. The
+        # per-channel and per-thread agent overrides are owner controls, so
+        # neither may redirect a guest onto another member's memory store.
+        agent_override = _guest_agent
 
     # ── Trusted-bot turn ledger (loop guard bookkeeping) ──
     # Counted HERE — after auth, activation, dedup, the empty-clean_text
@@ -2744,6 +3237,10 @@ async def _route_message(
     session_key = (
         flat_dm_session_key(channel, thread_ts, enabled=_dm_single_session) or thread_ts or msg_ts
     )
+    if _guest_admitted:
+        # Derived the same way the turn derives it, so a busy guest turn queues
+        # against itself rather than against whatever session owns the thread.
+        session_key = guest_session_key(sender_id, thread_ts or msg_ts)
     _task_busy = session_key in orch._session_tasks
     if _task_busy:
         # A task is already running for this session key.  Try the session-level
@@ -2763,6 +3260,10 @@ async def _route_message(
             # Historical key; carries every attachment temp path for cleanup.
             image_temp_paths=list(_attachment_temp_paths),
             from_trusted_bot=from_trusted_bot,
+            guest_user=sender_id if _guest_admitted else "",
+            # Stored because it is a fact of the MESSAGE and cannot change; every
+            # other admission input is re-read live when the queue drains.
+            is_mention=is_mention,
         )
         if not _queued:
             # Session object not created yet — stash on orch._pending_queue
@@ -2779,6 +3280,10 @@ async def _route_message(
                         user_display_name=_sender_display,
                         image_temp_paths=list(_attachment_temp_paths),
                         from_trusted_bot=from_trusted_bot,
+                        guest_user=sender_id if _guest_admitted else "",
+                        # Stored because it is a fact of the MESSAGE and cannot change; every
+                        # other admission input is re-read live when the queue drains.
+                        is_mention=is_mention,
                     ),
                 )
             )
@@ -2806,6 +3311,15 @@ async def _route_message(
         user_display_name=_sender_display,
         image_temp_paths=list(_attachment_temp_paths),
         from_trusted_bot=from_trusted_bot,
+        # Carried here as well as on the force=True branch above. The queue entry
+        # is what ``_dispatch_queued`` reconstructs the turn from, so omitting it
+        # made the message re-dispatch as an OWNER turn: guest session key, guest
+        # hooks, guest tool gate and the YOLO refusal all keyed off this one value,
+        # and every one of them would have been absent.
+        guest_user=sender_id if _guest_admitted else "",
+        # Stored because it is a fact of the MESSAGE and cannot change; every
+        # other admission input is re-read live when the queue drains.
+        is_mention=is_mention,
     ):
         logger.info("Message %s queued for busy session %s", msg_ts, session_key)
         if orch.slack:
@@ -2835,6 +3349,11 @@ async def _route_message(
     _use_transport = (
         getattr(getattr(slack_cfg(orch), "messaging", None), "use_transport", False) is True
         and activation != ACTIVATION_REVIEW
+        # A guest turn stays on the native path, for the same shape of reason
+        # review mode does. The transport path re-resolves thread ownership and
+        # can move a turn onto a dashboard-linked session, which for a guest
+        # would be a session holding the owner's context.
+        and not _guest_admitted
     )
     if _use_transport:
         t = asyncio.create_task(
@@ -2852,11 +3371,14 @@ async def _route_message(
                 # configured mode + operator YOLO/SafetyOverride TTL, rather
                 # than an unconditional auto-approve. Deny-by-default unless
                 # auto-approve is explicitly active.
-                approval_mode=_resolve_approval_mode(orch),
+                approval_mode=_resolve_approval_mode(orch, guest=_guest_admitted),
                 # Per-channel agent override (slack.channels.<id>.agent), same
                 # as native handle_message's channel_agent, so a channel-pinned
                 # agent is honored on the transport path too.
                 agent_override=agent_override,
+                # Non-empty for an admitted guest, which keys the turn to its own
+                # session, pins it to the guest member and gates its tools.
+                guest_user=sender_id if _guest_admitted else "",
                 # Keyword-command services, same as native handle_message, so
                 # `sessions`/`spawn`/`run`/`cron` work on the transport path via
                 # the shared maybe_handle_keyword_command interceptor.
@@ -2932,7 +3454,7 @@ async def _route_message(
                 msg_ts,
                 sender_id,
                 team_id=team_id,
-                approval_mode=_resolve_approval_mode(orch),
+                approval_mode=_resolve_approval_mode(orch, guest=_guest_admitted),
                 context_builder=orch.ctx_builder,
                 cron_service=orch.cron_svc,
                 conversation_log=orch.conv_log,
@@ -2940,6 +3462,10 @@ async def _route_message(
                 subagent_manager=orch.subagent_mgr,
                 task_runner=orch.task_runner,
                 channel_agent=agent_override,
+                guest_user=sender_id if _guest_admitted else "",
+                # The object admission just passed on, so the turn executes
+                # against the config its admission was decided on.
+                guest_cfg=_guest_cfg if _guest_admitted else None,
                 user_display_name=_sender_display,
                 from_trusted_bot=from_trusted_bot,
                 channel_activation=activation,

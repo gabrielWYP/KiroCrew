@@ -47,6 +47,7 @@ from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import SLACK_NAMESPACE, canonical_key
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.platform import current_context
+from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.security import redact, redact_local_paths
 from kiro_crew.sel import sel
 from kiro_crew.session_allocation import SessionClosingError
@@ -71,6 +72,7 @@ from kiro_crew.slack.renderer import PARTIAL_TURN_MARKER
 from kiro_crew.slack.renderer import SlackApprovalDecider
 from kiro_crew.slack.renderer import SlackApprovalDecider as _APPROVAL_REGISTRY
 from kiro_crew.slack.renderer import SlackRenderer
+from kiro_crew.slack.tool_gate import build_guest_hooks
 from kiro_crew.stats import Stats
 
 if TYPE_CHECKING:
@@ -185,6 +187,7 @@ async def handle_message_transport(
     gateway: Any | None = None,
     from_trusted_bot: bool = False,
     dm_single_session: bool = False,
+    guest_user: str = "",
 ) -> None:
     """Drive a Slack message through the new transport path end-to-end.
 
@@ -196,7 +199,19 @@ async def handle_message_transport(
     state to the session-directive consumer, so a monitor directive on a
     dashboard-owned thread can resolve the slot instead of failing closed on
     the sessions-backed stand-in.
+
+    *guest_user* is refused rather than served. This path re-resolves thread
+    ownership and may move a turn onto a dashboard-linked session, which for an
+    allow-listed guest would be a session carrying the owner's context. Guest
+    turns run on ``handle_message``; the caller decides that, and this refusal
+    keeps a future caller from routing one here by accident.
     """
+    if guest_user:
+        logger.error(
+            "Refusing guest turn on the transport path for %s — guest turns run native",
+            redact_log_via_context(guest_user),
+        )
+        return
     Stats().inc_message_received()
     _t0 = time.monotonic()
     inbound_text = text
@@ -366,7 +381,22 @@ async def handle_message_transport(
     # as native handle_message. Without this the transport path would start a
     # full (billable, slower) turn for a message a hook already answers.
     if context_builder:
-        hook_result = context_builder.hooks.on_message(text)
+        # Scoped the same way the native path scopes it, and for the same reason
+        # the guest refusal above exists rather than instead of it. ``:208`` is the
+        # front door and it holds today, so ``guest_user`` is empty here and this
+        # resolves to the builder's own manager -- the owner path is unchanged.
+        #
+        # It is written anyway because the unscoped read is what went wrong one file
+        # away: ``build_message`` ran the OWNER's hooks on a guest turn, and the
+        # only thing that had ever kept this call correct was a refusal in a
+        # different function. A caller added later that reaches this line with a
+        # guest gets the scoped manager instead of the owner's canned replies.
+        _hooks = (
+            build_guest_hooks(context_builder.hooks)
+            if guest_user and context_builder.hooks
+            else context_builder.hooks
+        )
+        hook_result = _hooks.on_message(text)
         if hook_result.action == HOOK_REPLY:
             await slack.post_message(channel, hook_result.text, post_thread_ts)
             if conversation_log and not _is_slack_restricted(session_key):
@@ -419,6 +449,12 @@ async def handle_message_transport(
         sessions,
         post_thread_ts or "",
         not _flat_key,
+        # Always empty here — this path refuses a guest turn outright above.
+        # Passed anyway, for the same reason the run-control scope below is:
+        # the refusal must not be the ONLY thing standing between a guest and an
+        # owner control, and this argument is required precisely so a caller
+        # cannot reach the modifiers without answering the question.
+        guest_user=guest_user,
     )
     if _only_modifier:
         # Message was nothing but the modifier(s) — no LLM turn.
@@ -446,6 +482,10 @@ async def handle_message_transport(
         task_runner=task_runner,
         cron_service=cron_service,
         channel_agent=agent_override,
+        # Always empty here — this path refuses a guest turn outright above. Passed
+        # anyway so the refusal is not the ONLY thing standing between a guest and
+        # the four commands this helper runs with no caller check.
+        guest_user=guest_user,
     ):
         return
 
