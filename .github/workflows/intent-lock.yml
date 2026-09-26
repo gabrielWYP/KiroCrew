@@ -1,0 +1,32 @@
+name: Intent Approve
+
+# A maintainer's `/intent approve <head-sha>` moves the Intent Lock baseline;
+# PR Readiness does the comparison. Runs the default branch's script, no PR code.
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write  # dispatch pr-readiness.yml
+  contents: read
+  pull-requests: write  # the baseline is a PR comment
+
+jobs:
+  approve:
+    name: Intent approve
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/intent approve ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+          EVENT_BODY: ${{ github.event.issue.body }}  # the body being approved
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+        run: bash .github/scripts/intent-lock.sh approve

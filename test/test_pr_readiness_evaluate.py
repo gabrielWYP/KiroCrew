@@ -311,6 +311,7 @@ class Runner:
         existing_status_state: str = "",
         disposition_ok: str = "",
         disposition_violations: str = "",
+        intent_state: str = "",
         advisory_unpublished: str = "",
         wr_name: str = "",
         wr_status: str = "",
@@ -320,6 +321,8 @@ class Runner:
             env["DISPOSITION_OK"] = disposition_ok
         if disposition_violations:
             env["DISPOSITION_VIOLATIONS"] = disposition_violations
+        if intent_state:
+            env["INTENT_STATE"] = intent_state
         if advisory_unpublished:
             env["ADVISORY_UNPUBLISHED"] = advisory_unpublished
         if fork:
@@ -1761,3 +1764,36 @@ class TestAnAdvisoryLaneThatPublishedNoVerdictIsNotPassed:
         assert branch_labels == labels
         assert set(arms) == labels
         assert set(arms.values()) == set(_whole_design_lanes())
+
+
+class TestTheFrozenGoalGatesTheRequiredStatus:
+    """The Intent Lock verdict is computed inside this job (the
+    "Evaluate the frozen goal" step), so the required status itself holds a
+    changed goal -- no separate check whose stale green a merge could use."""
+
+    @pytest.mark.parametrize("fork", [False, True])
+    def test_a_changed_goal_awaits_maintainer_approval(self, runner: Runner, fork: bool):
+        proc, outputs = runner.evaluate(fork=fork, intent_state="changed")
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert "goal changed: comment /intent approve " + runner.env["SHA"] in _lane_log(proc)
+        if not fork:
+            assert outputs["description"] == "1 workflow(s) awaiting maintainer approval"
+
+    def test_a_missing_baseline_fails_closed(self, runner: Runner):
+        proc, outputs = runner.evaluate(intent_state="missing")
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert "goal missing: comment /intent approve" in _lane_log(proc)
+
+    @pytest.mark.parametrize("state", ["ok", "skip"])
+    def test_an_unchanged_or_older_pr_stays_green(self, runner: Runner, state: str):
+        proc, outputs = runner.evaluate(intent_state=state)
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "success"
+
+    def test_an_unreadable_goal_waits_as_a_read_failure(self, runner: Runner):
+        proc, outputs = runner.evaluate(intent_state="unreadable")
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "pending"
+        assert outputs["description"].startswith("[read-failed]")

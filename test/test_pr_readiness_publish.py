@@ -221,6 +221,16 @@ class Runner:
         stub.write_text(GH_STUB)
         stub.chmod(0o755)
         (self.tmp / "pr-readiness-summary.md").write_text("## summary\n")
+        # The success re-check runs the Intent Lock evaluator the job checks out
+        # from the default branch. A stand-in answers with the state in
+        # $FIXTURES/intent_state (default "ok"); intent-lock.sh itself is
+        # exercised by test_intent_lock_workflow.py.
+        evaluator = self.work / ".github" / "scripts" / "intent-lock.sh"
+        evaluator.parent.mkdir(parents=True)
+        evaluator.write_text(
+            'echo "state=$(cat "$FIXTURES/intent_state" 2>/dev/null || echo ok)"'
+            ' >> "$GITHUB_OUTPUT"\n'
+        )
         self.summary = root / "step-summary.md"
         self.summary.write_text("")
         # The steps under test `source "$RUNNER_TEMP/gh-retry.sh"`; in CI the
@@ -999,3 +1009,28 @@ def test_a_delayed_re_check_never_overwrites_a_red_rerun_with_pending(runner: Ru
     assert result.published is not None
     assert result.published["state"] == "failure"
     assert "CI" in result.published["description"]
+
+
+@pytest.mark.parametrize(
+    "state,published",
+    [
+        ("ok", "success"),
+        ("skip", "success"),
+        ("changed", "failure"),
+        ("missing", "failure"),
+        ("unreadable", "pending"),
+    ],
+)
+def test_a_goal_edit_since_the_evaluation_holds_a_success(
+    runner: Runner, state: str, published: str
+) -> None:
+    """A body edit changes no SHA. An older run scored before the goal edit
+    must not publish green over the edit's own verdict, so every success
+    re-reads the frozen goal first."""
+    (runner.fixtures / "intent_state").write_text(state)
+    runner.run()
+    # Read the POSTed status itself: it is written before any label call.
+    status = json.loads((runner.fixtures / "published_status.json").read_text())
+    assert status["state"] == published
+    if published == "failure":
+        assert "awaiting maintainer approval" in status["description"]

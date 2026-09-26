@@ -577,14 +577,18 @@ jobs:
           echo "pr-readiness: holding $SHA at pending while ${LANE:-a monitored lane} runs"
 
       - name: Check out the disposition evaluator from the default branch
+        # Also on a stale `opened`: the Intent Lock baseline is its body.
         if: >-
-          steps.context.outputs.stale != 'true'
-          && steps.context.outputs.state == 'OPEN'
-          && steps.hold.outputs.held != 'true'
+          (steps.context.outputs.stale != 'true'
+           && steps.context.outputs.state == 'OPEN'
+           && steps.hold.outputs.held != 'true')
+          || (github.event.action == 'opened' && steps.context.outputs.state == 'OPEN')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch || github.ref_name }}
-          sparse-checkout: src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts
+          sparse-checkout: |
+            src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts
+            .github/scripts
           persist-credentials: false
 
       # Issue #6658: the one-lane / one-rationale-per-finding disposition rule
@@ -672,6 +676,25 @@ jobs:
             echo "$delim"
           } >> "$GITHUB_OUTPUT"
 
+      # Intent Lock: the required status itself compares the frozen goal with
+      # the bot baseline on every run (.github/scripts/intent-lock.sh).
+      - name: Evaluate the frozen goal
+        id: intent
+        if: >-
+          (steps.context.outputs.stale != 'true'
+           && steps.context.outputs.state == 'OPEN'
+           && steps.hold.outputs.held != 'true')
+          || (github.event.action == 'opened' && steps.context.outputs.state == 'OPEN')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.context.outputs.pr }}
+          DEFAULT_BRANCH: ${{ steps.context.outputs.default_branch }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          EVENT_BODY: ${{ github.event.pull_request.body }}
+        run: bash .github/scripts/intent-lock.sh evaluate
+
       - name: Evaluate current revision
         id: verdict
         if: >-
@@ -705,6 +728,7 @@ jobs:
           # matches this one's, and test_pr_readiness_dispositions.py pins the
           # wiring so a rename cannot silently disable the gate.
           DISPOSITION_OK: ${{ steps.dispositions.outputs.ok }}
+          INTENT_STATE: ${{ steps.intent.outputs.state }}
           DISPOSITION_VIOLATIONS: ${{ steps.dispositions.outputs.violations }}
           # The whole-design lanes the same gate call found owing this head a
           # verdict they never published -- see the advisory-slot note below.
@@ -1455,6 +1479,11 @@ jobs:
               read_failure=true
               ;;
           esac
+          # Intent Lock: only a maintainer clears a changed or missing baseline.
+          case "${INTENT_STATE:-}" in
+            changed|missing) awaiting_approval+=("goal $INTENT_STATE: comment /intent approve $SHA") ;;
+            unreadable) pending+=("frozen goal could not be read"); read_failure=true ;;
+          esac
 
           blockers=()
           waiting=()
@@ -1579,7 +1608,7 @@ jobs:
               echo "**Awaiting maintainer approval**"
               printf -- "- %s\n" ${awaiting_approval[@]+"${awaiting_approval[@]}"}
               echo
-              echo "> GitHub created these fork runs but has not executed them."
+              echo "> Fork runs GitHub has not executed, or a changed PR goal."
               echo "> A maintainer must approve them; the contributor cannot"
               echo "> clear this condition."
             fi
@@ -1623,6 +1652,7 @@ jobs:
           FORK: ${{ steps.context.outputs.fork }}
           HEAD_REPO: ${{ steps.context.outputs.head_repo }}
           HEAD_REF: ${{ steps.context.outputs.head_ref }}
+          DEFAULT_BRANCH: ${{ steps.context.outputs.default_branch }}
         run: |
           set -euo pipefail
           source "$RUNNER_TEMP/gh-retry.sh"
@@ -1734,6 +1764,20 @@ jobs:
             # evaluation rejected, or blocking a verdict it passed. A fork head
             # cannot run the managed default-setup CodeQL (the verdict step
             # lists it skipped), so this read is same-repo only.
+            # The frozen goal too: a body edit changes no SHA.
+            if [ "$STATUS_STATE" = "success" ]; then
+              intent_out="$(mktemp)"
+              GITHUB_OUTPUT="$intent_out" EVENT=recheck bash .github/scripts/intent-lock.sh evaluate >/dev/null
+              case "$(sed -n 's/^state=//p' "$intent_out")" in
+                ok|skip) ;;
+                changed|missing)
+                  STATUS_STATE=failure; TARGET_LABEL="readiness: action required"
+                  DESCRIPTION="1 workflow(s) awaiting maintainer approval; goal changed since evaluation" ;;
+                *)
+                  STATUS_STATE=pending; TARGET_LABEL="readiness: checking"
+                  DESCRIPTION="[read-failed] The frozen goal could not be re-checked" ;;
+              esac
+            fi
             if [ "$STATUS_STATE" = "success" ] && [ "${FORK:-}" = "false" ]; then
               if codeql_state="$(gh_retry gh api --method GET \
                 "repos/$REPO/actions/runs?event=dynamic&head_sha=$SHA&per_page=100" \

@@ -1362,6 +1362,7 @@ def decide(
     rollup_notice="",
     disposition_eval=None,
     concerns_eval=None,
+    readiness_wait=False,
 ):
     """Resolve PR state to (exit_code, status line). Fail-closed.
 
@@ -1496,6 +1497,14 @@ def decide(
     # pending one (handled by the running gate above) nor a failing one here.
     if readiness_kind == "fail":
         reasons.append("{} reported action required".format(readiness_context))
+        if readiness_wait:
+            # Still blocking, but some of it is a HUMAN wait: a changed goal
+            # (`/intent approve`) or an unapproved fork run. No code change
+            # clears it, and the loop never posts the approval itself.
+            reasons.append(
+                "HUMAN WAIT - awaiting maintainer approval (a changed goal's "
+                "`/intent approve <head-sha>`, or a fork run to approve); not a code fix"
+            )
     if n_fail > 0:
         reasons.append("{} check(s) failed".format(n_fail))
     if n_checks == 0:
@@ -1774,6 +1783,7 @@ def main(argv):
     n_running = n_fail = 0
     failing_checks = []
     readiness_kind = None
+    readiness_wait = False
     for e in rollup:
         kind = classify_check(e)
         if kind == "running":
@@ -1788,6 +1798,7 @@ def main(argv):
         # namespace and must remain part of the ordinary rollup.
         if e.get("context") == readiness_context:
             readiness_kind = kind
+            readiness_wait = "awaiting maintainer approval" in (e.get("description") or "")
         shown = (e.get("status") or "-") + "/" + (e.get("conclusion") or e.get("state") or "-")
         print("  - {}: {}  [{}]".format(name, shown, kind))
     print("  rollup: total={} running={} failing={}".format(len(rollup), n_running, n_fail))
@@ -2015,6 +2026,7 @@ def main(argv):
         rollup_notice=rollup_notice,
         disposition_eval=disposition_eval,
         concerns_eval=concerns_eval,
+        readiness_wait=readiness_wait,
     )
     print(status)
     if "--json" in argv[1:]:

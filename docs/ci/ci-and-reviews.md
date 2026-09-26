@@ -2321,6 +2321,14 @@ status plus one `readiness:` label**.
   managed workflow.
 - **Labels:** `readiness: checking` (pending), `readiness: action required` (a
   blocker), `readiness: passed`. Exactly one is ever present.
+- **It also holds a changed PR goal (Intent Lock).** Its "Evaluate the frozen goal"
+  step runs `.github/scripts/intent-lock.sh evaluate` from the default branch: it
+  hashes the `**Goal:**` line, `## Why it matters` and `## Not a goal` and compares
+  them with the latest github-actions[bot] baseline comment (posted on `opened`).
+  `changed` or `missing` is an "awaiting maintainer approval" item; `unreadable` is
+  a `[read-failed]` pending. Every success re-reads it before publishing. A
+  writer's `/intent approve <head-sha>` (`intent-lock.yml`) posts a new baseline
+  and dispatches a recompute. Agents never post it.
 - **It also enforces the disposition rule.** Besides scoring lanes, readiness runs
   `pr_status.py --disposition-gate` (checked out from the default branch, never
   from the PR head — this workflow is `pull_request_target` and holds write

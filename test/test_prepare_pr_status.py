@@ -3738,3 +3738,46 @@ def test_the_evaluator_itself_refuses_an_untrusted_override_record() -> None:
         [forged], _HEAD, bindings, only=["GPT"], authors=("coverage-app[bot]",)
     )
     assert widened["overridden"] == {"GPT": "maintainer"}, widened
+
+
+def test_a_readiness_wait_on_a_maintainer_is_named_a_human_wait(capsys) -> None:
+    """A changed PR goal holds PR Readiness until a maintainer comments
+    `/intent approve`. It still blocks, but reads as a human wait, not a code
+    fix, so the loop keeps fixing the rest and never posts the approval."""
+    module = _load_script()
+    _install_fake_gh(
+        module,
+        _pr_payload(
+            [
+                {
+                    "context": "PR Readiness",
+                    "state": "FAILURE",
+                    "description": "1 workflow(s) awaiting maintainer approval",
+                }
+            ]
+        ),
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 20
+    out = capsys.readouterr().out
+    assert "HUMAN WAIT - awaiting maintainer approval" in out
+    assert "/intent approve <head-sha>" in out
+
+
+def test_an_ordinary_readiness_failure_is_not_a_human_wait(capsys) -> None:
+    module = _load_script()
+    _install_fake_gh(
+        module,
+        _pr_payload(
+            [
+                {
+                    "context": "PR Readiness",
+                    "state": "FAILURE",
+                    "description": "1 blocking readiness item(s)",
+                }
+            ]
+        ),
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 20
+    assert "HUMAN WAIT" not in capsys.readouterr().out
