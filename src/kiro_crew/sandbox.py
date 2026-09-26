@@ -7488,23 +7488,6 @@ def main():
                 _mount_or_die(p.encode(), _stage_dir.encode(), _MS_BIND,
                               "staging private window %s" % p)
                 _private_stage[p] = _stage_dir
-        # Bind-mount empty dirs over credential paths (per-dir tmpdir to
-        # prevent content leaking across mounts via shared backing dir).
-        for d in SENSITIVE_DIRS:
-            target = d.encode()
-            if os.path.isdir(target):
-                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
-                _windows = [p for p in _private_stage
-                            if p.startswith(d.rstrip("/") + "/")]
-                for p in _windows:
-                    os.makedirs(os.path.join(per_dir_empty.decode(),
-                                             os.path.relpath(p, d)))
-                _mount_or_die(per_dir_empty, target, _MS_BIND,
-                              "hiding credential directory %s" % d)
-                for p in _windows:
-                    _mount_or_die(_private_stage[p].encode(), p.encode(), _MS_BIND,
-                                  "opening private window %s" % p)
-
         # Exposed-but-read-only dirs (the governance cache): bind the real dir over
         # itself, then remount that bind MS_RDONLY. Both steps are load-bearing --
         # MS_RDONLY is ignored on the initial MS_BIND, so without the remount this
@@ -7514,6 +7497,22 @@ def main():
         # and rejects a remount that would drop them, so the seal re-asserts them
         # via _locked_mount_flags -- re-asserting bits already in force can only
         # keep restrictions, never widen access.
+        #
+        # MUST run BEFORE the SENSITIVE_DIRS hide loop. A non-recursive
+        # MS_BIND does not replicate submounts, so a self-bind of a parent
+        # established AFTER a hide of one of its leaves masks that hide: lookups
+        # through the new parent mount reach the REAL leaf. That is exactly the
+        # ``run`` / ``run/voice-runtime`` pair -- the runtime parent is sealed
+        # here and its decoder leaf is hidden below -- and with the loops the
+        # other way round the hide degraded to read-only-visible (container
+        # measured: the marker inside the leaf was readable, writes EROFS). Seal
+        # first, hide second: a hide placed ON a sealed parent is a mount on top
+        # of it and stays reachable through it, the same kernel property the
+        # WRITABLE_DIRS carve-outs below rely on. The reverse nesting (a sealed
+        # leaf inside a hidden tree) is order-insensitive in outcome: the hide
+        # masks the seal, so the leaf is hidden either way. Staging of private
+        # windows stays ahead of this loop on purpose, so a window's stage bind
+        # is never taken from an already-sealed source.
         for d in READONLY_DIRS:
             target = d.encode()
             # ``exists``, not ``isdir``: a governance ceiling is a plain file
@@ -7528,6 +7527,27 @@ def main():
                               _MS_REMOUNT | _MS_BIND | _MS_RDONLY
                               | _locked_mount_flags(target),
                               "sealing read-only path %s" % d)
+
+        # Bind-mount empty dirs over credential paths (per-dir tmpdir to
+        # prevent content leaking across mounts via shared backing dir). Runs
+        # AFTER the READONLY_DIRS seals: a hidden leaf nested under a
+        # sealed parent (``run/voice-runtime`` under ``run``) must be hidden on
+        # top of the parent's self-bind, never underneath it, or the
+        # non-recursive parent bind masks the hide.
+        for d in SENSITIVE_DIRS:
+            target = d.encode()
+            if os.path.isdir(target):
+                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
+                _windows = [p for p in _private_stage
+                            if p.startswith(d.rstrip("/") + "/")]
+                for p in _windows:
+                    os.makedirs(os.path.join(per_dir_empty.decode(),
+                                             os.path.relpath(p, d)))
+                _mount_or_die(per_dir_empty, target, _MS_BIND,
+                              "hiding credential directory %s" % d)
+                for p in _windows:
+                    _mount_or_die(_private_stage[p].encode(), p.encode(), _MS_BIND,
+                                  "opening private window %s" % p)
 
         # Writable carve-outs (#8653) — validated by the builder against every
         # seal this script applies; each approved entry lives INSIDE the sealed

@@ -88,9 +88,11 @@ class _FakeLibc:
     """``_libc``, with a ``mount`` that fails on a chosen call.
 
     ``fail_at`` is 1-based over the calls this region makes, in source order:
-    1 = propagation, 2 = first credential dir, 3 = read-only bind, 4 = read-only
-    remount, 5 = first sensitive file, 6 = ~/.ssh. ``None`` means every mount
-    succeeds.
+    1 = propagation, 2 = read-only bind, 3 = read-only remount, 4 = first
+    credential dir, 5 = first sensitive file, 6 = ~/.ssh. ``None`` means every
+    mount succeeds. The seal pair comes BEFORE the credential hide on purpose:
+    a hidden leaf under a sealed parent must be hidden on top of the parent's
+    self-bind, or the non-recursive bind masks the hide.
     """
 
     def __init__(self, *, fail_at: int | None, err: int = errno.EPERM) -> None:
@@ -139,6 +141,8 @@ def _run(
     script: str | None = None,
     writable_dirs: list[str] | None = None,
     private_dirs: list[str] | None = None,
+    sensitive_dirs: list[str] | None = None,
+    readonly_dirs: list[str] | None = None,
 ) -> tuple[_FakeLibc, str | None]:
     """Run the mount region. Returns ``(fake_libc, refusal_message_or_None)``.
 
@@ -187,11 +191,13 @@ def _run(
         "_src_prefix": "kirocrew_sb_%d_" % os.getpid(),
         "expose_data": {},
         "EXPOSE_FILES": [],
-        "SENSITIVE_DIRS": [str(aws)],
+        # Overridable so the nesting test can hand the region a hidden leaf that
+        # lives INSIDE a sealed parent; the default keeps the six-site numbering.
+        "SENSITIVE_DIRS": [str(aws)] if sensitive_dirs is None else list(sensitive_dirs),
         # Empty by default for the same reason as WRITABLE_DIRS: a private
         # window stages its own bind, which would shift the call numbering.
         "PRIVATE_DIRS": list(private_dirs or []),
-        "READONLY_DIRS": [str(cache)],
+        "READONLY_DIRS": [str(cache)] if readonly_dirs is None else list(readonly_dirs),
         # Empty by default so the six-site call numbering above stays stable;
         # the carve-out tests inject their own entry.
         "WRITABLE_DIRS": list(writable_dirs or []),
@@ -226,7 +232,7 @@ def test_all_mounts_succeeding_lets_the_exec_proceed(tmp_path: Path) -> None:
     """
     libc, refusal = _run(tmp_path, fail_at=None)
     assert refusal is None
-    # propagation + credential dir + read-only bind + its sealing remount + file + ssh
+    # propagation + read-only bind + its sealing remount + credential dir + file + ssh
     assert len(libc.calls) == 6
 
 
@@ -234,17 +240,17 @@ def test_all_mounts_succeeding_lets_the_exec_proceed(tmp_path: Path) -> None:
     ("fail_at", "expect_in_message"),
     [
         (1, "propagation"),
-        (2, "credential directory"),
-        (3, "exposing read-only path"),
-        (4, "sealing read-only path"),
+        (2, "exposing read-only path"),
+        (3, "sealing read-only path"),
+        (4, "credential directory"),
         (5, "sensitive file"),
         (6, "ssh key directory"),
     ],
     ids=[
         "propagation",
-        "credential-dir",
         "readonly-bind",
         "readonly-seal",
+        "credential-dir",
         "sensitive-file",
         "ssh-dir",
     ],
@@ -277,7 +283,7 @@ def test_the_refusal_names_the_hidden_path(tmp_path: Path) -> None:
 
     Break-arm: ``drop_path`` (the dirs site's label made a constant).
     """
-    libc, refusal = _run(tmp_path, fail_at=2)
+    libc, refusal = _run(tmp_path, fail_at=4)
     assert refusal is not None
     target = libc.calls[-1][1].decode()
     assert target in refusal
@@ -323,6 +329,124 @@ def test_every_tier_routes_all_eight_mounts_through_the_guard() -> None:
         # window's two -- staging its real contents out before the parent is
         # masked, then binding them onto the placeholder inside the stand-in.
         assert script.count("_mount_or_die(") == 9
+
+
+# --------------------------------------------------------------------------
+# Seal before hide: a hidden leaf under a sealed parent
+# --------------------------------------------------------------------------
+
+_MS_BIND, _MS_REMOUNT = 4096, 32
+
+
+def _nested_pair(tmp_path: Path) -> tuple[str, str]:
+    """A sealed parent and a hidden leaf inside it -- the ``run`` /
+    ``run/voice-runtime`` shape, on paths under pytest's tmp_path."""
+    parent = tmp_path / "home" / "run"
+    leaf = parent / "voice-runtime"
+    leaf.mkdir(parents=True)
+    (leaf / "marker.txt").write_text("decoder image\n")
+    return str(parent), str(leaf)
+
+
+def _seal_and_hide_positions(libc: _FakeLibc, parent: str, leaf: str) -> tuple[int, int, int]:
+    """Call indexes of the parent's self-bind, its sealing remount, and the
+    leaf's hide, in the order the region issued them."""
+    calls = libc.calls
+    parent_b, leaf_b = parent.encode(), leaf.encode()
+    self_bind = next(
+        i
+        for i, (src, tgt, flags) in enumerate(calls)
+        if tgt == parent_b and src == parent_b and flags == _MS_BIND
+    )
+    remount = next(
+        i for i, (src, tgt, flags) in enumerate(calls) if tgt == parent_b and flags & _MS_REMOUNT
+    )
+    hide = next(
+        i
+        for i, (src, tgt, flags) in enumerate(calls)
+        if tgt == leaf_b and src != leaf_b and flags == _MS_BIND
+    )
+    return self_bind, remount, hide
+
+
+def test_a_hidden_leaf_under_a_sealed_parent_is_hidden_after_the_seal(
+    tmp_path: Path,
+) -> None:
+    """The leaf's empty-dir hide must be issued AFTER both halves of the
+    parent's seal.
+
+    A non-recursive ``MS_BIND`` does not replicate submounts, so a parent
+    self-bind issued after the leaf's hide masks it: lookups through the new
+    parent mount reach the REAL leaf, and the hide degrades to read-only
+    visible (container measured on the shipped launcher: the marker inside
+    ``run/voice-runtime`` was ``cat``-readable, writes EROFS). Issued after the
+    seal, the hide is a mount ON the sealed parent and stays reachable through
+    it -- the same property the write carve-outs rely on.
+
+    Break-arm: ``test_break_arm_hide_before_seal_is_caught`` (the two loops
+    swapped back to the pre-fix order).
+    """
+    parent, leaf = _nested_pair(tmp_path)
+    libc, refusal = _run(tmp_path, fail_at=None, sensitive_dirs=[leaf], readonly_dirs=[parent])
+    assert refusal is None
+    self_bind, remount, hide = _seal_and_hide_positions(libc, parent, leaf)
+    assert self_bind < remount < hide, [c[1] for c in libc.calls]
+
+
+def test_seal_before_hide_keeps_the_carveout_after_the_seal(tmp_path: Path) -> None:
+    """The reorder must not disturb the carve-out's own ordering constraint:
+    the write carve-out is still issued after the parent's seal, and
+    after the leaf hide, so neither the hide nor the carve-out is masked."""
+    parent, leaf = _nested_pair(tmp_path)
+    scratch = Path(parent) / "mcp-tmp" / "probe-x" / "tmp"
+    scratch.mkdir(parents=True)
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        sensitive_dirs=[leaf],
+        readonly_dirs=[parent],
+        writable_dirs=[str(scratch)],
+    )
+    assert refusal is None
+    _self_bind, remount, hide = _seal_and_hide_positions(libc, parent, leaf)
+    carve = next(
+        i
+        for i, (_src, tgt, flags) in enumerate(libc.calls)
+        if tgt == str(scratch).encode() and flags == _MS_BIND
+    )
+    assert remount < hide < carve, [c[1] for c in libc.calls]
+
+
+def _swap_hide_and_seal(script: str) -> str:
+    """The pre-fix launcher: the SENSITIVE_DIRS hide loop ahead of the
+    READONLY_DIRS seal loop. Built by moving the blocks, not by editing them,
+    so the mutant differs from the shipped script in ORDER only."""
+    ro_start = script.index("        # Exposed-but-read-only dirs")
+    hide_start = script.index("        # Bind-mount empty dirs over credential paths")
+    carve_start = script.index("        # Writable carve-outs")
+    assert ro_start < hide_start < carve_start
+    return (
+        script[:ro_start]
+        + script[hide_start:carve_start]
+        + script[ro_start:hide_start]
+        + script[carve_start:]
+    )
+
+
+def test_break_arm_hide_before_seal_is_caught(tmp_path: Path) -> None:
+    """Swapping the loops back must falsify the ordering assertion."""
+    parent, leaf = _nested_pair(tmp_path)
+    mutant = _swap_hide_and_seal(_build_launcher_script("strict"))
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        script=mutant,
+        sensitive_dirs=[leaf],
+        readonly_dirs=[parent],
+    )
+    assert refusal is None
+    self_bind, remount, hide = _seal_and_hide_positions(libc, parent, leaf)
+    assert hide < self_bind < remount, "the mutant did not reorder the mounts"
 
 
 # --------------------------------------------------------------------------
@@ -390,21 +514,21 @@ _ARMS: dict[str, tuple[str, str]] = {
         '_libc.mount(None, b"/", None, _MS_REC | _MS_PRIVATE, None)',
     ),
     "site2": (
-        "_mount_or_die(per_dir_empty, target, _MS_BIND,\n"
-        '                              "hiding credential directory %s" % d)',
-        "_libc.mount(per_dir_empty, target, None, _MS_BIND, None)",
-    ),
-    "site3": (
         "_mount_or_die(target, target, _MS_BIND,\n"
         '                              "exposing read-only path %s" % d)',
         "_libc.mount(target, target, None, _MS_BIND, None)",
     ),
-    "site4": (
+    "site3": (
         "_mount_or_die(target, target,\n"
         "                              _MS_REMOUNT | _MS_BIND | _MS_RDONLY\n"
         "                              | _locked_mount_flags(target),\n"
         '                              "sealing read-only path %s" % d)',
         "_libc.mount(target, target, None, _MS_REMOUNT | _MS_BIND | _MS_RDONLY, None)",
+    ),
+    "site4": (
+        "_mount_or_die(per_dir_empty, target, _MS_BIND,\n"
+        '                              "hiding credential directory %s" % d)',
+        "_libc.mount(per_dir_empty, target, None, _MS_BIND, None)",
     ),
     "site5": (
         "_mount_or_die(empty_path.encode(), target, _MS_BIND,\n"
@@ -461,7 +585,7 @@ def test_break_arms_falsify_each_assertion(tmp_path: Path, arm: str) -> None:
         return
 
     if arm == "drop_path":
-        libc, refusal = _run(tmp_path, fail_at=2, script=script)
+        libc, refusal = _run(tmp_path, fail_at=4, script=script)
         assert refusal is not None
         assert libc.calls[-1][1].decode() not in refusal
         return
@@ -486,7 +610,7 @@ def test_break_arms_falsify_each_assertion(tmp_path: Path, arm: str) -> None:
 
 def test_break_arm_reintroduce_raw_is_caught_by_the_tier_sweep() -> None:
     """The no-raw-call-sites sweep must fail when a raw call comes back."""
-    script = _mutate("site2")
+    script = _mutate("site4")
     raw = [
         line
         for line in script.splitlines()
