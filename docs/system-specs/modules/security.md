@@ -21,6 +21,33 @@ commands: those retain the sandbox chokepoint and the AST routing audit.
 
 Kiro Crew implements defense-in-depth security across multiple layers: OS-level process isolation, credential path protection, input/output validation, authentication, authorization, and audit logging. This document consolidates all security controls and the vulnerabilities they address.
 
+### MCP launch authorization leaves
+
+The `approvals.json` file in the crew-home `mcp-launch-approvals/` directory
+records operator-approved fingerprints for stubbed MCP launches. Every writer publishes it by rename, so
+the seal is its DIRECTORY: the file-tool gate denies writes under
+`mcp-launch-approvals/`, and the OS sandbox mounts that precreated directory
+read-only with a strict no-symlink check. Empty and absent forms both approve
+nothing. A refusal displays each command with its redacted,
+bounded declared environment. Every identity serialized into `expected_launch`
+has exactly one displayed command and one displayed environment, so the operator
+can approve only launch content that was rendered. Cached recommendation seeding
+can add a stub route, but it does not approve the launch behind that name.
+
+The generated `mcp-gateway/agents/` overlays and `mcp-gateway/stubs/` sidecars
+are not sealed: gatewayd checks the command and environment they carry against
+the approved fingerprint at launch, so tampered content fails closed. The
+`mcp/resolved/` tree supplies the executable substituted for a resolved npm
+launcher. It is file-tool write-protected, OS-sandbox read-only, and a strict
+no-symlink mount target. Linux precreates it before bind mounting it, so a fresh
+data home has the same disposition as one that already contains resolved
+launches. Its writers are gateway-side. The
+resolve-once npm child stays sandboxed and installs into a private directory
+under the sealed `run/` parent. The existing validated runtime carve-out grants
+that child write access to only the random staging directory; it cannot cover
+`record.json` or another resolution. After validating the tree, the gateway
+process renames it into `mcp/resolved/` and writes `record.json`.
+
 ### Member memory boundaries
 
 Cold subagent continuation restores app ownership from the canonical

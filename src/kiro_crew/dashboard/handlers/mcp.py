@@ -45,8 +45,17 @@ from kiro_crew.mcp_discovery import (
     redact_mcp_error,
     redact_mcp_headers,
 )
-from kiro_crew.mcp_gateway import hazards, is_gateway_supported
+from kiro_crew.mcp_gateway import hazards, is_gateway_supported, launch_resolve
 from kiro_crew.mcp_gateway.hashing import hash_command
+from kiro_crew.mcp_gateway.launch_approval import (
+    approve,
+    display_launches,
+    load_approvals,
+    refused_servers,
+    restore,
+    revoke,
+    target_stem,
+)
 from kiro_crew.mcp_gateway.rewriter import records_dir
 from kiro_crew.mcp_gateway.shareability import ShareEvidence, ShareVerdict, assess
 from kiro_crew.mcp_gateway.verdict_cache import load_cache
@@ -3288,6 +3297,7 @@ async def api_mcp_gateway_status(request: web.Request) -> web.Response:
     running = manager is not None and manager.is_running
     ping_ok = manager is not None and running and await manager.ping()
     cfg = KiroCrewConfig.load().mcp_gateway
+    launch_refused = await asyncio.to_thread(refused_servers)
     return web.json_response(
         {
             "enabled": cfg.enabled,
@@ -3297,6 +3307,10 @@ async def api_mcp_gateway_status(request: web.Request) -> web.Response:
             # row's own control without a second request.
             "stub": sorted(cfg.stub_servers),
             "stub_count": len(cfg.stub_servers),
+            # Stubbed servers whose launch the last rewrite refused to run
+            # outside the sandbox. Each resolved argv is paired with its
+            # redacted declared environment for an informed re-approval.
+            "launch_refused": launch_refused,
             "running": bool(running),
             "ping_ok": bool(ping_ok),
             # Whether the broker can run on this OS at all. The UI reads this to
@@ -4078,6 +4092,36 @@ def _assess_server(
     )
 
 
+async def api_mcp_gateway_server_launch(request: web.Request) -> web.Response:
+    """GET one server's complete, display-safe launch and compare-and-set token."""
+    name = str(request.query.get("name", "")).strip()
+    if not name:
+        return web.json_response({"error": "name is required", "code": "name_required"}, status=400)
+    if not _is_valid_mcp_name(name):
+        return web.json_response(
+            {"error": "invalid server name", "code": "invalid_server_name"}, status=400
+        )
+    try:
+        launches = await asyncio.to_thread(launch_resolve.resolve_launches, [name])
+    except Exception as exc:
+        logger.warning("mcp launch resolution failed: %s", exc)
+        return web.json_response(
+            {"error": "could not resolve the launch", "code": "launch_resolve_failed"},
+            status=503,
+        )
+    if name in getattr(launches, "over_cap", ()):
+        return web.json_response(
+            {"error": "the launch set exceeds the approval limit", "code": "launch_over_cap"},
+            status=409,
+        )
+    if not launches.get(name):
+        return web.json_response(
+            {"error": "no launch resolves for this server", "code": "launch_unresolved"},
+            status=409,
+        )
+    return web.json_response(display_launches(name, launches[name]))
+
+
 async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
     """POST /api/mcp-gateway/servers/stub — toggle servers' stub flag.
 
@@ -4116,6 +4160,7 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
         return denied
     from kiro_crew.config.loader import (  # noqa: F811
         ConfigReadError,
+        ConfigWriteRefused,
         config_path,
         update_config_locked,
     )
@@ -4163,6 +4208,14 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
         names = [name]
     if not isinstance(stub, bool):
         return web.json_response({"error": "stub must be a boolean"}, status=400)
+    if batch and stub:
+        return web.json_response(
+            {
+                "error": "stub=true requires one displayed launch per request",
+                "code": "batch_stub_requires_individual",
+            },
+            status=400,
+        )
     # Opt-in: "stub only the ones the evidence allows, and decide that yourself".
     #
     # The alternative -- a client filtering the rows it already has -- can only
@@ -4184,6 +4237,125 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
             },
             status=400,
         )
+
+    def _log_stub_rejection(code: str) -> None:
+        sel().log_api_access(
+            caller=request.get("user", "dashboard"),
+            operation=f"mcp_stub_rejected_{code}",
+            outcome="denied",
+            source="dashboard",
+            resources=f"code={code} names={','.join(names)}"[:256],
+        )
+
+    def _launch_over_cap_response(over_cap: list[str]) -> web.Response:
+        _log_stub_rejection("launch_over_cap")
+        return web.json_response(
+            {
+                "error": (
+                    "more launches resolve for "
+                    + ", ".join(over_cap)
+                    + " than one approval can record. Nothing was changed."
+                ),
+                "code": "launch_over_cap",
+                "over_cap": over_cap,
+            },
+            status=409,
+        )
+
+    expected_launch = body.get("expected_launch")
+    if expected_launch is not None and (batch or not stub or not isinstance(expected_launch, str)):
+        _log_stub_rejection("expected_launch_invalid")
+        return web.json_response(
+            {
+                "error": "expected_launch is only valid as a string for one stub approval",
+                "code": "expected_launch_invalid",
+            },
+            status=400,
+        )
+
+    # The toggle approves a NAME; what that name launches is approved by content
+    # (``mcp_gateway.launch_approval``). Resolve it NOW, from the inputs the
+    # gateway's own rewrite reads, and approve exactly that: the rewrite that
+    # would otherwise observe it runs at the next gateway start, and an agent
+    # can edit ``mcp.json`` or a spec in between. Before any write, so a name
+    # with nothing to approve changes nothing.
+    launches: dict[str, list[Any]] = {}
+    if stub:
+        try:
+            launches = await asyncio.to_thread(launch_resolve.resolve_launches, names)
+        except Exception as exc:
+            logger.warning("mcp launch resolution failed: %s", exc)
+            _log_stub_rejection("launch_resolve_failed")
+            return web.json_response(
+                {
+                    "error": "could not resolve the launch to approve",
+                    "code": "launch_resolve_failed",
+                },
+                status=503,
+            )
+        over_cap = [n for n in names if n in getattr(launches, "over_cap", ())]
+        if over_cap:
+            return _launch_over_cap_response(over_cap)
+        unresolved = [n for n in names if not launches.get(n)]
+        if unresolved and not resolve_eligibility:
+            _log_stub_rejection("launch_unresolved")
+            return web.json_response(
+                {
+                    "error": (
+                        "no agent declares a launch the gateway would run for "
+                        + ", ".join(unresolved)
+                        + ", so there is nothing to approve. Nothing was changed."
+                    ),
+                    "code": "launch_unresolved",
+                    "unresolved": unresolved,
+                },
+                status=409,
+            )
+
+        # Every approval is a compare-and-set on a complete launch display,
+        # including the first time a name is stubbed.
+        current_display = display_launches(names[0], launches.get(names[0], ()))
+        if not current_display["complete"]:
+            _log_stub_rejection("launch_display_incomplete")
+            return web.json_response(
+                {
+                    "error": "the launch display is incomplete and cannot be approved",
+                    "code": "launch_display_incomplete",
+                },
+                status=409,
+            )
+        if expected_launch is None:
+            _log_stub_rejection("expected_launch_required")
+            return web.json_response(
+                {
+                    "error": "display the launch before approving it",
+                    "code": "expected_launch_required",
+                },
+                status=409,
+            )
+        stored_refusals = await asyncio.to_thread(refused_servers)
+        stored = stored_refusals.get(names[0])
+        current_expected = current_display.get("expected_launch")
+        if expected_launch != current_expected or (
+            stored is not None and expected_launch != stored.get("expected_launch")
+        ):
+            _log_stub_rejection("launch_changed_since_display")
+            return web.json_response(
+                {
+                    "error": "the launch changed after it was shown; refresh before approving",
+                    "code": "launch_changed_since_display",
+                },
+                status=409,
+            )
+
+        approval_snapshot = await asyncio.to_thread(load_approvals)
+        over_cap = [
+            name
+            for name in names
+            if launches.get(name) and approval_snapshot.over_cap(target_stem(name))
+        ]
+        if over_cap:
+            return _launch_over_cap_response(over_cap)
 
     path = config_path()
     # ``_MCP_GATEWAY_APPLY_LOCK`` outermost, in the SAME order the sharing toggle
@@ -4220,6 +4392,25 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+
+        revoked_snapshot = None
+        if not stub:
+            try:
+                revoked_snapshot = await asyncio.to_thread(revoke, names)
+            except OSError as exc:
+                logger.warning("mcp launch approval store write failed: %s", exc)
+                _log_stub_rejection("approval_write_failed")
+                return web.json_response(
+                    {
+                        "error": "could not record the launch approval",
+                        "code": "approval_write_failed",
+                    },
+                    status=503,
+                )
+
+        async def _restore_revoked() -> None:
+            if revoked_snapshot is not None:
+                await asyncio.to_thread(restore, revoked_snapshot)
 
         # Carries the compare-and-set outcome out of the mutate callback. Raising
         # through ``update_config_locked`` would abort the write, which is the
@@ -4267,6 +4458,17 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
                         )
                     ),
                 )
+                # A name with no launch to approve would be stubbed with nothing
+                # the gateway may run for it.
+                skipped = [
+                    *skipped,
+                    *(
+                        {"name": n, "reason": "launch_unresolved"}
+                        for n in written
+                        if not launches.get(n)
+                    ),
+                ]
+                written = [n for n in written if launches.get(n)]
                 resolved["skipped"] = skipped
                 resolved["sharing_on"] = sharing_on
                 if not written:
@@ -4304,8 +4506,15 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
             async with _get_config_lock():
                 await _offload_config_write(update_config_locked, path, mutate=_mutate)
         except ConfigReadError:
+            await _restore_revoked()
             return web.json_response({"error": "config.json is corrupt"}, status=500)
+        except ConfigWriteRefused as exc:
+            await _restore_revoked()
+            return web.json_response(
+                {"error": str(exc), "code": "config_write_refused"}, status=400
+            )
         except OSError as exc:
+            await _restore_revoked()
             # OSError can carry a filesystem path; keep it server-side and send
             # the client a generic message (rendered verbatim into a localized UI).
             logger.warning("mcp config lock failed: %s", exc)
@@ -4315,7 +4524,25 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
             )
 
         if refused.get("code") == "mcp_gateway_not_object":
+            await _restore_revoked()
             return web.json_response({"error": "mcp_gateway is not an object"}, status=500)
+
+        # Turning a stub on approves the launches resolved above for the names written.
+        decided = list(resolved.get("eligible") or [])
+        if stub and decided:
+            approved = {n: launches[n] for n in decided if launches.get(n)}
+            try:
+                await asyncio.to_thread(approve, approved)
+            except OSError as exc:
+                logger.warning("mcp launch approval store write failed: %s", exc)
+                _log_stub_rejection("approval_write_failed")
+                return web.json_response(
+                    {
+                        "error": "could not record the launch approval",
+                        "code": "approval_write_failed",
+                    },
+                    status=503,
+                )
 
         state: DashboardState = request.app["state"]
         apply = getattr(state, "_mcp_gateway_apply_stub", None)

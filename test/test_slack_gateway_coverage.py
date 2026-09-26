@@ -1622,6 +1622,13 @@ class TestTaskNotify:
 # ═════════════════════════════════════════════════════════════════════════
 
 
+def _gateway_rewrite_inputs(tmp_path):
+    def _inputs(_cfg, stubs):
+        return {"socket_path": tmp_path / "gw.sock", "stub_servers": stubs}
+
+    return _inputs
+
+
 class TestInitMcpGateway:
     """Broker startup, its two early returns and the rewriter-failure fallback."""
 
@@ -1735,9 +1742,10 @@ class TestInitMcpGateway:
         orch._cfg.mcp_gateway.enabled = True
         with (
             patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
-            patch("kiro_crew.slack.gateway.resolve_overlay_dir", return_value=tmp_path / "overlay"),
-            patch("kiro_crew.slack.gateway.default_socket_path", return_value=tmp_path / "gw.sock"),
-            patch("kiro_crew.slack.gateway.kiro_agents_dir", return_value=tmp_path / "agents"),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
             patch("kiro_crew.slack.gateway.rewrite_agents", side_effect=RuntimeError("bad spec")),
             patch("kiro_crew.slack.gateway.GatewayManager") as mgr_cls,
         ):
@@ -1756,9 +1764,10 @@ class TestInitMcpGateway:
         manager.start = AsyncMock(return_value=True)
         with (
             patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
-            patch("kiro_crew.slack.gateway.resolve_overlay_dir", return_value=tmp_path / "overlay"),
-            patch("kiro_crew.slack.gateway.default_socket_path", return_value=tmp_path / "gw.sock"),
-            patch("kiro_crew.slack.gateway.kiro_agents_dir", return_value=tmp_path / "agents"),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
             patch(
                 "kiro_crew.slack.gateway.rewrite_agents",
                 return_value=(None, {"MC_MCP_TARGET_X": "1"}),
@@ -1787,9 +1796,10 @@ class TestInitMcpGateway:
         manager.start = AsyncMock(return_value=True)
         with (
             patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
-            patch("kiro_crew.slack.gateway.resolve_overlay_dir", return_value=tmp_path / "overlay"),
-            patch("kiro_crew.slack.gateway.default_socket_path", return_value=tmp_path / "gw.sock"),
-            patch("kiro_crew.slack.gateway.kiro_agents_dir", return_value=tmp_path / "agents"),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
             patch("kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})) as rewriter,
             patch("kiro_crew.slack.gateway.GatewayManager", return_value=manager),
         ):
@@ -1819,9 +1829,10 @@ class TestInitMcpGateway:
         manager.start = AsyncMock(return_value=True)
         with (
             patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
-            patch("kiro_crew.slack.gateway.resolve_overlay_dir", return_value=tmp_path / "overlay"),
-            patch("kiro_crew.slack.gateway.default_socket_path", return_value=tmp_path / "gw.sock"),
-            patch("kiro_crew.slack.gateway.kiro_agents_dir", return_value=tmp_path / "agents"),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
             patch("kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})),
             patch("kiro_crew.slack.gateway.GatewayManager", return_value=manager),
         ):
@@ -1851,9 +1862,10 @@ class TestInitMcpGateway:
         manager.start = AsyncMock(return_value=False)  # transient failure
         with (
             patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
-            patch("kiro_crew.slack.gateway.resolve_overlay_dir", return_value=tmp_path / "overlay"),
-            patch("kiro_crew.slack.gateway.default_socket_path", return_value=tmp_path / "gw.sock"),
-            patch("kiro_crew.slack.gateway.kiro_agents_dir", return_value=tmp_path / "agents"),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
             patch("kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})),
             patch("kiro_crew.slack.gateway.GatewayManager", return_value=manager),
         ):
@@ -1873,9 +1885,10 @@ class TestInitMcpGateway:
         manager.start = AsyncMock(return_value=False)
         with (
             patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
-            patch("kiro_crew.slack.gateway.resolve_overlay_dir", return_value=tmp_path / "overlay"),
-            patch("kiro_crew.slack.gateway.default_socket_path", return_value=tmp_path / "gw.sock"),
-            patch("kiro_crew.slack.gateway.kiro_agents_dir", return_value=tmp_path / "agents"),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
             patch("kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})),
             patch("kiro_crew.slack.gateway.GatewayManager", return_value=manager),
         ):

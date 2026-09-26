@@ -803,7 +803,15 @@ class TestSetStubNameGate:
         monkeypatch.setattr(loader_mod, "config_path", lambda: cfg)
         monkeypatch.setattr(mcp_mod, "_local_overlay_section", lambda: {})
 
-        request = _make_stub_request({"name": "auto-improvement:auto-improvement", "stub": True})
+        from kiro_crew.mcp_gateway import launch_approval
+
+        name = "auto-improvement:auto-improvement"
+        expected_launch = launch_approval.launch_pair(
+            launch_approval.hash_command(name, []), launch_approval.env_fingerprint({})
+        )
+        request = _make_stub_request(
+            {"name": name, "stub": True, "expected_launch": expected_launch}
+        )
         resp = await mcp_mod.api_mcp_gateway_set_stub(request)
         body = json.loads(resp.body)
 

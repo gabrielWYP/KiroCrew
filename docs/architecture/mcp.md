@@ -697,6 +697,58 @@ Python server configured through `env.PYTHONPATH` fails the probe while working
 in a session, and unexplained that reads as a probe bug rather than the
 launcher boundary it is.
 
+### Stub launch approval
+
+A stub roster entry selects routing, while
+`~/.kiro/crew/mcp-launch-approvals/approvals.json` authorizes the exact resolved
+command and arguments together with the derived effective-environment hash that
+gatewayd may run outside a session sandbox. Command and environment hashes are
+stored and checked as one pair, so values from two approvals cannot be combined.
+An absent or empty store approves nothing. A stub
+without a matching fingerprint stays on the session's unpooled, sandboxed launch
+path. A queued cold spawn reloads the store after admission and resolves the same
+command and environment identity again immediately before the fork, so revoking
+an approval while it waits prevents the process from starting. Existing stubs
+therefore require one approval in **Settings → MCP
+Management** after an upgrade introduces this store. Cached recommendation
+seeding may add a stub route, but it grants no launch approval; the seeded
+row stays on the session-sandboxed path until the operator reviews it.
+
+The MCP Management toggle resolves the launch at the time of the operator's
+choice. Every `stub: true` is a compare-and-set on a displayed launch, the first
+approval of a name included: the UI reads
+`GET /api/mcp-gateway/servers/launch?name=<name>`, which returns `name`,
+`commands`, `envs`, `complete` and, only when the display is complete,
+`expected_launch`. This display-safe, bounded GET follows the other dashboard
+read routes and does not require owner identity; the POST that records the choice
+remains owner-only. `POST /api/mcp-gateway/servers/stub` refuses a missing token
+with 409 `expected_launch_required`, a truncated display with 409
+`launch_display_incomplete`, and a token that no longer matches the resolution
+with 409 `launch_changed_since_display`. A batch `stub: true` returns 400
+`batch_stub_requires_individual`; batch `stub: false` is accepted. Turning a stub
+off revokes the approval first, and restores it when the config write does not
+commit. The approval also stores the redacted, bounded display of the approved
+launch, so a `changed_needs_reapproval` refusal carries `approved_commands` and
+`approved_envs` beside the new `commands` and `envs`; an approval recorded
+without a display omits both fields. A refused row exposes each display-only command argv with its redacted
+declared environment. Both displays are scrubbed and bounded before they enter
+the refusal record, and status polling only reads that record; it does not rebuild
+or resolve agent specs. Every identity serialized into `expected_launch` has
+exactly one displayed command and one displayed environment, so an approval
+covers only launch content the operator saw. Selecting re-approve sends back the
+stored command/effective-environment pair for the row. The handler compares it
+with both the stored refusal and a fresh resolution before any write; a changed
+launch returns 409 and preserves both stores. A matching launch replaces the
+fingerprint and clears the refusal. A changed command, arguments, or declared
+environment requires the same re-approve flow. The gateway-owned `mcp/resolved/`
+store is sealed read-only in
+session sandboxes because its record chooses the entry point substituted for an
+approved npm launcher. Resolve-once therefore gives sandboxed npm a private
+prefix below the sealed runtime parent, using the existing validated carve-out
+that accepts only self-derived runtime directories. After validating the
+completed tree, the gateway process renames it into `mcp/resolved/` before
+committing the record. The carve-out cannot cover the sealed store.
+
 ### Which `mcp_gateway.*` knobs a config write reaches
 
 One knob is resolved per use rather than captured at boot, so a `config.json`

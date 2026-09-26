@@ -52,6 +52,19 @@ def _request(
         raw = b"{not json"
         req.json = AsyncMock(side_effect=body)
     else:
+        if (
+            isinstance(body, dict)
+            and body.get("stub") is True
+            and isinstance(body.get("name"), str)
+            and "expected_launch" not in body
+        ):
+            from kiro_crew.mcp_gateway import launch_approval
+
+            env_hash = launch_approval.env_fingerprint({})
+            expected = launch_approval.launch_pair(
+                launch_approval.hash_command(body["name"], []), env_hash
+            )
+            body = {**body, "expected_launch": expected}
         raw = json.dumps(body).encode() if body is not None else b""
         # Kept alive: ``api_mcp_server_detail`` reads uncapped
         # (``max_bytes=None``) and consumes ``request.json()``.
@@ -2240,7 +2253,7 @@ class TestGatewayServers:
 
         cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": False, "stub_servers": []}}))
         resp = await mcp_mod.api_mcp_gateway_set_stub(
-            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": True})
+            _request({"name": "a-mcp", "stub": True, "resolve_eligibility": True})
         )
         assert resp.status == 200
         body = _payload(resp)
@@ -2256,7 +2269,7 @@ class TestGatewayServers:
         # say which name it declined, rather than co-tenanting on the weaker flag.
         cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
         resp = await mcp_mod.api_mcp_gateway_set_stub(
-            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": True})
+            _request({"name": "a-mcp", "stub": True, "resolve_eligibility": True})
         )
         assert resp.status == 200
         body = _payload(resp)
@@ -2304,7 +2317,7 @@ class TestGatewayServers:
         monkeypatch.setattr(mcp_mod, "_stub_eligibility", _record)
 
         resp = await mcp_mod.api_mcp_gateway_set_stub(
-            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": True})
+            _request({"name": "a-mcp", "stub": True, "resolve_eligibility": True})
         )
         assert resp.status == 200
         assert seen["forward"] is False, (
@@ -2407,7 +2420,7 @@ class TestGatewayServers:
         monkeypatch.setattr(loader, "update_config_locked", _recording_update)
 
         resp = await mcp_mod.api_mcp_gateway_set_stub(
-            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": False})
+            _request({"name": "a-mcp", "stub": True, "resolve_eligibility": False})
         )
         assert resp.status == 200
         # Empty means the handler wrote config.json some other way, which is the
@@ -2455,7 +2468,7 @@ class TestGatewayServers:
         monkeypatch.setattr(loader, "update_config_locked", _slow_update)
 
         task = asyncio.create_task(
-            mcp_mod.api_mcp_gateway_set_stub(_request({"names": ["a-mcp"], "stub": True}))
+            mcp_mod.api_mcp_gateway_set_stub(_request({"name": "a-mcp", "stub": True}))
         )
         await asyncio.to_thread(entered.wait, 5)
         task.cancel()
@@ -2508,7 +2521,7 @@ class TestGatewayServers:
         monkeypatch.setattr(loader, "update_config_locked", _checking_update)
 
         resp = await mcp_mod.api_mcp_gateway_set_stub(
-            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": False})
+            _request({"name": "a-mcp", "stub": True, "resolve_eligibility": False})
         )
         assert resp.status == 200
         assert held_during_write == [True], (
@@ -2839,7 +2852,7 @@ class TestGatewaySetStub:
         )
         resp = await mcp_mod.api_mcp_gateway_set_stub(
             _request(
-                {"names": ["nope-mcp"], "stub": True, "resolve_eligibility": True},
+                {"name": "nope-mcp", "stub": True, "resolve_eligibility": True},
                 state=SimpleNamespace(),
             )
         )
@@ -3126,21 +3139,10 @@ class TestGatewaySetStubBatch:
                 state=SimpleNamespace(),
             )
         )
-        assert resp.status == 200
-        # The batch form answers with `names`, never a single `name`.
-        assert _payload(resp) == {
-            "ok": True,
-            "names": ["b-mcp", "a-mcp", "a-mcp"],
-            "stub": True,
-            "applied": False,
-            "restart_required": True,
-        }
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "batch_stub_requires_individual"
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert _effective_stubs(saved["mcp_gateway"]) == [
-            "kept-mcp",
-            "a-mcp",
-            "b-mcp",
-        ]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["kept-mcp"]
 
     @pytest.mark.asyncio
     async def test_removes_every_name_and_leaves_the_rest(
@@ -3180,12 +3182,9 @@ class TestGatewaySetStubBatch:
         resp = await mcp_mod.api_mcp_gateway_set_stub(
             _request({"names": ["a-mcp", "b-mcp"], "stub": True}, state=state)
         )
-        assert resp.status == 200
-        assert _payload(resp)["sessions_relinked"] == 3
-        apply_cb.assert_awaited_once_with()
-        # The audit names every server the request touched, not just the first.
-        audited = [c.kwargs.get("resources") for c in sel.log_api_access.call_args_list]
-        assert any("names=a-mcp,b-mcp" in (r or "") for r in audited)
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "batch_stub_requires_individual"
+        apply_cb.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_single_name_form_still_answers_with_name(
@@ -3197,7 +3196,8 @@ class TestGatewaySetStubBatch:
         resp = await mcp_mod.api_mcp_gateway_set_stub(
             _request({"name": "ok-mcp", "stub": True}, state=SimpleNamespace())
         )
-        assert _payload(resp) == {
+        body = _payload(resp)
+        assert body == {
             "ok": True,
             "name": "ok-mcp",
             "stub": True,
