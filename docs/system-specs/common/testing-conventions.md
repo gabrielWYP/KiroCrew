@@ -657,6 +657,14 @@ unauthenticated, the ones that hold a connection open, and the ones that
 reach the network on a fresh home are each a small table in the test, and a
 route that joins one of those classes is added there by hand.
 
+Two operator seams reach the boot without patching anything inside it. A spec
+that a SLOT or a SPAWN must resolve by name is written to `<home>/kiro/agents`
+BEFORE the boot: the loader answers agent names from a snapshot it scans once
+(`_scan_materialized_agents`), so a spec dropped in after the boot is not
+dispatchable until the next registration (the loader documents this as accepted
+staleness). Config a test needs the boot to read (`agent.spawn_min_memory_gb`,
+say) goes in `<home>/config.local.json`, the override file the operator owns.
+
 The directory is a package (`test/integration/__init__.py`) so its conftest
 imports as `integration.conftest`. The unit files import `test/conftest.py` by
 the bare name `conftest`; a second top-level `conftest` shadows it and 160
