@@ -53,6 +53,7 @@ def _fake_config(names, default=CREW):
         memory_stores={},
         workspaces={"default": SimpleNamespace(dir="workspace")},
         default_workspace="default",
+        degraded_sections=frozenset(),
     )
 
 
