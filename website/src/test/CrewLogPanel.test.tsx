@@ -28,8 +28,18 @@ function emptyBundle() {
 /** The client's shape: the folds plus the two facts the folds cannot carry --
  *  whether a unit was addressable, and whether the writer had drained. Tests that
  *  care about either pass it explicitly. */
-function read(folds: unknown, over: { resolved?: boolean; writesDrained?: boolean } = {}) {
-  return { folds, resolved: true, writesDrained: true, ...over } as never
+function read(
+  folds: unknown,
+  over: {
+    resolved?: boolean; writesDrained?: boolean; recording?: boolean; flagValue?: string
+    flagRecognised?: boolean; envFile?: string
+  } = {},
+) {
+  return {
+    folds, resolved: true, writesDrained: true, recording: true, flagValue: '', flagRecognised: true,
+    envFile: '~/.kiro/crew/.env',
+    ...over,
+  } as never
 }
 
 function populatedBundle(overrides: Record<string, unknown> = {}) {
@@ -177,11 +187,91 @@ describe('CrewLogTab', () => {
     vi.spyOn(api, 'sessionCrewLogProjections').mockResolvedValue(read(emptyBundle()))
     renderWithProviders(<CrewLogTab slot={SLOT} />)
     await waitFor(() =>
-      expect(screen.getByText('Nothing recorded for this session')).toBeInTheDocument())
+      expect(screen.getByText('No messages saved for this chat yet')).toBeInTheDocument())
     expect(screen.getByText('up to date; no entries yet')).toBeInTheDocument()
     // No section headers: a fold with no entries has nothing to summarise, and a
     // row of five zeroes would assert a measurement of an empty file.
     expect(screen.queryByText('Status')).not.toBeInTheDocument()
+    // Recording is on, so the switch-off instructions are not on screen.
+    expect(screen.queryByText(/KIROCREW_CREW_LOG/)).not.toBeInTheDocument()
+    expect(screen.queryByTestId('crew-log-off')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('crew-log-footer-off')).not.toBeInTheDocument()
+  })
+
+  it('says the crew log is off and the chat is not saved when the gateway reports it', async () => {
+    vi.spyOn(api, 'sessionCrewLogProjections').mockResolvedValue(
+      read(emptyBundle(), { recording: false, flagValue: 'fasle', flagRecognised: false }))
+    renderWithProviders(<CrewLogTab slot={SLOT} />)
+    await waitFor(() => expect(screen.getByText('The crew log is off')).toBeInTheDocument())
+    // The body opens with the consequence and quotes the value that switched it off.
+    // The consequence is its own line; nothing is on screen, so it is every message.
+    expect(screen.getByText('Messages in this chat are not being saved.')).toBeInTheDocument()
+    // A value the gateway does not recognise is said to be one BEFORE it is quoted, so it
+    // is not read as the app misspelling a setting.
+    expect(screen.getByText(/^KIROCREW_CREW_LOG has a value that is not recognised, “fasle”/))
+      .toBeInTheDocument()
+    expect(screen.queryByText(/0, false, no, off/)).not.toBeInTheDocument()
+    // A warning, not the neutral empty state.
+    const notice = screen.getByTestId('crew-log-off')
+    expect(notice).toHaveAttribute('role', 'status')
+    expect(notice.className).toContain('bg-warn-subtle')
+    expect(screen.getByText('The crew log is off').className).toContain('text-warn')
+    expect(screen.queryByText('No messages saved for this chat yet')).not.toBeInTheDocument()
+    // The docs path is a real link, not text that only looks like one.
+    const link = screen.getByRole('link', { name: 'what the crew log stores' })
+    expect(link).toHaveAttribute('href', expect.stringContaining('docs/reference/crew-log/README.md'))
+    expect(link).toHaveAttribute('target', '_blank')
+    // Nothing is written, so the footer makes no claim about a record.
+    expect(screen.queryByText('up to date; no entries yet')).not.toBeInTheDocument()
+    expect(screen.queryByText(/this chat is writing now/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Refresh/ })).toBeInTheDocument()
+    // The footer slot still says something: a lone Refresh button reads as broken.
+    expect(screen.getByTestId('crew-log-footer-off')).toHaveTextContent('Crew log off')
+  })
+
+  it('falls back to naming the variable when the gateway sends no value', async () => {
+    vi.spyOn(api, 'sessionCrewLogProjections').mockResolvedValue(
+      read(emptyBundle(), { recording: false, envFile: '~/elsewhere/.env' }))
+    renderWithProviders(<CrewLogTab slot={SLOT} />)
+    await waitFor(() => expect(screen.getByText('The crew log is off')).toBeInTheDocument())
+    // The body leads with the fix.
+    expect(screen.getByText(/^Remove KIROCREW_CREW_LOG from ~\/elsewhere\/\.env \(or wherever/))
+      .toBeInTheDocument()
+    // The file named is the one the gateway reported, not a hardcoded home.
+    expect(screen.queryByText(/~\/\.kiro\/crew\/\.env/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/“”/)).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'what the crew log stores' })).toBeInTheDocument()
+  })
+
+  it('says the crew log is off above entries an earlier run wrote, and keeps their footer', async () => {
+    vi.spyOn(api, 'sessionCrewLogProjections').mockResolvedValue(
+      read(populatedBundle(), { recording: false, flagValue: '0' }))
+    renderWithProviders(<CrewLogTab slot={SLOT} />)
+    await waitFor(() => expect(screen.getByText('The crew log is off')).toBeInTheDocument())
+    const notice = screen.getByTestId('crew-log-off')
+    expect(notice).toHaveTextContent(/Remove KIROCREW_CREW_LOG from .*restart the gateway\. It is set to “0”\./)
+    expect(notice).not.toHaveTextContent(/not recognised/)
+    // Entries are on screen, so only NEW messages go unsaved.
+    expect(screen.getByText('New messages in this chat are not being saved. The ones below stay.'))
+      .toBeInTheDocument()
+    expect(screen.queryByText('Messages in this chat are not being saved.')).not.toBeInTheDocument()
+    // The footer leads with the status and keeps the saved entries' watermark.
+    expect(screen.getByTestId('crew-log-footer-off'))
+      .toHaveTextContent('Crew log off · last saved entry 1,842')
+    // The entries stay readable below the notice.
+    expect(screen.getByText('Status')).toBeInTheDocument()
+    expect(notice.compareDocumentPosition(screen.getByText('Status')) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
+    // Nothing is being written, so the scope note about the log "being written now" goes.
+    expect(screen.queryByText(/this chat is writing now/)).not.toBeInTheDocument()
+    expect(screen.queryByText('No messages saved for this chat yet')).not.toBeInTheDocument()
+  })
+
+  it('keeps the footer when recording is on', async () => {
+    vi.spyOn(api, 'sessionCrewLogProjections').mockResolvedValue(read(emptyBundle()))
+    renderWithProviders(<CrewLogTab slot={SLOT} />)
+    await waitFor(() => expect(screen.getByText('up to date; no entries yet')).toBeInTheDocument())
+    expect(screen.getByText(/this chat is writing now/)).toBeInTheDocument()
   })
 
   it('re-reads when a turn ends, and not when one starts', async () => {
@@ -360,11 +450,16 @@ describe('CrewLogTab', () => {
     vi.spyOn(api, 'sessionCrewLogProjections').mockResolvedValue(read(emptyBundle(), { resolved: false }))
     renderWithProviders(<CrewLogTab slot={SLOT} />)
     await waitFor(() =>
-      expect(screen.getByText('No record addressable for this session')).toBeInTheDocument())
-    expect(screen.queryByText('Nothing recorded for this session')).not.toBeInTheDocument()
+      expect(screen.getByText('Nothing saved since this chat’s last reset')).toBeInTheDocument())
+    expect(screen.queryByText('No messages saved for this chat yet')).not.toBeInTheDocument()
     // Both causes named: a slot that has not run a turn, and a retired unit.
-    expect(screen.getByText(/Run a turn to start a new record/)).toBeInTheDocument()
-    expect(screen.getByText(/may not have run a turn yet/)).toBeInTheDocument()
+    expect(screen.getByText(/Run a turn to start saving messages again/)).toBeInTheDocument()
+    expect(screen.getByText(/has not run a turn yet/)).toBeInTheDocument()
+    expect(screen.getByText(/Messages saved before the reset stay saved/)).toBeInTheDocument()
+    // Unlike the empty state, it claims no watermark: there is no record to be current with.
+    expect(screen.queryByText('up to date; no entries yet')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Refresh/ })).toBeInTheDocument()
+    expect(screen.queryByText(/retired id/)).not.toBeInTheDocument()
   })
 
   it('says the fold may be behind when the writer had not drained', async () => {

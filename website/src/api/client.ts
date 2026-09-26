@@ -3284,7 +3284,15 @@ export const api = {
    *  advances the folds it belongs to and leaves the rest where they were. */
   sessionCrewLogProjections: async (slot: string) => {
     const body = await fetch(`/api/sessions/${encodeURIComponent(slot)}/crew-log/projections`).then(j)
-    const read = body as { projections?: Record<string, unknown>; resolved?: unknown; writes_drained?: unknown }
+    const read = body as {
+      projections?: Record<string, unknown>
+      resolved?: unknown
+      writes_drained?: unknown
+      recording?: unknown
+      flag_value?: unknown
+      flag_recognised?: unknown
+      env_file?: unknown
+    }
     return {
       folds: read.projections ?? {},
       // Whether a unit was NAMED for the id sent. An empty fold cannot say why it
@@ -3296,6 +3304,16 @@ export const api = {
       // taken, so the value may be behind the record. Absent reads as drained: an
       // older gateway does not send the field and did not race either.
       writesDrained: read.writes_drained !== false,
+      // False only when the gateway says recording is switched off. Absent reads as
+      // on: an older gateway does not send the field.
+      recording: read.recording !== false,
+      // The KIROCREW_CREW_LOG value that switched it off, so the panel can quote it.
+      // Empty when the gateway does not send one.
+      flagValue: typeof read.flag_value === 'string' ? read.flag_value : '',
+      // False when that value is not one of the switch-off spellings.
+      flagRecognised: read.flag_recognised !== false,
+      // The `.env` the gateway reads; the default home's when the gateway sends none.
+      envFile: typeof read.env_file === 'string' && read.env_file ? read.env_file : '~/.kiro/crew/.env',
     }
   },
   telemetryStartup: () => fetch('/api/telemetry/startup').then(j),

@@ -55,11 +55,16 @@ the code (`session_ledger.py`, `work_ledger.py`): a **ledger** is the append-onl
   instead. Message BODIES are in scope and are written, because they are redacted before
   they reach the file -- exfiltration URLs then credentials, in the writer rather than at
   the call sites, so a new call site cannot forget -- and a redaction that fails yields the
-  empty string, never the input. Bodies on disk are GATED: `KIROCREW_CREW_LOG` may
-  not default to on until session trash and permanent delete reach a session's ledger
-  directory and `StorageReport` counts its bytes. Until both land, "delete this
-  conversation" would not delete it and the disk-use surface would understate it, which are
-  product promises rather than costs. Tracked as kirodotdev/KiroCrew#10705.
+  empty string, never the input. Bodies on disk are GATED on session trash and permanent
+  delete reaching a session's ledger directory and `StorageReport` counting its bytes.
+  Session trash stages every crew-log unit the session owns inside the agent-hidden
+  crew-log tree, restore puts them back and emptying the trash removes them; a permanent
+  delete from an open tab removes the units it proved; and `StorageReport` counts their
+  bytes. An open unit grows for the life of its session; segments are not rotated, and
+  that is accepted. `KIROCREW_CREW_LOG` is on by default on that basis. A history row deleted with no
+  open tab proves no unit and leaves its units to retention, which collects only
+  `destroyed` closes, so units ended by a reset stay until the session is trashed. Tracked
+  as kirodotdev/KiroCrew#10705.
 - FR-8 Cold load synthesizes closers for open intervals.
 - NFR-1 Cheap to fold: checkpoints on disk; state never replays everything.
 - NFR-2 The backend extracts, the frontend loads pages; no client folds a ledger.

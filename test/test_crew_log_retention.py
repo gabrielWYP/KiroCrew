@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import shutil
 import time
+from pathlib import Path
 
 import pytest
 from crew_log_type_helpers import minimal_data
@@ -1456,3 +1457,78 @@ async def test_a_session_opened_after_a_destroy_makes_the_unit_uncollectable_aga
         assert CrewLog.exists(lg.KIND_SESSION, "acp-revived")
     finally:
         emit.reset_caches()
+
+
+def _stage_target(unit_id: str):
+    return (
+        store.crew_log_trash_root() / "batch-1" / "uid-1" / _unit_dir(lg.KIND_SESSION, unit_id).name
+    )
+
+
+def test_staging_syncs_both_parents_after_the_rename(monkeypatch):
+    """A rename is not a move until both directories are on disk."""
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-stage")
+    del log
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-stage").parent
+    target = _stage_target("s-stage")
+    synced: list = []
+    monkeypatch.setattr(atomic_write, "fsync_dir", lambda path, **_k: synced.append(Path(path)))
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-stage", target) == store.REMOVE_REMOVED
+
+    assert target.is_dir()
+    assert target.parent in synced
+    assert source_parent in synced
+
+
+def test_a_sync_that_fails_after_the_rename_puts_the_unit_back(monkeypatch):
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-unsynced")
+    del log
+    target = _stage_target("s-unsynced")
+    calls = {"n": 0}
+    real_rename = os.rename
+
+    def _rename(src, dst):
+        calls["n"] += 1
+        real_rename(src, dst)
+
+    after_rollback: list = []
+
+    def _fsync(path, **_k):
+        if calls["n"] == 1:
+            raise OSError("sync failed")
+        if calls["n"] == 2:
+            after_rollback.append(Path(path))
+
+    monkeypatch.setattr(os, "rename", _rename)
+    monkeypatch.setattr(atomic_write, "fsync_dir", _fsync)
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-unsynced").parent
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-unsynced", target) == store.REMOVE_FAILED
+
+    assert CrewLog.exists(lg.KIND_SESSION, "s-unsynced")
+    assert not target.exists()
+    assert source_parent in after_rollback, "the rollback was not made durable"
+
+
+def test_the_windows_branch_stages_an_idle_unit_and_refuses_a_held_one(monkeypatch):
+    """Windows renames only after releasing the lease; the lease still refuses a holder."""
+    monkeypatch.setattr(store, "_RENAME_UNDER_LEASE", False)
+    idle = _closed_session(unit_id="s-idle")
+    del idle
+    held = _closed_session(unit_id="s-held")
+    held.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src="gateway")
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-idle", _stage_target("s-idle")) == (
+        store.REMOVE_REMOVED
+    )
+    assert store.stage_unit(lg.KIND_SESSION, "s-held", _stage_target("s-held")) == (
+        store.REMOVE_OWNED
+    )
+    assert not CrewLog.exists(lg.KIND_SESSION, "s-idle")
+    assert CrewLog.exists(lg.KIND_SESSION, "s-held")
+    del held

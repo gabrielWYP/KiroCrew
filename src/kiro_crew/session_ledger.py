@@ -78,6 +78,7 @@ from pathlib import Path
 from typing import Any, Iterator, NamedTuple
 
 from kiro_crew.config.paths import data_home
+from kiro_crew.constants import env_file_display
 from kiro_crew.platform_compat import (
     release_lock,
     strip_extended_length_prefix,
@@ -1891,7 +1892,9 @@ def _require_crew_log(session_id: str) -> Any:
     if not crew_log_emit.enabled():
         raise LedgerUnavailable(
             "the session ledger is recorded in this session's crew log, which is "
-            f"switched off; set {crew_log_emit.CREW_LOG_ENV}=1 to record one"
+            f"switched off because {crew_log_emit.CREW_LOG_ENV} is set to 0, false, no, off or an "
+            f"unrecognised value; unset it (or remove it from {env_file_display()}) and "
+            "restart the gateway to record one"
         )
     projection = _projection()
     from kiro_crew.crew_log.schema import KIND_SESSION

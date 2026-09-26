@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Iterator
@@ -32,6 +33,10 @@ KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
 # security toggle (e.g. KIROCREW_NO_JAIL) is a silent-bypass footgun.
 ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+# Canonical falsy set, the explicit opt-out for the crew log, which defaults ON. See
+# ``crew_log_enabled``.
+ENV_FALSY = frozenset({"0", "false", "no", "off"})
+
 
 # Minimum supported Node.js MAJOR version for every Python-side check
 # (``kirocrew doctor``, the frontend-build probe in ``cli.py``, the TUI
@@ -45,6 +50,55 @@ MIN_NODE_MAJOR = 22
 def env_flag_enabled(name: str) -> bool:
     """Return True iff env var *name* is set to a truthy value (case/space-insensitive)."""
     return os.environ.get(name, "").strip().lower() in ENV_TRUTHY
+
+
+def env_file_display() -> str:
+    """The ``.env`` the gateway reads, as an operator would type it (``~`` for home).
+
+    Resolved through ``config.loader.env_path``, so it follows ``KIROCREW_HOME``: a
+    refusal that tells an operator which file to edit must name the one that is read.
+    """
+    from pathlib import Path
+
+    from kiro_crew.config.loader import env_path
+
+    path = env_path()
+    try:
+        return "~/" + path.relative_to(Path.home()).as_posix()
+    except (ValueError, RuntimeError):
+        return str(path)
+
+
+#: The variable that switches the crew log off. It lives here, beside its reader,
+#: so the gateway boot path can ask whether the crew log is wanted without importing
+#: the emitter.
+CREW_LOG_ENV = "KIROCREW_CREW_LOG"
+
+#: ``KIROCREW_CREW_LOG`` values :func:`crew_log_enabled` has already warned about.
+_WARNED_UNRECOGNISED: set[str] = set()
+
+
+def crew_log_enabled() -> bool:
+    """Whether the crew log records: ``KIROCREW_CREW_LOG`` unset, empty or truthy.
+
+    Read per call, case- and space-insensitive. Unset, empty and a value in
+    ``ENV_TRUTHY`` leave it on, and a value in ``ENV_FALSY`` turns it off. Any other
+    value fails CLOSED -- the only reason to set the variable is to opt out, so a
+    typo'd opt-out such as ``disable`` or ``fasle`` turns it off too, and is logged
+    once per value so the unrecognised spelling is visible.
+    """
+    value = os.environ.get(CREW_LOG_ENV, "").strip().lower()
+    if not value or value in ENV_TRUTHY:
+        return True
+    if value not in ENV_FALSY and value not in _WARNED_UNRECOGNISED:
+        _WARNED_UNRECOGNISED.add(value)
+        logging.getLogger(__name__).warning(
+            "%s=%r is not a recognised value, so it is OFF; unset it, or set it to "
+            "1, true, yes or on, to switch it on",
+            CREW_LOG_ENV,
+            value,
+        )
+    return False
 
 
 # Outer wall-clock cap on a single ``_run_chat`` invocation (any dispatch site:

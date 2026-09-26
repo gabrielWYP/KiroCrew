@@ -3925,7 +3925,7 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
             # Imported here, not at module scope: this file is on the gateway boot
             # path, and the emitter is flag-gated behind KIROCREW_CREW_LOG.
             # AUTOSDE's no-new-work-on-gateway-boot-path rule asks for the IMPORT to
-            # be gated, not just the handler, so a launch with the flag unset pays
+            # be gated, not just the handler, so a launch with the flag off pays
             # nothing for a subsystem it will never call.
             from kiro_crew.crew_log import emit as crew_log_emit
 
@@ -5520,12 +5520,6 @@ async def start_dashboard(
         # failed warm never blocks readiness.
         await warm_sel_singleton()
 
-        # Bind the crew-log push to this loop and register it with the session
-        # emitter. Installed here rather than lazily on a first request: the frame
-        # exists so a watching client learns of a growth it did not ask for, and a
-        # publisher armed by the first read would miss every growth before it.
-        handlers.install_crew_log_publisher(state)
-
         # Explicit middleware ordering — self-documenting and immune to future insertions
         app.middlewares[:] = [
             # Outermost: privacy-safe per-route latency. Times the FULL
@@ -5762,6 +5756,12 @@ async def start_dashboard(
     # the constructor (which runs pre-bind, on the loop) and runs here on a
     # worker thread once requests are already being served.
     _kick_knowledge_orphan_reclaim(state)
+    # Bind the crew-log push to this loop and register it with the session emitter,
+    # once the listener is serving: installing it imports and builds the publisher,
+    # which the crew log's default-on flag would otherwise put in front of the bind.
+    # It is installed here rather than on a first request because the frame exists
+    # so a watching client learns of a growth it did not ask for.
+    handlers.install_crew_log_publisher(state)
 
     # Event-loop heartbeat: proves the asyncio loop is live (the off-loop /proc
     # sampler can't — it runs in a subprocess). Sleeps 10s, then logs actual

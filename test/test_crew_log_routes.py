@@ -542,6 +542,50 @@ async def test_the_batch_read_reports_whether_the_writer_owed_anything():
 
 
 @pytest.mark.asyncio
+async def test_the_fold_read_says_whether_the_gateway_is_recording(monkeypatch):
+    """An empty fold cannot say why, so the read names the flag state beside it."""
+    handle = _log()
+    _opened(handle)
+    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    on = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert on["recording"] is True
+    assert "flag_value" not in on
+    assert "env_file" not in on
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "off")
+    off = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert off["recording"] is False
+    assert off["flag_value"] == "off"
+    assert off["flag_recognised"] is True
+    from kiro_crew.constants import env_file_display
+
+    assert off["env_file"] == env_file_display()
+
+
+@pytest.mark.asyncio
+async def test_the_fold_read_quotes_only_the_flag_value_that_switched_recording_off(
+    monkeypatch,
+):
+    """The panel names the typo; nothing else from the environment is sent."""
+    handle = _log()
+    _opened(handle)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", " fasle\x1b[31m" + "x" * 80 + " ")
+    monkeypatch.setenv("KIROCREW_TEST_SECRET_NEIGHBOUR", "do-not-send")
+    off = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert off["recording"] is False
+    assert off["flag_value"].startswith("fasle[31m")
+    assert len(off["flag_value"]) == 40
+    assert "\x1b" not in off["flag_value"]
+    assert off["flag_recognised"] is False
+    assert "do-not-send" not in json.dumps(off)
+
+
+@pytest.mark.asyncio
 async def test_the_settle_step_waits_on_the_emitter_s_own_flush():
     """The drain must be the emitter's, not a local guess at what quiet means.
 
@@ -1127,13 +1171,13 @@ def test_the_flag_name_matches_the_emitters_own_constant():
 
 @pytest.mark.asyncio
 async def test_installing_with_the_flag_off_builds_nothing(monkeypatch):
-    """A launch without the flag must not pay for the subsystem it will not use.
+    """A launch with the flag off must not pay for the subsystem it will not use.
 
     The installer runs on the gateway's boot path. With the crew log off it returns
     without importing the emitter and without constructing a publisher, so a
     disabled launch does no optional work and registers no listener.
     """
-    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(routes.CREW_LOG_ENV, "0")
     monkeypatch.setattr(routes, "_publisher", None)
     from kiro_crew.crew_log import emit as crew_log_emit
 
@@ -1233,24 +1277,74 @@ def test_the_caller_name_is_pinned_to_the_mcp_servers_own(monkeypatch):
 
 
 def test_the_enable_hint_names_the_real_flag():
-    assert routes.CREW_LOG_ENV in routes.CREW_LOG_ENABLE_HINT
+    assert routes.CREW_LOG_ENV in routes.crew_log_enable_hint()
 
 
-def test_the_enable_hint_names_the_live_data_home_not_the_legacy_one():
+def test_the_enable_hint_says_to_unset_the_flag_not_to_set_it():
+    """The log is on by default, so the only way to be off is a falsy value."""
+    assert "unset" in routes.crew_log_enable_hint()
+    assert f"{routes.CREW_LOG_ENV}=1" not in routes.crew_log_enable_hint()
+
+
+def test_the_enable_hint_names_the_env_file_the_gateway_reads(monkeypatch, tmp_path):
     """An agent is told to edit this file, so naming the wrong one wastes the turn.
 
-    The live credentials file is ``~/.kiro/crew/.env`` (``config/loader.py``'s own
-    header, and ``config_dir()`` under the default home). ``~/.kirocrew/.env`` is a
-    legacy location that ``sandbox.py`` keeps only to fence a leftover copy;
-    nothing reads configuration from it. A hint naming it sends the reader to an
+    The file read is ``config.loader.env_path()``, which follows ``KIROCREW_HOME``; a
+    hint that hardcodes the default home sends an operator with another home to an
     inert file, and the flag appears not to work.
-
-    Not compared against ``config_dir()``: the suite's isolation fixture overrides
-    the home, so that call answers a ``tmp_path`` here and would pass on either
-    string.
     """
-    assert ".kiro/crew/.env" in routes.CREW_LOG_ENABLE_HINT
-    assert ".kirocrew/" not in routes.CREW_LOG_ENABLE_HINT
+    from kiro_crew.config.loader import env_path
+
+    home = tmp_path / "elsewhere"
+    monkeypatch.setenv("KIROCREW_HOME", str(home))
+    hint = routes.crew_log_enable_hint()
+    assert str(env_path()).startswith(str(home))
+    assert (
+        str(env_path()) in hint or ("~/" + env_path().relative_to(Path.home()).as_posix()) in hint
+    )
+    assert "~/.kiro/crew/.env" not in hint
+
+
+def test_the_session_ledger_refusal_names_the_env_file_the_gateway_reads(monkeypatch, tmp_path):
+    from kiro_crew import session_ledger
+    from kiro_crew.constants import env_file_display
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
+    with pytest.raises(session_ledger.LedgerUnavailable) as caught:
+        session_ledger._require_crew_log("s-any")
+    assert env_file_display() in str(caught.value)
+    assert "~/.kiro/crew/.env" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "work_ledger",
+        "crew_store",
+        "mcp_ledger",
+    ],
+)
+def test_every_crew_log_off_refusal_names_the_env_file_the_gateway_reads(
+    monkeypatch, tmp_path, refusal
+):
+    """The same file, spelled once, in every place that tells an operator to edit it."""
+    import inspect
+
+    from kiro_crew import session_ledger
+    from kiro_crew.apps.builtins.issue_radar.backend import crew_store
+    from kiro_crew.dashboard.handlers import work_ledger
+    from kiro_crew.mcp_tools import ledger as mcp_ledger
+
+    module = {
+        "session_ledger": session_ledger,
+        "work_ledger": work_ledger,
+        "crew_store": crew_store,
+        "mcp_ledger": mcp_ledger,
+    }[refusal]
+    source = inspect.getsource(module)
+    assert "~/.kiro/crew/.env" not in source
+    assert "env_file_display()" in source
 
 
 def test_the_page_reader_is_the_one_shared_implementation():
@@ -1266,13 +1360,22 @@ def test_the_page_reader_is_the_one_shared_implementation():
 
 def test_a_read_with_the_flag_off_says_how_to_switch_it_on(monkeypatch):
     """MUTATION-SENSITIVE: the agent learns the flag state from THIS refusal."""
-    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(routes.CREW_LOG_ENV, "0")
     request = _internal_request("/api/crew-log/sessions")
     response = asyncio.run(routes.api_crew_log_sessions(request))
     assert response.status == 422
     body = json.loads(response.text)
     assert body["code"] == "crew_log_disabled"
     assert routes.CREW_LOG_ENV in body["error"]
+
+
+def test_a_read_with_the_flag_unset_is_not_refused(monkeypatch):
+    """The crew log is on by default, so an install that never set the flag reads."""
+    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    request = _internal_request("/api/crew-log/sessions")
+    response = asyncio.run(routes.api_crew_log_sessions(request))
+    assert response.status != 422
+    assert json.loads(response.text).get("code") != "crew_log_disabled"
 
 
 #: A conductor, its child and its grandchild, plus a session in another tree. The
@@ -3893,3 +3996,20 @@ def test_the_unit_route_refuses_a_slot_keyed_fold(monkeypatch):
     response = asyncio.run(routes.api_crew_log_unit_projection(request))
     assert response.status == 400
     assert json.loads(response.text)["code"] == "slot_projection"
+
+
+def test_the_publisher_is_installed_after_the_listener_binds():
+    """Installing it imports and builds the publisher, so it stays off the boot path.
+
+    ``no-new-work-on-gateway-boot-path``: everything before ``_start_site`` is paid by
+    every launch, and the crew log is on by default. ``start_dashboard`` binds with
+    ``await site.start()`` on its pre-reserved socket.
+    """
+    import inspect
+
+    from kiro_crew.dashboard import server
+
+    source = inspect.getsource(server.start_dashboard)
+    bind = source.index("await site.start()")
+    assert source.count("install_crew_log_publisher(") == 1
+    assert source.index("install_crew_log_publisher(") > bind

@@ -49,6 +49,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import session_ledger, work_ledger
+from kiro_crew.constants import env_file_display
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.crew_log.errors import CrewLogError
 from kiro_crew.crew_log.resolve import UNKNOWN, unit_for_session_key
@@ -1000,7 +1001,8 @@ def _acting_unit(
         return None, _refuse_409(
             "crew_log_off",
             "the crew log is off and the work ledger records only into it; "
-            f"start the gateway with {crew_log_emit.CREW_LOG_ENV}=1",
+            f"{crew_log_emit.CREW_LOG_ENV} is set to 0, false, no, off or an unrecognised value; "
+            f"unset it (or remove it from {env_file_display()}) and restart the gateway",
         )
     unit = unit_for_session_key(getattr(state, "sessions", None), key)
     if not unit or unit == UNKNOWN:
@@ -1475,7 +1477,8 @@ async def api_work_ledger_rebuild(request: web.Request) -> web.Response:
         return _refuse_409(
             "crew_log_off",
             "the crew log is off, so there is no record to rebuild from; "
-            f"start the gateway with {crew_log_emit.CREW_LOG_ENV}=1",
+            f"{crew_log_emit.CREW_LOG_ENV} is set to 0, false, no, off or an unrecognised value; "
+            f"unset it (or remove it from {env_file_display()}) and restart the gateway",
         )
     try:
         async with _board_lock(key):

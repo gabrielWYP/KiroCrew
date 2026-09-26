@@ -562,6 +562,288 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
     return REMOVE_REMOVED
 
 
+#: A file inside a unit directory that keeps the unit out of retention. The session
+#: trash writes it when a restore that failed could not stage a unit it had already put
+#: back: the unit is then live while the rest of its session is still in the trash, and
+#: the sweep must not expire a unit whose session the user can still restore. Only the
+#: trash removes it, when that session is restored or its batch is emptied.
+TRASH_HOLD_FILE = ".trash-hold"
+
+
+def _write_hold(directory: Path) -> None:
+    """Create *directory*'s hold mark and make it durable. Raises ``OSError`` if it is not.
+
+    The mark is created without following a link, then the file and its directory are
+    synced, so a power loss cannot come back to a unit the sweep reads as unheld.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(directory / TRASH_HOLD_FILE, flags, 0o600)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _sync_hold_dir(directory)
+
+
+def _sync_hold_dir(directory: Path) -> None:
+    """Sync the directory entry of a new hold mark."""
+    from kiro_crew.atomic_write import fsync_dir
+
+    fsync_dir(directory)
+
+
+def hold_unit(kind: str, unit_id: str) -> bool:
+    """Keep *unit_id* out of retention until :func:`release_unit_hold`. False when not held.
+
+    The unit is already live, so there is nothing to withhold when the mark cannot be
+    made durable: a mark that exists is still what the sweep reads, and the failed
+    sync is logged. False only when no mark could be created at all.
+    """
+    require_kind(kind)
+    try:
+        named = _checked_crew_log_root(kind) / _store_name(unit_id)
+        if is_link(named):
+            return False
+        directory = crew_log_dir(kind, unit_id)
+        if not directory.is_dir():
+            return False
+    except (CrewLogError, OSError):
+        log_exception_text(
+            logger, logging.ERROR, "crew log trash: could not hold %s log %r", kind, unit_id
+        )
+        return False
+    try:
+        _write_hold(directory)
+    except OSError:
+        if not _is_held(directory):
+            log_exception_text(
+                logger, logging.ERROR, "crew log trash: could not hold %s log %r", kind, unit_id
+            )
+            return False
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not sync the hold on %r", unit_id
+        )
+    return True
+
+
+def hold_staged_unit(staged: Path) -> bool:
+    """Mark a unit still in the trash as held, so it is held the moment it is published.
+
+    A restore publishes a session's units before its transcript, and a sweep running in
+    between would otherwise read a closed, expired unit and delete it while the rest of
+    the session is still coming back. The mark rides the rename into the live tree, and
+    it is durable before this answers True, so the caller publishes only a unit whose
+    hold survives a power loss. False when the staged directory is not a real directory
+    under the trash root, or when the mark could not be made durable.
+    """
+    trash = crew_log_trash_root()
+    try:
+        if is_link(trash) or is_link(staged) or not staged.is_relative_to(trash):
+            return False
+        if not staged.is_dir():
+            return False
+        _write_hold(staged)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not hold staged %s", staged.name
+        )
+        return False
+    return True
+
+
+def release_unit_hold(kind: str, unit_id: str) -> None:
+    """Let *unit_id* age out again; a unit with no hold is left as it is."""
+    require_kind(kind)
+    try:
+        named = _checked_crew_log_root(kind) / _store_name(unit_id)
+        if is_link(named):
+            return
+        (crew_log_dir(kind, unit_id) / TRASH_HOLD_FILE).unlink()
+    except FileNotFoundError:
+        return
+    except (CrewLogError, OSError):
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not release the hold on %r", unit_id
+        )
+
+
+def is_trash_held(directory: Path) -> bool:
+    """Whether the unit in *directory* belongs to a session still in the trash."""
+    return _is_held(directory)
+
+
+def _is_held(directory: Path) -> bool:
+    """Whether *directory* carries a trash hold; an unreadable answer counts as held."""
+    try:
+        (directory / TRASH_HOLD_FILE).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def crew_log_trash_root() -> Path:
+    """Where session trash stages crew logs: ``<data home>/crew-log/trash``.
+
+    Inside the crew-log tree rather than beside the transcripts in the session trash,
+    because that tree is the one the sandbox hides from agents. A staged crew log is
+    later RESTORED into the live tree, so a copy an agent could edit while it waits
+    would be a way to write entries the gateway then reads as its own.
+    """
+    return data_home() / _ROOT_LEAF / "trash"
+
+
+#: Whether a unit directory can be renamed while this process holds its lease. POSIX
+#: renames a directory whatever is open inside it; Windows refuses a directory holding
+#: an open handle, and the held lease IS one. See :func:`stage_unit`.
+_RENAME_UNDER_LEASE = os.name != "nt"
+
+
+def _sync_down(top: Path, leaf: Path) -> None:
+    """Sync *leaf* and every directory above it up to *top*, so a new name survives a crash."""
+    from kiro_crew.atomic_write import fsync_dir
+
+    level = leaf
+    while True:
+        fsync_dir(level)
+        if level == top or top not in level.parents:
+            return
+        level = level.parent
+
+
+def _durable_rename(source: Path, destination: Path) -> bool:
+    """Rename *source* to *destination* and make both names durable. False when it did not.
+
+    The rename alone is not a move a caller may build on: a power loss before the
+    two parent directories are synced can come back to the unit under neither name,
+    or under both. The destination's own chain is synced BEFORE the rename, so the
+    directory it lands in exists on disk first; both parents are synced after it. A
+    sync that fails after the rename puts the unit back and syncs that too, so a False
+    answer means the unit is where it started. If even the rollback cannot be synced,
+    a power loss may still recover the unit under *destination*; that is logged, and it
+    loses nothing -- a crew log left in the trash with no manifest entry is kept there
+    by the session trash, which refuses to delete staging its manifest does not list.
+    """
+    top = data_home() / _ROOT_LEAF
+    _mkdir_private(destination.parent)
+    _sync_down(top, destination.parent)
+    os.rename(source, destination)
+    try:
+        _sync_down(top, destination.parent)
+        _sync_down(top, source.parent)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log: could not sync the move of %s", source.name
+        )
+        try:
+            os.rename(destination, source)
+        except OSError:
+            log_exception_text(
+                logger, logging.ERROR, "crew log: %s is at %s and not synced", source, destination
+            )
+            return True
+        try:
+            _sync_down(top, source.parent)
+            _sync_down(top, destination.parent)
+        except OSError:
+            log_exception_text(
+                logger,
+                logging.ERROR,
+                "crew log: %s was put back at %s but that is not synced; after a power "
+                "loss it may be found at %s instead",
+                source.name,
+                source,
+                destination,
+            )
+        return False
+    return True
+
+
+def stage_unit(kind: str, unit_id: str, destination: Path) -> str:
+    """Move one unit's directory to *destination*, under its lease. A ``REMOVE_*`` status.
+
+    The session trash's counterpart of :func:`remove_unit`: the same sole lease stands
+    between the move and a live writer, so a unit some process is appending to answers
+    ``owned`` and stays where it is. ``removed`` means the unit left the live tree and
+    both names are on disk. *destination* must not exist; it is created under
+    :func:`crew_log_trash_root`.
+
+    On Windows the lease is released before the rename rather than held across it,
+    because Windows refuses to rename a directory that holds an open handle and the
+    lease is one. That refusal is what stands in for the hold: a writer that takes the
+    lease in the gap has its lease file open inside the directory, so the rename fails
+    and the unit stays, exactly as ``owned`` would have left it.
+    """
+    require_kind(kind)
+    named = _checked_crew_log_root(kind) / _store_name(unit_id)
+    if is_link(named):
+        return REMOVE_ABSENT
+    directory = crew_log_dir(kind, unit_id)
+    if not directory.is_dir():
+        return REMOVE_ABSENT
+    trash = crew_log_trash_root()
+    if is_link(trash) or not destination.is_relative_to(trash):
+        raise CrewLogError(
+            f"refusing to stage a crew log outside {trash}: {destination}", code=CODE_BAD_ROOT
+        )
+    try:
+        lease_key = acquire_lease(directory / LEASE_FILE, kind=kind, unit_id=unit_id, sole=True)
+    except CrewLogError as exc:
+        if exc.code == CODE_ALREADY_OWNED:
+            return REMOVE_OWNED
+        raise
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: cannot lease %s log %r", kind, unit_id
+        )
+        return REMOVE_FAILED
+    held = True
+    try:
+        if not _RENAME_UNDER_LEASE:
+            release_lease(lease_key)
+            held = False
+        moved = _durable_rename(directory, destination)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not stage %s log %r", kind, unit_id
+        )
+        return REMOVE_FAILED
+    finally:
+        if held:
+            release_lease(lease_key)
+    # The session-tree projection keeps this unit's record: a staged unit comes back on
+    # restore, and nothing re-derives a record for an unchanged root. A reader that
+    # meets the unit while it is staged gets ``gone``, as it would for a removed one.
+    return REMOVE_REMOVED if moved else REMOVE_FAILED
+
+
+def restore_staged_unit(kind: str, staged: Path) -> "str | None":
+    """Put a unit :func:`stage_unit` moved back into the live tree; its id, or None.
+
+    The unit's own header decides where it goes: its id must fold to the staged
+    directory's name, the same proof :func:`unit_header_slot` requires. An occupied
+    destination is left alone -- a unit recreated since is newer than this copy. The
+    move is synced like the stage (:func:`_durable_rename`).
+    """
+    require_kind(kind)
+    header = None if is_link(staged) else _proved_header(staged)
+    if header is None:
+        return None
+    root = _checked_crew_log_root(kind)
+    target = root / staged.name
+    if is_link(target) or target.exists():
+        return None
+    try:
+        moved = _durable_rename(staged, target)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not restore %s", staged.name
+        )
+        return None
+    return str(header["id"]) if moved else None
+
+
 def _unit_header_object(kind: str, unit_id: str) -> "dict[str, Any] | None":
     """*unit_id*'s header line, parsed FROM DISK, or None when it cannot be proved.
 
@@ -1334,6 +1616,8 @@ def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
       resolves it, and it is accepted only if it folds BACK to this directory's
       own name. A directory no id addresses is not removed, because the removal
       would be aimed by id and would resolve somewhere else.
+    * **A trash hold** (:data:`TRASH_HOLD_FILE`). The unit is live while the rest of
+      its session waits in the trash, so the user can still restore it whole.
     * **A torn tail.** Unterminated trailing bytes are what
       ``open(repair=True)`` truncates, and the sweep cannot tell a dead writer's
       crash artifact from an append that has not yet reached its fsync -- the
@@ -1377,7 +1661,7 @@ def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
         ]
     except OSError:
         return None
-    if not segments:
+    if not segments or _is_held(directory):
         return None
     segments.sort(key=lambda pair: pair[0])
     oldest = segments[0][1]

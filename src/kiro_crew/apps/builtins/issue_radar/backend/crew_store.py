@@ -45,6 +45,7 @@ from kiro_crew import atomic_write as atomic_write_module
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home
+from kiro_crew.constants import env_file_display
 from kiro_crew.crew_log.entry_types import (
     RADAR_CLEARABLE_FIELDS,
     RADAR_CREW_LEVEL_EVENT_KIND,
@@ -1559,7 +1560,9 @@ def _require_crew_log(session_id: str) -> Any:
     if not crew_log_emit.enabled():
         raise CrewLedgerUnavailable(
             "the crew ledger is recorded in the crew's crew log, which is switched off; "
-            f"set {crew_log_emit.CREW_LOG_ENV}=1 to record one"
+            f"{crew_log_emit.CREW_LOG_ENV} is set to 0, false, no, off or an unrecognised value; "
+            f"unset it (or remove it from {env_file_display()}) and restart the gateway "
+            "to record one"
         )
     from kiro_crew.crew_log.schema import KIND_SESSION
     from kiro_crew.crew_log.store import CrewLog

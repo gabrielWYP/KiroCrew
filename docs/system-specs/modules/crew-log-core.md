@@ -155,20 +155,14 @@ writers, projections, migration, and transport are owned by
 [member-event-log.md](member-event-log.md); this core owns only the shared
 envelope, storage, lease, and damage rules it uses.
 
-## 5. The session-log format, pre-release
+## 5. The session-log format and its compatibility rule
 
-**The shapes below are PRE-RELEASE and may change.** `KIROCREW_CREW_LOG` defaults off, so
-the session emitter creates no session-kind unit on a stock install. The shared `crew-log`
-root is still pre-created as a security boundary, and independent member-kind logs may exist;
-neither freezes the default-off session entry shapes. While that holds, a session type may be
-added, removed or reshaped in one commit.
-
-**The freeze point is the release that turns the flag on by default.** From then on there are
-files a reader may hold, so the compatibility strategy has to be decided rather than assumed: a
-type gains fields additively and an unknown type is skipped when its writer marked it
-`ignorable`, OR a shape change carries a migration. That choice belongs to the change that flips
-the default, which is the first one with data to migrate. `version` is the escape hatch it would
-spend.
+`KIROCREW_CREW_LOG` defaults on, so a stock install writes session-kind units and a later
+build may read files an earlier one wrote. The shapes below change under one rule. A type
+gains fields additively, and a reader ignores a key it does not know. A new type that an
+older reader may safely skip is written `ignorable` (see "An unknown type is the reader's
+rule" below). Any other change to an existing type's shape carries a migration and spends
+`version`, the header's escape hatch.
 
 Every type is `domain/<past participle>`, a fact that happened. Every turn-scoped entry carries
 `data.turn`, and `data.step` where a step exists. `thread` stays unset on session entries.
@@ -587,7 +581,7 @@ running right now, and a rule that read the newest close would call it expired a
 conversation's log. Entries that are neither -- a turn, a tool, an in-flight closer the emitter writes
 after a teardown by design -- say nothing about the state and are skipped.
 
-Four things are skipped regardless of age, and each is a refusal rather than an oversight:
+Five things are skipped regardless of age, and each is a refusal rather than an oversight:
 
 - **An OPEN unit** -- one whose newest lifecycle entry is a `session/opened`, or which has no
   lifecycle entry in the window at all. The deciding entry is looked for in a bounded read of the
@@ -599,6 +593,8 @@ Four things are skipped regardless of age, and each is a refusal rather than an 
 - **A torn tail.** Unterminated trailing bytes are what `open(repair=True)` truncates, and the sweep
   cannot tell a dead writer's crash artifact from an append that has not reached its fsync -- the
   bytes are identical. Deleting the unit would destroy the history the repair exists to recover.
+- **A unit the session trash holds** (a `.trash-hold` file in its directory). Its session is
+  still in the trash or being restored, so the user can still get it back whole.
 - **A header whose id does not fold back to its own directory name.** The removal is aimed by id, so
   a directory carrying another unit's id would have the removal land on that other unit.
 - **A close whose reason does not END the ACP id's life.** A unit is collectable on exactly ONE reason:

@@ -109,6 +109,32 @@ def _build_index(state: DashboardState | None = None) -> SessionIndex:
     )
 
 
+def _activation(state: DashboardState) -> "tuple[Any, Any] | None":
+    """The lock a resume maps a session under, and a read of the LIVE map it guards.
+
+    ``SessionMap.set`` runs under ``session_map._MAP_LOCK``, and the live map applies a
+    mapping at once while its file write is deferred, so this read sees a resume the
+    file does not show yet. ``None`` when the gateway has no live map to read.
+    """
+    from kiro_crew.session_map import _MAP_LOCK
+
+    live = getattr(getattr(state, "sessions", None), "_session_map", None)
+    if live is None or not callable(getattr(live, "mapped_sids_by_key", None)):
+        return None
+
+    def live_index() -> SessionIndex:
+        mapping = live.mapped_sids_by_key()
+        return SessionIndex(
+            stem_to_sid={
+                stem: sid for key, sid in mapping.items() for stem in transcript_stems(key)
+            },
+            active_sids=frozenset(mapping.values()),
+            live_sids=frozenset(),
+        )
+
+    return _MAP_LOCK, live_index
+
+
 def _map_token() -> tuple[int, int, int] | None:
     """Identity of the session map file, or ``None`` when it cannot be read.
 
@@ -358,6 +384,7 @@ async def api_session_storage_cleanup(request: web.Request) -> web.Response:
             # request — a shared one would serve a later request an index built
             # before it started.
             refresh=_MapBackedRefresh(),
+            activation=_activation(state),
         )
     except SessionStorageError as exc:
         return _refused(exc, "cleanup_refused")
@@ -1035,6 +1062,7 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             # a shared one would serve a later request an index built before it
             # started.
             refresh=_MapBackedRefresh(),
+            activation=_activation(state),
         )
     except SessionStorageError as exc:
         # Audited before returning. A refusal from inside the move is the same

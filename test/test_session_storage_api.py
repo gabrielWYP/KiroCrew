@@ -1214,9 +1214,9 @@ class TestWhyAReclaimIsRefused:
             calls["cotenant"] += 1
             return real_cotenants()
 
-        def counted_scan(sid_for_stem):
+        def counted_scan(sid_for_stem, **kwargs):
             calls["scan"] += 1
-            return real_scan(sid_for_stem)
+            return real_scan(sid_for_stem, **kwargs)
 
         monkeypatch.setattr(session_storage_module, "_replay_store_cotenants", counted_cotenants)
         monkeypatch.setattr(session_storage_module, "_scan_raw_uncached", counted_scan)
@@ -1597,3 +1597,22 @@ class TestACredentialInASessionIdIsScrubbed:
         rows = {r["uid"]: r for r in json.loads(resp.body)["sessions"]}
         assert secret in rows, "the row must still be listed and actionable"
         assert secret not in rows[secret]["origin"], "the DISPLAYED string is scrubbed"
+
+
+def test_the_activation_reads_the_live_map_under_the_lock_a_resume_maps_under():
+    """A mapping in the live map is seen before its deferred file write lands."""
+    from types import SimpleNamespace
+
+    from kiro_crew.dashboard.handlers import session_storage as handler
+    from kiro_crew.session_map import _MAP_LOCK
+
+    live = SimpleNamespace(mapped_sids_by_key=lambda: {"dashboard:chat-1": "acp-resumed"})
+    state = SimpleNamespace(sessions=SimpleNamespace(_session_map=live))
+
+    lock, live_index = handler._activation(state)
+    index = live_index()
+
+    assert lock is _MAP_LOCK
+    assert "acp-resumed" in index.active_sids
+    assert index.stem_to_sid.get("dashboard_chat-1") == "acp-resumed"
+    assert handler._activation(SimpleNamespace(sessions=None)) is None

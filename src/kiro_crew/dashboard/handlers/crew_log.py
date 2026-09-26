@@ -32,8 +32,8 @@ and ``resolve``, applied to a range read.
 The storage package is imported LAZILY here, on the first call that needs it,
 never at module import. The crew log is an optional subsystem behind
 ``KIROCREW_CREW_LOG``, this module is reachable from the dashboard's boot
-path, and a gateway launched with the flag unset must not pay to load a store it
-will not read -- the same split the emitter keeps, and one a test pins from a
+path, and a gateway launched with the flag set to a falsy value must not pay to
+load a store it will not read -- the same split the emitter keeps, and one a test pins from a
 clean interpreter.
 """
 
@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
 from collections import OrderedDict
 from collections.abc import Callable
 from types import ModuleType
@@ -49,18 +50,11 @@ from typing import TYPE_CHECKING, Any, Final
 
 from aiohttp import web
 
-from kiro_crew.constants import env_flag_enabled
+from kiro_crew.constants import CREW_LOG_ENV, ENV_FALSY, crew_log_enabled, env_file_display
 from kiro_crew.dashboard.handlers._shared import (
     guard_owner_surface_routes,
     require_owner_dashboard_request,
 )
-
-#: The variable that switches the crew log on, spelled here rather than read from
-#: the emitter's ``CREW_LOG_ENV``. This module sits on the gateway's boot path and
-#: importing that module to learn whether it is wanted is the very cost the flag
-#: exists to avoid. A test pins this string against the emitter's own constant, so
-#: the two cannot drift apart unnoticed.
-CREW_LOG_ENV: Final[str] = "KIROCREW_CREW_LOG"
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from kiro_crew.crew_log.errors import CrewLogError
@@ -380,14 +374,40 @@ async def api_session_crew_log_projections(request: web.Request) -> web.Response
     # reads follow: a client polling by slot key compares this against the id it
     # sent, and answering with the resolved ACP id would break that comparison and
     # put an internal identity on the wire.
-    return web.json_response(
-        {
-            "session_id": session_id,
-            "projections": folded,
-            "resolved": resolved,
-            "writes_drained": drained,
-        }
-    )
+    # Whether the gateway is recording at all. An empty fold cannot say, and the two
+    # cases want different words: a session that has not recorded yet, and a gateway
+    # whose flag switched recording off.
+    recording = crew_log_enabled()
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "projections": folded,
+        "resolved": resolved,
+        "writes_drained": drained,
+        "recording": recording,
+    }
+    if not recording:
+        payload["flag_value"] = value = crew_log_flag_value()
+        # Whether the value is one of the switch-off spellings. The panel words an
+        # unrecognised one as such, so a typo is not read as the app misspelling it.
+        payload["flag_recognised"] = value.lower() in ENV_FALSY
+        # The ``.env`` the gateway reads, so the panel names the file to edit.
+        payload["env_file"] = env_file_display()
+    return web.json_response(payload)
+
+
+#: The longest flag value the fold read quotes back; a longer one is cut.
+_FLAG_VALUE_MAX = 40
+
+
+def crew_log_flag_value() -> str:
+    """The ``KIROCREW_CREW_LOG`` value that switched recording off, as the panel quotes it.
+
+    Only this one variable, and only its printable characters up to
+    :data:`_FLAG_VALUE_MAX`: the read is owner-gated, and the operator set the value
+    themselves, so quoting it lets them see a typo instead of a list of spellings.
+    """
+    value = os.environ.get(CREW_LOG_ENV, "").strip()
+    return "".join(char for char in value if char.isprintable())[:_FLAG_VALUE_MAX]
 
 
 #: How long a fold read waits for the writer to owe nothing before folding anyway.
@@ -528,11 +548,18 @@ def _crew_log_refusal(exc: "CrewLogError") -> web.Response:
 #: cannot drift.
 CREW_LOG_MCP_CALLER: Final[str] = "kirocrew-crew-log"
 
-#: How to switch the crew log on, quoted in the refusal a disabled read earns. An
-#: agent that reads ``crew_log_disabled`` should not have to be told separately.
-CREW_LOG_ENABLE_HINT: Final[str] = (
-    f"set {CREW_LOG_ENV}=1 in ~/.kiro/crew/.env and restart the gateway"
-)
+
+def crew_log_enable_hint() -> str:
+    """How to switch the crew log back on, quoted in the refusal a disabled read earns.
+
+    The log is on by default, so a disabled read means the variable holds a falsy or
+    unrecognised value. An agent that reads ``crew_log_disabled`` should not have to be
+    told separately. The ``.env`` named is the one the gateway reads.
+    """
+    return (
+        f"{CREW_LOG_ENV} is set to 0, false, no, off or an unrecognised value; unset it "
+        f"(or remove it from {env_file_display()}) and restart the gateway"
+    )
 
 
 def _forbidden(reason: str) -> web.Response:
@@ -550,7 +577,7 @@ def _disabled() -> web.Response:
     """
     return web.json_response(
         {
-            "error": f"the crew log is switched off; {CREW_LOG_ENABLE_HINT}",
+            "error": f"the crew log is switched off; {crew_log_enable_hint()}",
             "code": "crew_log_disabled",
         },
         status=422,
@@ -1567,7 +1594,7 @@ async def api_crew_log_sessions(request: web.Request) -> web.Response:
     denied = await _authorize_crew_log_read(request, "session_crew_log.list", listing=True)
     if denied is not None:
         return denied
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
     try:
         limit = int(request.query.get("limit") or 50)
@@ -1640,7 +1667,7 @@ async def api_crew_log_resolve(request: web.Request) -> web.Response:
     key = asked
     if not key:
         return _bad_request("key is required", "unresolvable_key")
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
     unit = target
     if not unit:
@@ -1667,7 +1694,7 @@ async def api_crew_log_unit_page(request: web.Request) -> web.Response:
     denied = await _authorize_crew_log_read(request, "session_crew_log.read", unit=unit)
     if denied is not None:
         return denied
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
     try:
         start, end = _span(request)
@@ -1696,7 +1723,7 @@ async def api_crew_log_unit_projection(request: web.Request) -> web.Response:
     denied = await _authorize_crew_log_read(request, "session_crew_log.projection", unit=unit)
     if denied is not None:
         return denied
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
     from kiro_crew.crew_log.errors import CrewLogError
 
@@ -1920,9 +1947,10 @@ _publisher: CrewLogPublisher | None = None
 def install_crew_log_publisher(state: Any) -> CrewLogPublisher | None:
     """Register the crew-log push with the emitter, once per process.
 
-    Returns ``None`` and does nothing when the crew log is switched off. This runs
-    on the gateway's boot path, so a launch without the flag must not pay for a
-    subsystem it will not use: the flag is read from the environment here, before
+    Returns ``None`` and does nothing when the crew log is switched off. The gateway
+    calls this once its listener is serving, so building the publisher never delays
+    the bind, and a launch that switches the flag off does not pay for a subsystem it
+    will not use at all: the flag is read from the environment here, before
     the emitter is imported and before a publisher is built. Importing the emitter
     to ask it whether it is enabled would be the cost itself, which is why the
     variable's name is spelled out below rather than read from that module.
@@ -1935,7 +1963,7 @@ def install_crew_log_publisher(state: Any) -> CrewLogPublisher | None:
     twice.
     """
     global _publisher
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return None
     loop = asyncio.get_running_loop()
     if _publisher is not None:
