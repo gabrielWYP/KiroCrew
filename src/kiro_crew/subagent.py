@@ -60,6 +60,13 @@ from kiro_crew.agent_discovery import (
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_CLAUDE_CODE
+from kiro_crew.agent_sdk.spec_hooks import (
+    invalidate_stale_kas_session,
+    refuse_stale_switch,
+    replace_stale_shared_session,
+    reproject_claimed_session,
+    turn_spec_hooks,
+)
 from kiro_crew.agent_spec_format import is_markdown_spec, iter_agent_spec_files
 from kiro_crew.config import live
 from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
@@ -92,6 +99,7 @@ from kiro_crew.hooks import (
     fire_tool_hooks,
     hook_gate_kwargs,
     identity_grant_covers_child,
+    permission_pre_tool_block,
 )
 from kiro_crew.llm_helpers import (
     FALLBACK_CANDIDATE_ATTEMPTS,
@@ -110,6 +118,7 @@ from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.providers.base import (
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -5514,6 +5523,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     CONTEXT_GROUP_LESSONS,
     CONTEXT_GROUP_MEMORY,
     CONTEXT_GROUP_PROJECT,
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -5590,6 +5600,12 @@ _COMPONENT_GLOBAL_BINDINGS = (
     subprocess_executor,
     time,
     transient_retry_delay,
+    permission_pre_tool_block,
+    turn_spec_hooks,
+    invalidate_stale_kas_session,
+    refuse_stale_switch,
+    replace_stale_shared_session,
+    reproject_claimed_session,
     update_state,
     window_for_provider_client,
     write_result_chunk,

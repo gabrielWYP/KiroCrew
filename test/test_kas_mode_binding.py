@@ -19,9 +19,10 @@ import sys
 import pytest
 
 from kiro_crew.acp import session_handle as sh
+from kiro_crew.acp import skill_projection  # bound before a fixture patches its paths
 from kiro_crew.acp.kas_agents import _KAS_FALLBACK_PROMPT
 from kiro_crew.acp.runtime import AcpRuntime
-from kiro_crew.acp.types import ACP_BACKEND_KAS
+from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
 
 
 @pytest.fixture(autouse=True)
@@ -170,6 +171,55 @@ class TestModeBinding:
         # Activation had to happen, and had to name the injected agent — not a
         # built-in that KAS would have run in its place.
         assert seen["set_mode"] == "kirocrew"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_KAS, ACP_BACKEND_KIRO], ids=["kas", "kiro"])
+    async def test_only_a_kas_session_records_its_projected_batch(
+        self, mode_stub, crew_agent, tmp_path, monkeypatch, backend
+    ):
+        """The projection bookkeeping is KAS-only: a kiro-cli handle keeps the defaults."""
+        from kiro_crew.acp import runtime as runtime_mod
+
+        recorded: list = []
+        real = runtime_mod.projected_auto_approved
+
+        def spy(kas_agents, active_agent):
+            recorded.append(active_agent)
+            return real(kas_agents, active_agent)
+
+        monkeypatch.setattr(runtime_mod, "projected_auto_approved", spy)
+        if backend == ACP_BACKEND_KIRO:
+            # The kiro spawn's skill-view projection is not what this test is about.
+            monkeypatch.setattr(
+                skill_projection,
+                "prepare_native_skill_projection",
+                lambda work_dir, **_kwargs: skill_projection.NativeSkillProjection(
+                    {"vibe": "vibe"}
+                ),
+            )
+        kas = backend == ACP_BACKEND_KAS
+        # kiro-cli takes its agent at spawn: the stub's own current mode stands in.
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "wsp",
+            agent="kirocrew" if kas else "vibe",
+            sandbox_mode="off",
+            acp_backend=backend,
+        )
+        try:
+            await runtime.spawn()
+            handle = await runtime.create_session(
+                cwd=tmp_path / "wsp", agent="kirocrew" if kas else None
+            )
+        finally:
+            await runtime.kill()
+        if kas:
+            assert recorded == ["kirocrew"]
+            assert handle.kas_projected_agent == "kirocrew"
+            assert isinstance(handle.kas_auto_approved, frozenset)
+        else:
+            assert recorded == []
+            assert handle.kas_auto_approved is None
+            assert handle.kas_projected_agent == ""
 
     @pytest.mark.asyncio
     async def test_runtime_default_agent_is_activated_without_explicit_request(

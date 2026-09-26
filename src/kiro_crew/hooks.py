@@ -5318,6 +5318,7 @@ class ScriptHookStore:
         extra_hooks: Sequence[ScriptHook] = (),
         extra_hooks_cwd: str | None = None,
         extra_hooks_tool_names: Sequence[str] | None = None,
+        tool_match_names: Sequence[str] | None = None,
     ) -> list[ScriptHookResult]:
         """Fire all enabled hooks matching the given event. Returns results.
 
@@ -5327,6 +5328,10 @@ class ScriptHookStore:
         :mod:`kiro_crew.agent_sdk.spec_hooks`), not to this store. They run in
         ``extra_hooks_cwd`` -- the session's workspace, where the harness that
         would otherwise run them runs them -- and their payload's ``cwd`` says so.
+        ``tool_match_names``, when given, are every name the call is known by (its
+        title, its canonical tool name, its ``@server/tool`` form); a tool matcher
+        then matches when it matches any of them. ``tool_name`` stays what the
+        payload says.
 
         For PreToolUse/PostToolUse, matcher filters by tool name. When
         ``extra_hooks_tool_names`` is given, an extra hook's tool matcher is
@@ -5402,7 +5407,10 @@ class ScriptHookStore:
                             _tool_matches(hook.matcher, name) for name in extra_hooks_tool_names
                         ):
                             continue
-                    elif not _tool_matches(hook.matcher, tool_name):
+                    elif not any(
+                        _tool_matches(hook.matcher, name)
+                        for name in (tool_match_names or (tool_name,))
+                    ):
                         continue
                 elif context:
                     # Offload to a thread: regex mode spawns a bounded subprocess
@@ -5590,3 +5598,118 @@ async def fire_tool_hooks(
         )
     except Exception:
         logger.debug("PreToolUse hook error", exc_info=True)
+
+
+def pre_tool_match_names(
+    title: str,
+    *,
+    tool_identity: str = "",
+    mcp_server: str = "",
+    harness_tool_id: str = "",
+) -> tuple[tuple[str, ...], tuple[str, ...] | None]:
+    """The names a PreToolUse matcher meets for one call: ``(all, spec)``.
+
+    *all* is every name the call is known by, for a Hooks-page hook: its *title*,
+    its canonical *tool_identity* (written by the harness, never the model), the
+    ``@server/tool`` and ``mcp__server__tool`` forms built from the trusted
+    *mcp_server*, and the names the harness's own *harness_tool_id* stands for
+    (:func:`kiro_crew.agent_sdk.spec_hooks.spec_hook_tool_names`). *spec* is the
+    same without the title, for a spec hook, whose matcher names tools; ``None``
+    when the harness stated no id, so a spec hook keeps matching the title.
+    """
+    # circular import: spec_hooks imports this module at load time.
+    from kiro_crew.agent_sdk.spec_hooks import spec_hook_tool_names
+
+    harness_names = spec_hook_tool_names(harness_tool_id) or ()
+    trusted = [*harness_names, tool_identity]
+    if mcp_server and tool_identity:
+        trusted += [f"@{mcp_server}/{tool_identity}", f"mcp__{mcp_server}__{tool_identity}"]
+    every = tuple(dict.fromkeys(n for n in [title, *trusted] if n))
+    spec = tuple(dict.fromkeys(n for n in trusted if n)) if harness_names else None
+    return every, spec
+
+
+async def permission_pre_tool_block(
+    hook_store: ScriptHookStore | None,
+    spec_hooks: Sequence[ScriptHook],
+    spec_hooks_cwd: str | None,
+    event_title: str,
+    event_tool_input: str | None = None,
+    *,
+    tool_identity: str = "",
+    mcp_server: str = "",
+    harness_tool_id: str = "",
+    subagent_id: str | None = None,
+    parent_session_key: str | None = None,
+    agent_role: str | None = None,
+) -> str | None:
+    """Run the PreToolUse hooks on a subagent or task-runner permission request.
+
+    For a turn whose backend never receives the agent spec's ``hooks`` (see
+    :func:`kiro_crew.agent_sdk.spec_hooks.turn_spec_hooks`): on that backend the
+    projection turns every call a PreToolUse hook covers into a permission
+    request, so this is where the hooks gate. The Hooks page's hooks and the
+    spec's run together, as on the chat turn loop. Such a turn skips the
+    informational tool-call fire: KAS sends a call's tool-call frame BEFORE its
+    permission request, and every call a PreToolUse hook covers reaches this gate,
+    so firing there too would run each hook twice. Returns why the call is
+    blocked, or ``None``.
+
+    A hook matcher is compared with every name the call is known by: its title
+    (what the chat turn loop matches), its canonical *tool_identity*
+    (``LLMEvent.tool_name``, written by the harness, never the model) and, for an
+    MCP call, the ``@server/tool`` and ``mcp__server__tool`` forms built from the
+    trusted *mcp_server* (``LLMEvent.mcp_server_name``). When the harness stated
+    its own id for the call (*harness_tool_id*, KAS's ``_meta.kiro.toolId``), the
+    names that id stands for join them
+    (:func:`kiro_crew.agent_sdk.spec_hooks.spec_hook_tool_names`), so a ``web_fetch``
+    hook meets KAS's "Fetch URL". A spec hook then matches those names and the
+    trusted identity only, never the title, as on the chat turn loop.
+
+    Blocks by the same rule the chat turn loop applies: exit 2 is a delivered
+    deny, and any other nonzero exit or a fire that raises is a gate with no
+    verdict, which blocks. With no store there is nothing to run unless spec
+    hooks were loaded, and a deny hook that cannot run blocks.
+    """
+    if hook_store is None:
+        return "hook store not initialized" if spec_hooks else None
+    tool_name = event_title or ""
+    if tool_name.startswith("Running: "):
+        tool_name = tool_name[9:]
+    match_names, spec_names = pre_tool_match_names(
+        tool_name,
+        tool_identity=tool_identity,
+        mcp_server=mcp_server,
+        harness_tool_id=harness_tool_id,
+    )
+    tool_input = None
+    if event_tool_input:
+        try:
+            tool_input = json.loads(event_tool_input)
+        except Exception:
+            pass
+    try:
+        results = await hook_store.fire(
+            HOOK_EVENT_PRE_TOOL_USE,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            subagent_id=subagent_id,
+            parent_session_key=parent_session_key,
+            agent_role=agent_role,
+            extra_hooks=spec_hooks,
+            extra_hooks_cwd=spec_hooks_cwd,
+            extra_hooks_tool_names=spec_names,
+            tool_match_names=match_names,
+        )
+    except Exception as exc:  # noqa: BLE001 - a gate with no verdict blocks
+        logger.warning("PreToolUse hook fire failed; blocking tool", exc_info=True)
+        return f"PreToolUse hook could not run: {exc}"[:500]
+    for r in results:
+        if r.exit_code == 2:
+            return f"{r.hook_name}: {r.stderr[:200] if r.stderr else 'hook denied'}"
+        if r.exit_code != 0:
+            detail = (
+                r.error[:200] if r.error else (r.stderr[-200:] or f"exited with code {r.exit_code}")
+            )
+            return f"{r.hook_name}: {detail}"
+    return None

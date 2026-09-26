@@ -72,7 +72,11 @@ from kiro_crew.acp.harness import (
 )
 from kiro_crew.acp.harness.kas import PROTOCOL_VERSION_KAS
 from kiro_crew.acp.harness.kiro import KIRO_CLI_SUBCMD, PROTOCOL_VERSION
-from kiro_crew.acp.kas_agents import hoist_managed_servers, load_agent_spec
+from kiro_crew.acp.kas_agents import (
+    hoist_managed_servers,
+    load_agent_spec,
+    projected_auto_approved,
+)
 from kiro_crew.acp.kas_host_auth import HostAuthCallbackError
 from kiro_crew.acp.kas_transport import (
     KAS_AUTH_CALLBACK_ERROR_CODE,
@@ -118,6 +122,7 @@ from kiro_crew.acp.types import (
     overlay_project_scope,
 )
 from kiro_crew.agent import ensure_agent_materialized, markdown_spec_for_agent
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS
 from kiro_crew.agent_sdk.tool_search import (
     ToolSearchSettings,
     kas_client_meta_settings,
@@ -5648,6 +5653,22 @@ class AcpRuntime:
             "its MCP tools would be unreachable -- create a runtime for the agent"
         )
 
+    @staticmethod
+    def _record_kas_projection(
+        handle: AcpSessionHandle, kas_agents: Any, active_agent: str
+    ) -> None:
+        """Record on a KAS session's handle what its registered batch auto-approves.
+
+        KAS keeps the batch it registered for the session's life, so the turn loop
+        compares this with the hooks as they stand now. Called only on the KAS
+        branch of session/new and session/load; a kiro-cli handle keeps the
+        declared defaults.
+        """
+        handle.kas_auto_approved = projected_auto_approved(kas_agents, active_agent)
+        handle.kas_projected_agent = active_agent if kas_agents else ""
+        # A mode switch re-reads the batch for the agent it moves to.
+        handle.kas_registered_agents = list(kas_agents) if kas_agents else []
+
     async def _kas_custom_agents(
         self,
         agent: str,
@@ -6675,6 +6696,11 @@ class AcpRuntime:
         # session's permission requests. Empty for a host with no mirror and for a
         # caller-supplied array, and the handle's check is a no-op on empty.
         handle.spec_denied_tools = denied_tools
+        # Only where Crew runs the spec's hooks (KAS): what the batch auto-approves
+        # is what those hooks are checked against. The kiro path registers no batch,
+        # so its handle keeps the declared defaults and gains no step (H13).
+        if self._acp_backend in ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS:
+            self._record_kas_projection(handle, kas_agents, active_agent)
         if self._mirrored_spec_check_needed(mirrored_snapshot):
             await self._require_unchanged_mirrored_spec(session_id, mirrored_snapshot)
 
@@ -7252,6 +7278,10 @@ class AcpRuntime:
         # Mirrors create_session: the resumed session re-declares the array, so it
         # re-derives the deny set that array came with and re-checks the generation.
         handle.spec_denied_tools = denied_tools
+        # Mirrors create_session: the re-registered batch is what this session now
+        # runs, recorded on KAS only.
+        if self._acp_backend in ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS:
+            self._record_kas_projection(handle, kas_agents, active_agent)
         if self._mirrored_spec_check_needed(mirrored_snapshot):
             await self._require_unchanged_mirrored_spec(resume_sid, mirrored_snapshot)
         handle.store_session_config(resp)
