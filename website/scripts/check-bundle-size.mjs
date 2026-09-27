@@ -131,7 +131,14 @@ export const CHUNK_BUDGETS = {
   // the regenerated `en-XA`, which all land in this chunk by construction: measured
   // 907.7 KB on this branch before the judge row above landed on main, so the two
   // features together sit near 909 KB; same 5% convention over that size.
-  t: 955 * KB, // measured ~909 KB on this branch (~5% headroom)
+  // Re-measured 2026-09-27: main ALONE builds this chunk as
+  // `t-5F-gSVGz.js` at 977,948 B (955.03 KB), 28 B over the 955 KB ceiling, so
+  // the gate fails on the merge ref of every open PR. Attribution is measured,
+  // not assumed: the docked crew-webview branch that tripped it adds no catalog
+  // key and builds the byte-identical chunk (same content hash). The growth is
+  // main's accumulated English catalog, the same drift the notes above record.
+  // Back to the 5% convention over the measured size.
+  t: 1003 * KB, // measured 955.0 KB on main, 2026-09-27 (~5% headroom)
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor
