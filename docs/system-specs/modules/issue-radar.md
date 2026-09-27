@@ -199,6 +199,43 @@ All routes live under `/api/apps/issue-radar/` and are registered by
 `apps/builtins/issue_radar/backend/routes.py:register_routes`. Every handler is
 wrapped in `_require_enabled` (returns 403 when the app is disabled).
 
+**`backend/routes.py` is the route layer's facade, and the handlers live in
+`backend/http_routes/`.** The facade owns what every handler runs first: request
+identity (`_key_from_request`, `_key_from_body`, `_account_key`), the enabled,
+connected-repo and write-permission gates (`_require_enabled`, `_connected`,
+`_repo_can_write`), per-repo store scoping (`_scope`, `_st`), the SEL audit
+(`_audit`) and the provider-neutral error aliases. It also keeps `/connect`, whose
+off-loop URL parse `tests/test_gitlab.py` pins to that file, the probe-gated
+list-poll decision (see Client-Side List Polling) and `register_routes`. Each
+private `http_routes` module owns one responsibility:
+
+| Module | Owns |
+|---|---|
+| `http_routes/repositories.py` | `/repos` (GET, DELETE), `/me`, `/recent-repos`, `/settings`, `/settings/role`, `/labels`, `/members`, and the cache-first label loader `_load_labels_for_ai` |
+| `http_routes/items.py` | `/issues`, `/issue`, `/pulls`, `/pulls/search`, `/pull`, `/ref`, both first-page fast paths, and the open-issue loader `_load_open_issues_for_reco` |
+| `http_routes/deps.py` | `/deps` and its per-app refresh-task and rebuild-lock registries |
+| `http_routes/ai.py` | `/issue-ai`, `/pull-ai`, the one-shot model adapter `_run_oneshot_model`, and the output-language resolution every AI surface shares |
+| `http_routes/recommendations.py` | `/recommendations` (GET, POST) and `/labels/create` |
+| `http_routes/tagging.py` | `/tagging` (GET, POST) and `/labels/apply-bulk` |
+| `http_routes/issue_writes.py` | `/labels/apply`, `/issue/state`, `/issue/assignees` |
+| `http_routes/investigation.py` | `/investigation` (GET, PUT) |
+| `http_routes/pr_actions.py` | every `/pull/*` action, `/pull/runs`, `/pulls/bulk`, and the shared `_pr_action_preamble` / `_run_pr_action` |
+
+The facade re-exports every name those modules define, so `routes.<name>` keeps
+resolving for the tests, for `crew_routes`' gate chain and for other modules' docs.
+**A patch on `backend.routes` of a gate or a seam intercepts the call wherever it
+is made.** An owner module reaches everything the facade owns, and every seam the
+suites patch (the cache-first loaders, the model calls, `_run_pr_action`,
+`_refuse_if_head_moved`, the locked write helpers, `_ui_language`,
+`_TAG_BATCH_MAX`), through a function-local `from .. import routes` and a
+call-time `routes.<name>` read. Any other name an owner calls within its own
+module, such as `_pr_action_preamble` from the PR handlers, is bound there, so
+patching it on the facade reaches only the callers that read it through the
+facade. `test/test_issue_radar_http_routes_surface.py` fails an owner module that
+binds a gate or a seam itself. The import is function-local because the facade
+imports the owners, so a module-scope import back would be a cycle. The same test
+extends the per-repo store-scoping guard over every owner module.
+
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/connect` | Connect a repo (validates URL, verifies `gh` access) |
@@ -429,8 +466,8 @@ deliberate narrowing:
      one GitLab value in the set. Note the read side still reports `can_be_merged` as
      `mergeable: true` — "no conflicts" is a true, useful signal for the pane's warning;
      the merge *gate* keys off the raw status instead, which is why
-     `gitlab_client._MERGEABLE_STATUSES` and `routes._MERGE_ALLOWED_STATES` deliberately
-     differ.
+     `gitlab_client._MERGEABLE_STATUSES` and `http_routes/pr_actions.py`'s
+     `_MERGE_ALLOWED_STATES` deliberately differ.
 
    A gate that cannot tell must refuse — and such a PR is still one click from
    `auto_merge`, which lets the provider decide once the checks finish. A provider 405 is
@@ -650,7 +687,7 @@ Three further properties are load-bearing:
 
 - **Normalized into REST's vocabulary at the parse boundary.** GraphQL SHOUTS its enums
   (`CLEAN`, `MERGEABLE`, `OPEN`) where REST is lowercase, so `_parse_summary_rows`
-  lowers them; `routes._MERGE_ALLOWED_STATES` and the frontend's `MERGE_READY_STATES`
+  lowers them; `pr_actions._MERGE_ALLOWED_STATES` and the frontend's `MERGE_READY_STATES`
   both compare lowercase, and an un-lowered `CLEAN` would match neither and read as
   "not ready" — silently keeping the broken arm on offer.
 - **`UNKNOWN` stays unknown, and it is the COMMON case.** GitHub computes mergeability

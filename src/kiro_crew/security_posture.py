@@ -2183,7 +2183,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # electron-builder's stderr (a registry URL can carry a token) before
         # the bounded tail is printed. Same classification as cli_commands.py.
         "cli_setup.py",
-        "apps/builtins/issue_radar/backend/routes.py",
+        # Issue Radar's route layer: its AI routes redact the model's own output
+        # (summaries, label reasons, recommendation text) before caching or
+        # returning it. These three modules hold those calls.
+        "apps/builtins/issue_radar/backend/http_routes/ai.py",
+        "apps/builtins/issue_radar/backend/http_routes/recommendations.py",
+        "apps/builtins/issue_radar/backend/http_routes/tagging.py",
         "apps/builtins/meetings/backend/domain/session.py",
         # Live translation redacts the MODEL's answer before writing it to the
         # meeting's translations.json. The source line was already redacted at

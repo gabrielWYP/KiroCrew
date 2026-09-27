@@ -19,8 +19,29 @@
       "dynamic_status": 1,
       "missing_code": 17
     },
+    "apps/builtins/issue_radar/backend/http_routes/ai.py": {
+      "missing_code": 8
+    },
+    "apps/builtins/issue_radar/backend/http_routes/investigation.py": {
+      "missing_code": 9
+    },
+    "apps/builtins/issue_radar/backend/http_routes/issue_writes.py": {
+      "missing_code": 22
+    },
+    "apps/builtins/issue_radar/backend/http_routes/items.py": {
+      "missing_code": 21
+    },
+    "apps/builtins/issue_radar/backend/http_routes/recommendations.py": {
+      "missing_code": 16
+    },
+    "apps/builtins/issue_radar/backend/http_routes/repositories.py": {
+      "missing_code": 27
+    },
+    "apps/builtins/issue_radar/backend/http_routes/tagging.py": {
+      "missing_code": 24
+    },
     "apps/builtins/issue_radar/backend/routes.py": {
-      "missing_code": 136
+      "missing_code": 9
     },
     "apps/route_registry.py": {
       "missing_code": 3
