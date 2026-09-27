@@ -2826,14 +2826,18 @@ class TestRefusalWithoutPinnedTraversal:
         # The fallback was deleted rather than left unreachable: an unreachable
         # walk is one refactor away from being reachable again. Checked on the AST
         # rather than the text, because the module legitimately MENTIONS os.walk
-        # in prose explaining why the pinned descent replaces it.
+        # in prose explaining why the pinned descent replaces it. Every module of the
+        # engine is read, not only the facade: the descent lives in ``backup_parts``.
         import ast
 
         assert not hasattr(backup, "_add_tree_by_name")
-        tree = ast.parse(Path(backup.__file__).read_text(encoding="utf-8"))
+        facade = Path(backup.__file__)
+        sources = [facade, *sorted((facade.parent / "backup_parts").glob("*.py"))]
+        assert len(sources) > 2
         calls = [
-            node
-            for node in ast.walk(tree)
+            f"{source.name}:{node.lineno}"
+            for source in sources
+            for node in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "walk"
@@ -2844,6 +2848,56 @@ class TestRefusalWithoutPinnedTraversal:
 # ---------------------------------------------------------------------------
 # list_remote_backups
 # ---------------------------------------------------------------------------
+
+
+class TestInstallFoldersReasonAboutAbsence:
+    """``_install_folders`` answers "is another install writing here" by what it finds.
+
+    So it must read the COMPLETE, unredacted set of install prefixes and refuse an
+    answer it could not read, rather than report "nothing found". Patched at
+    ``backup._checked`` -- the one AWS call it makes -- so no listing reaches AWS.
+    """
+
+    MINE = "0123456789abcdef0123456789abcdef"
+    OTHER = "fedcba9876543210fedcba9876543210"
+
+    def _folders(self, monkeypatch, out):
+        calls = []
+
+        def fake_checked(argv, profile, *, action, timeout):
+            calls.append((argv, profile, action, timeout))
+            return out
+
+        monkeypatch.setattr(backup, "_checked", fake_checked)
+        found = backup._install_folders(
+            "p", "us-east-1", "b", backup.KIND_SNAPSHOT, account=ACCOUNT
+        )
+        return found, calls
+
+    def test_only_install_ids_directly_under_the_kind_prefix_count(self, monkeypatch):
+        rows = [
+            f"backup/snapshots/{self.MINE}/",
+            f"backup/snapshots/{self.OTHER}/",
+            "backup/snapshots/not-an-install/",
+            f"backup/sessions/{self.OTHER.replace('f', 'e')}/",
+            17,
+        ]
+        found, calls = self._folders(monkeypatch, json.dumps(rows))
+        assert found == {self.MINE, self.OTHER}
+        [(argv, profile, action, timeout)] = calls
+        assert (profile, action, timeout) == ("p", "s3:ListBucket", 60)
+        # The projection with no --max-items is what lets the CLI merge every page.
+        assert "--max-items" not in argv
+        assert argv[argv.index("--prefix") + 1] == "backup/snapshots/"
+        assert argv[argv.index("--expected-bucket-owner") + 1] == ACCOUNT
+
+    def test_an_empty_answer_is_an_empty_set(self, monkeypatch):
+        assert self._folders(monkeypatch, "")[0] == set()
+        assert self._folders(monkeypatch, "null")[0] == set()
+
+    def test_an_unreadable_answer_is_refused_rather_than_read_as_unshared(self, monkeypatch):
+        with pytest.raises(backup.AWSError, match="refusing to report the prefix as unshared"):
+            self._folders(monkeypatch, "{not json")
 
 
 class TestListRemoteBackups:
