@@ -403,6 +403,22 @@ jobs:
 
           pr_json="$(gh_retry gh pr view "$PR" --repo "$REPO" \
             --json number,state,isDraft,isCrossRepository,baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner,url)"
+
+          # The PR's OWN author, for the conditions that exempt a bot's pull
+          # request. `github.actor` cannot serve them here: the terminal verdict
+          # is delivered by the sweep's `workflow_dispatch`, whose actor is
+          # `github-actions[bot]` however the PR was opened, so an actor test
+          # exempts nothing on exactly the run that decides.
+          #
+          # Read over REST rather than taking `gh pr view --json author`: every
+          # dependabot condition in this repository compares against
+          # `dependabot[bot]`, which is REST's `.user.login`. `gh pr view` goes
+          # through GraphQL, where a Bot actor's login is the bare name
+          # (`dependabot`) -- add-contributor.yml's `__typename == "Bot"` note is
+          # the same distinction -- so normalising one spelling into the other
+          # would be an inference. One extra read is cheaper than a comparison
+          # that silently stops matching.
+          PR_AUTHOR="$(gh_retry gh api "repos/$REPO/pulls/$PR" --jq '.user.login')"
           SHA="$(jq -r '.headRefOid' <<<"$pr_json")"
           STATE="$(jq -r '.state' <<<"$pr_json")"
           # The default branch is where CI / Build / CodeQL are gated to run
@@ -425,6 +441,7 @@ jobs:
             echo "draft=$(jq -r '.isDraft' <<<"$pr_json")"
             echo "url=$(jq -r '.url' <<<"$pr_json")"
             echo "base=$(jq -r '.baseRefName' <<<"$pr_json")"
+            echo "author=$PR_AUTHOR"
             echo "default_branch=$DEFAULT_BRANCH"
             # (head repository, head branch) is how a monitored workflow run is
             # bound back to this PR below. Both fields are populated on a fork
@@ -726,7 +743,8 @@ jobs:
         if: >-
           steps.context.outputs.stale != 'true'
           && steps.context.outputs.state == 'OPEN'
-          && github.actor != 'dependabot[bot]'
+          && steps.hold.outputs.held != 'true'
+          && steps.context.outputs.author != 'dependabot[bot]'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}

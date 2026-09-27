@@ -28,6 +28,11 @@ BLOCK_MERGE_RE = re.compile(r"\[BLOCK-MERGE\]\s+([0-9a-f]{7,40})\b")
 # "never a grep of the review body", because "a review merely QUOTING the refusal
 # marker must not reclassify a completed verdict".
 _DOWNGRADE_HEADING_RE = re.compile(r"^##[^\n]*\(all downgraded on adjudication\)", re.MULTILINE)
+# Any `##` line, so the clearance heading can be required to BE the body's first
+# heading. On a blocking body -- which GPT emits unwrapped, model prose and all
+# (`codex-review.yml:1378-1379`) -- the workflow's own `## ... (blocking)` heading
+# is first, so a heading the model wrote can never be.
+_ANY_HEADING_RE = re.compile(r"^##", re.MULTILINE)
 _PREFIX_SHA_RE = re.compile(r"\b([0-9a-f]{7,40})\b")
 # The ONLY lane whose workflow renders that heading, so the only lane for which
 # reading it means anything. This is a positive restriction and not tidiness: the
@@ -492,6 +497,21 @@ def _sanctioned_downgrade(body, lane, head_sha):
     included, and the workflow prints the head sha into it too, so a single
     injected ``##`` heading would be the whole distance to a forged clearance. No
     lane but GPT's workflow renders the phrase, so no other lane loses anything.
+
+    The region argument also holds only on GPT's CLEAR path, which is the one a
+    genuine downgrade takes: it wraps the model's output in ``<details>``
+    (``codex-review.yml:1382-1390``). A BLOCKING body takes the sibling branch and
+    is emitted UNWRAPPED (``codex-review.yml:1378-1379``), so there ``prefix`` is
+    the whole body, model prose included, and the workflow's own sentence has
+    already put the head sha in it. What stays true on every body is positional:
+    the workflow writes its heading FIRST, so the phrase appearing below a heading
+    is text that arrived after one -- model prose. Requiring the match to BE the
+    body's first ``##`` is therefore what makes the region argument hold on the
+    blocking path too.
+
+    Deliberately not also keyed on a live ``[BLOCK-MERGE] <head>``: it would reject
+    strictly fewer bodies than the positional rule already does, because a sample
+    that is blocking by DECLARATION carries no such marker at all.
     """
     if (lane or "").upper() not in DOWNGRADE_LANES:
         # No other lane's workflow writes this heading, so for them the phrase can
@@ -502,7 +522,11 @@ def _sanctioned_downgrade(body, lane, head_sha):
         # injected `##` heading as the entire distance to a forged clearance.
         return False
     prefix = (body or "").split("<details>", 1)[0]
-    if not _DOWNGRADE_HEADING_RE.search(prefix):
+    heading = _DOWNGRADE_HEADING_RE.search(prefix)
+    if heading is None:
+        return False
+    first = _ANY_HEADING_RE.search(prefix)
+    if first is None or first.start() != heading.start():
         return False
     return any(sha_matches(sha, head_sha) for sha in _PREFIX_SHA_RE.findall(prefix))
 
@@ -671,25 +695,55 @@ def superseded_verdicts(
         # the marker sits in the embedded model output, so a review quoting it
         # would forge its own clearance. See _sanctioned_downgrade.
         #
-        # And a block OLDER than the newest sanctioned downgrade was cleared by
-        # that decision, so it must not count either. `samples` is newest-first,
-        # so the first downgraded sample is the cut: anything at or past it has
-        # already been adjudicated away. Reading `current["downgraded"]` alone
-        # covers only the case where the downgrade is still the presented body --
-        # but the lane can re-run at the SAME head after adjudication and write an
-        # ordinary clean verdict over it, which a body edit alone produces, since
-        # codex-review.yml carries `edited`. The adjudicated block would then be
-        # resurrected from history into a red required status that no recompute
-        # can clear, because the stored history keeps that body forever: the exact
-        # permanent-stuck shape the downgrade reading exists to prevent.
-        cut = next((i for i, s in enumerate(samples) if s["downgraded"]), len(samples))
-        unadjudicated_block = any(s["blocking"] for s in samples[:cut])
-        if (
-            entry["current_stamped"]
-            and unadjudicated_block
-            and not current["blocking"]
-            and not current["downgraded"]
-        ):
+        # And a block the newest sanctioned downgrade CLEARED must not count
+        # either. But a downgrade clears the findings of the sample it adjudicated
+        # -- the blocked body it was published over -- and not every block older
+        # than itself. Excluding the whole tail would let an adjudication of one
+        # block silently absolve an unrelated earlier one: block A, a clean sample,
+        # block B, an adjudication clearing B, then a later clean leaves A
+        # unadjudicated and unreported, and readiness permits the merge.
+        #
+        # So each downgrade is paired with the nearest blocked sample BEFORE it.
+        # `samples` is newest-first, so walking it in order and letting every
+        # downgrade consume the next blocking sample it meets pairs each decision
+        # with the body it was rendered over. A blocking sample left unpaired is a
+        # block no adjudication spoke to.
+        #
+        # Reading `current["downgraded"]` alone covers only the case where the
+        # downgrade is still the presented body -- but the lane can re-run at the
+        # SAME head after adjudication and write an ordinary clean verdict over it,
+        # which a body edit alone produces, since codex-review.yml carries
+        # `edited`. The adjudicated block would then be resurrected from history
+        # into a red required status that no recompute can clear, because the
+        # stored history keeps that body forever: the exact permanent-stuck shape
+        # the downgrade reading exists to prevent. The pairing keeps that fix and
+        # drops only its over-reach.
+        #
+        # ONE rule, over the whole sequence: every downgrade -- the presented body's
+        # as much as a superseded sample's -- pairs with exactly one blocking
+        # sample, the one it was rendered over, and a blocking sample left unpaired
+        # is a block no decision spoke to. The presented body is the newest element
+        # of that sequence, so its downgrade seeds the count rather than vetoing the
+        # report. Vetoing on `current["downgraded"]` was the same over-reach this
+        # loop removes from the history side: two same-head blocks with one
+        # adjudication presented leaves the earlier one undecided, and a blanket
+        # veto hid it with no recompute able to recover it.
+        unpaired_downgrades = 1 if current["downgraded"] else 0
+        unadjudicated_block = False
+        for sample in samples:
+            if sample["downgraded"]:
+                unpaired_downgrades += 1
+            elif sample["blocking"]:
+                if unpaired_downgrades:
+                    unpaired_downgrades -= 1
+                else:
+                    unadjudicated_block = True
+                    break
+        # `current["blocking"]` stays a veto, and is not a pairing term: a presented
+        # body that still blocks is not a DROPPED block at all -- the block is being
+        # reported by the lane itself, which is the state this gate exists to
+        # distinguish from a block that quietly stopped being reported.
+        if entry["current_stamped"] and unadjudicated_block and not current["blocking"]:
             dropped.add(name)
     result["lanes"] = sorted(lanes, key=lambda e: e["lane"])
     result["lanes_seen"] = len(lanes)
