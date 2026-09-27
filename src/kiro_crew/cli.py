@@ -54,7 +54,7 @@ from kiro_crew.config.paths import _default_home, _legacy_home
 from kiro_crew.constants import BANNER, MIN_NODE_MAJOR, env_flag_enabled
 from kiro_crew.crash_guard import install as _install_crash_guard
 from kiro_crew.env import git_build_info
-from kiro_crew.gateway_lock import GatewayLock, GatewayLockError
+from kiro_crew.gateway_lock import LIVE_HOLDER_EXIT_CODE, GatewayLock, GatewayLockError
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.knowledge import store as knowledge_store
 from kiro_crew.knowledge.dedup import dedup_sweep
@@ -3242,7 +3242,12 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
             _gw_lock = GatewayLock(config_dir(), port=_diagnostic_port(gw_kwargs)).acquire()
         except GatewayLockError as exc:
             print(f"👻 {exc}", file=sys.stderr)
-            sys.exit(1)
+            # A live holder is a sibling gateway already serving this home, so
+            # retrying can only meet the same refusal: exit the code the systemd
+            # unit's RestartPreventExitStatus= names (service/linux.py) and let
+            # the supervisor stand down. Every other refusal is one a later
+            # attempt may find cleared, so it keeps the restartable exit 1.
+            sys.exit(LIVE_HOLDER_EXIT_CODE if exc.live_holder else 1)
         try:
             asyncio.run(_gateway(**gw_kwargs))
         finally:

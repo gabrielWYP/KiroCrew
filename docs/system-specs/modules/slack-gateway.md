@@ -194,6 +194,7 @@ a restart-on-failure supervisor never relaunches an exit 0:
 | 0 | operator (SIGTERM, `systemctl stop`, Ctrl+C) | stay down as asked |
 | 75 (`EX_TEMPFAIL`) | stale-asset watchdog | the served assets vanished |
 | 69 (`EX_UNAVAILABLE`) | listener guard (`dashboard/listener_guard.py`) | the TCP listener could not be restored, so the process was alive but unreachable |
+| 78 (`EX_CONFIG`) | gateway lock refusal (`gateway_lock.LIVE_HOLDER_EXIT_CODE`), before the gateway runs — not a shutdown | the process `/proc/locks` positively identifies as holding `gateway.lock` is running, holds the dashboard port and answers HTTP on it: a sibling gateway already serves this home. The systemd unit's `RestartPreventExitStatus=` names this one status so it is NOT relaunched (see [cli](cli.md), *Service Management*); every other lock refusal — a holder no surface can identify, however the recorded pid looks, and a holder listening on the port without answering HTTP (a wedged gateway) among them — exits 1 and is relaunched |
 
 The listener-guard path is Windows-only in practice: CPython's proactor loop
 closes the LISTEN socket after one failed `accept()` and never re-arms it. The

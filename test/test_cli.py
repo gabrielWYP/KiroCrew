@@ -6152,6 +6152,122 @@ class TestSeedDispatch:
         mock_run.assert_called_once_with(gateway_call)
 
 
+class TestGatewayLockRefusalExit:
+    """How ``kirocrew gateway`` exits when the home's lock refuses it.
+
+    A supervisor reads nothing but the exit status, so the status has to say
+    whether relaunching can help. A live holder is a sibling gateway that keeps
+    serving the home for as long as it runs, so a relaunch meets the identical
+    refusal every time; every other refusal is one a later attempt may find
+    cleared. The systemd unit exempts exactly the first status from
+    ``Restart=always`` (see ``test_service.py``), so the mapping here and the
+    rendered unit must agree on one constant.
+    """
+
+    def _refused_exit_code(self, monkeypatch, error):
+        monkeypatch.setattr(sys, "argv", ["kirocrew", "gateway"])
+        lock_cls = MagicMock()
+        lock_cls.return_value.acquire.side_effect = error
+        with (
+            patch("kiro_crew.cli.GatewayLock", lock_cls),
+            patch("kiro_crew.cli_server._gateway") as mock_gateway,
+            patch("kiro_crew.cli.asyncio.run") as mock_run,
+            # The gateway path arms faulthandler on the real stderr descriptor,
+            # which a capsys-replaced stream does not have.
+            patch("kiro_crew.cli.faulthandler.enable"),
+        ):
+            from kiro_crew.cli import main
+
+            with pytest.raises(SystemExit) as excinfo:
+                main()
+        # A refused lock must never reach the gateway body.
+        mock_gateway.assert_not_called()
+        mock_run.assert_not_called()
+        return excinfo.value.code
+
+    def test_a_live_holder_refusal_exits_the_terminal_code(self, monkeypatch, tmp_path, capsys):
+        from kiro_crew.gateway_lock import LIVE_HOLDER_EXIT_CODE, GatewayLockError
+
+        error = GatewayLockError(
+            tmp_path,
+            4242,
+            f"{tmp_path} is held by pid 4242 (holds port 5476, answering HTTP) -- another "
+            f"gateway already owns {tmp_path}",
+            live_holder=True,
+        )
+        assert self._refused_exit_code(monkeypatch, error) == LIVE_HOLDER_EXIT_CODE
+        # The whole point: not the restartable status a supervisor retries.
+        assert LIVE_HOLDER_EXIT_CODE not in (0, 1)
+        assert "another gateway already owns" in capsys.readouterr().err
+
+    def test_every_other_lock_refusal_keeps_the_restartable_exit(self, monkeypatch, tmp_path):
+        from kiro_crew.gateway_lock import GatewayLockError
+
+        error = GatewayLockError(
+            tmp_path,
+            None,
+            f"{tmp_path} is being replaced faster than it can be locked",
+        )
+        assert error.live_holder is False
+        assert self._refused_exit_code(monkeypatch, error) == 1
+
+    def test_an_unidentified_owner_on_the_port_keeps_the_restartable_exit(
+        self, monkeypatch, tmp_path
+    ):
+        """The recorded pid is alive and on the port, but no surface names the acquirer.
+
+        Built from the REAL diagnosis rather than a hand-made error: without
+        ``/proc/locks`` (or on a filesystem it never matches) the lock file's pid
+        is the only fact, and a reused pid number that happens to listen on the
+        port must not stand the unit down. The refusal keeps exit 1 so systemd
+        retries; only a positively identified acquirer earns the terminal code.
+        """
+        from kiro_crew import gateway_lock, platform_compat
+
+        (tmp_path / gateway_lock.LOCK_FILENAME).write_text("4242\n", encoding="utf-8")
+        monkeypatch.setattr(platform_compat, "try_acquire_lock", lambda *a, **k: False)
+        monkeypatch.setattr(platform_compat, "flock_owner_pid", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "pids_holding_file", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: pid == 4242)
+        monkeypatch.setattr(platform_compat, "find_listening_pids", lambda _p: [4242])
+        with pytest.raises(gateway_lock.GatewayLockError) as excinfo:
+            gateway_lock.GatewayLock(tmp_path, port=5477).acquire()
+        error = excinfo.value
+        assert error.holder_pid == 4242 and "holds port 5477" in str(error)
+        assert error.live_holder is False
+        assert self._refused_exit_code(monkeypatch, error) == 1
+
+    @pytest.mark.parametrize("answers_http", [True, False])
+    def test_an_identified_owner_on_the_port_is_terminal_only_when_it_answers_http(
+        self, monkeypatch, tmp_path, answers_http
+    ):
+        """Built from the REAL diagnosis: ``/proc/locks`` names a live acquirer on the port.
+
+        Answering HTTP is what makes it a gateway serving this home, and only
+        then does the process exit the terminal code. A holder that listens
+        without answering is a wedged gateway: a hung process keeps its socket
+        bound, and a terminal exit here would park the unit `failed` with nothing
+        left to relaunch once that process dies -- so the exit stays 1.
+        """
+        from kiro_crew import gateway_lock, platform_compat
+
+        (tmp_path / gateway_lock.LOCK_FILENAME).write_text("16968\n", encoding="utf-8")
+        monkeypatch.setattr(platform_compat, "try_acquire_lock", lambda *a, **k: False)
+        monkeypatch.setattr(platform_compat, "flock_owner_pid", lambda _p: 16968)
+        monkeypatch.setattr(platform_compat, "pid_exists", lambda _p: True)
+        monkeypatch.setattr(platform_compat, "pids_holding_file", lambda _p: [16968])
+        monkeypatch.setattr(platform_compat, "process_thread_count", lambda _p: 118)
+        monkeypatch.setattr(platform_compat, "find_listening_pids", lambda _p: [16968])
+        monkeypatch.setattr(gateway_lock, "_port_answers_http", lambda *_a, **_k: answers_http)
+        with pytest.raises(gateway_lock.GatewayLockError) as excinfo:
+            gateway_lock.GatewayLock(tmp_path, port=5477).acquire()
+        error = excinfo.value
+        assert error.holder_pid == 16968
+        assert error.live_holder is answers_http
+        expected = gateway_lock.LIVE_HOLDER_EXIT_CODE if answers_http else 1
+        assert self._refused_exit_code(monkeypatch, error) == expected
+
+
 class TestDoctorEmbeddings:
     """Tests for the doctor Vector Memory (in-process embeddings) section."""
 

@@ -1465,6 +1465,54 @@ on crash, and starts on boot. Implemented in `src/kiro_crew/service/`.
   - Boot survival via `WantedBy=multi-user.target` (no linger needed —
     that's a user-service concept; this is system-level).
   - Crash-loop safety: `StartLimitBurst=3 StartLimitIntervalSec=300`.
+  - **A home another gateway already serves is not retried.** `kirocrew
+    gateway` takes `<home>/gateway.lock` before it binds anything. When the
+    refusal shows a running process, positively identified as the lock's
+    acquirer by `/proc/locks`, holding BOTH that lock and the dashboard port
+    this gateway was about to bind AND answering HTTP on it — a sibling gateway
+    serving the home, which this one can displace on neither front while it
+    lives (`GatewayLockError.live_holder`) — the process exits
+    `gateway_lock.LIVE_HOLDER_EXIT_CODE` (78, `EX_CONFIG`: two supervisors
+    pointed at one home is a host configuration, and the remedy is to change
+    it), and the unit's `RestartPreventExitStatus=` names that code, so a
+    `Restart=always` unit goes `failed` once with the refusal line in the
+    journal instead of relaunching every `RestartSec` against a refusal the
+    sibling keeps permanent (bounded by StartLimit* on the shipped unit,
+    unbounded on a unit without them). 78 fires only when the holder is
+    positively identified, alive, on the port and answering HTTP; otherwise
+    the process exits 1, which the unit's `Restart=always` relaunches. Every
+    other lock refusal exits 1 and is relaunched, because a later attempt can
+    find it cleared or because the evidence for standing down is missing: a
+    lock file replaced faster than it can be locked, a home that cannot be
+    opened or measured for directory locks, an flock whose acquirer is gone (a
+    wedged inheritor holds it until that process dies), a live acquirer that
+    does not hold the port (a sibling still starting, or one shutting down that
+    has closed its listener and releases the lock next), a live acquirer that
+    holds the port but does not answer HTTP (a wedged gateway: a hung process
+    keeps its listening socket bound, so port ownership alone cannot tell
+    serving from stuck, and a terminal exit would leave the unit `failed` with
+    nothing left to relaunch once that process dies — the message names the
+    silence and the relaunch is what takes the home over), and a holder no
+    surface could identify — no `/proc/locks` (macOS, Windows), or a Linux
+    filesystem whose device numbers never match the lock table (btrfs
+    subvolumes, overlayfs) — where the pid the lock file records may be alive
+    and on the port and still be a reused number rather than the process that
+    holds the lock; that refusal's message says the holder cannot be confirmed
+    and that a supervisor, if one manages the gateway, will retry it (the same
+    message on every platform, since macOS and Windows reach this branch on
+    every refusal). The HTTP probe that words the message (`holds port N,
+    answering HTTP` / `not answering HTTP`) is the one measurement the verdict
+    reads: one probe per diagnosis, its own 1.5 s budget, so the message and
+    the exit status cannot disagree. With no port to weigh (`--port auto`,
+    `--slack-only`) the verdict cannot be reached and every refusal stays
+    restartable. The constant is defined once, beside the
+    refusal in `gateway_lock.py`, and both `cli.py` (the exit) and
+    `render_unit()` (the exemption) import it; `test_service.py` pins the
+    rendered directive to the constant and the constant to 78, because the
+    value is baked into installed units, which `service install` writes once
+    and no upgrade re-renders — a unit written by an earlier build keeps
+    relaunching on this refusal until it is re-rendered. An existing install
+    picks the directive up by re-running `kirocrew service install`.
   - **Two scopes, both visible.** `install` writes the system unit only, but
     the SELinux refusal hands the operator a per-user unit
     (`render_unit(user_scope=True)`, managed with `systemctl --user`), so
