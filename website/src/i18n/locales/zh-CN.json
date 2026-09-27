@@ -984,6 +984,14 @@
           "run_live_notice": "这次审查还在运行。完成前发现可能仍会变化，因此现在还没有可提问的内容。",
           "loading": "加载中…"
         },
+        "reviewQueue": {
+          "empty": "没有等待你审查的拉取请求。",
+          "filter_by_repo": "按仓库或标题筛选",
+          "setup_required": "设置 GitHub CLI 以查看审查请求",
+          "starts_review": "每个选中的 PR 都会运行一次 Sage 审查。结果显示在 评审 中，除非你选择发布，否则不会发布到 GitHub。",
+          "starts_review_truncated": "仅显示最新的 100 个请求。每个选中的 PR 都会运行一次 Sage 审查。结果显示在 评审 中，除非你选择发布，否则不会发布到 GitHub。",
+          "tab": "审查请求"
+        },
         "runCard": {
           "cancel": "取消",
           "clean": "干净",

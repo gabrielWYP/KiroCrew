@@ -1028,6 +1028,14 @@
           "run_live_notice": "Cette relecture est encore en cours. Ses constats peuvent changer jusqu'à la fin, il n'y a donc rien à demander pour l'instant.",
           "loading": "Chargement…"
         },
+        "reviewQueue": {
+          "empty": "Aucune pull request n’attend ta relecture.",
+          "filter_by_repo": "Filtrer par dépôt ou titre",
+          "setup_required": "Configure la CLI GitHub pour voir les demandes de relecture",
+          "starts_review": "Chaque sélection lance une relecture Sage. Les résultats apparaissent dans Revues et ne sont publiés sur GitHub que si tu le décides.",
+          "starts_review_truncated": "Seules les 100 demandes les plus récentes sont affichées. Chaque sélection lance une relecture Sage. Les résultats apparaissent dans Revues et ne sont publiés sur GitHub que si tu le décides.",
+          "tab": "Demandes"
+        },
         "runCard": {
           "cancel": "Annuler",
           "clean": "Propre",

@@ -1006,6 +1006,14 @@
           "run_live_notice": "Diese Review läuft noch. Ihre Befunde können sich bis zum Ende ändern, daher gibt es noch nichts zu fragen.",
           "loading": "Wird geladen…"
         },
+        "reviewQueue": {
+          "empty": "Keine Pull Requests warten auf dein Review.",
+          "filter_by_repo": "Nach Repo oder Titel filtern",
+          "setup_required": "Richte die GitHub CLI ein, um Review-Anfragen zu sehen",
+          "starts_review": "Jede Auswahl startet ein Sage-Review. Die Ergebnisse erscheinen unter Reviews und werden nur auf GitHub gepostet, wenn du es willst.",
+          "starts_review_truncated": "Nur die neuesten 100 Anfragen werden angezeigt. Jede Auswahl startet ein Sage-Review. Die Ergebnisse erscheinen unter Reviews und werden nur auf GitHub gepostet, wenn du es willst.",
+          "tab": "Anfragen"
+        },
         "runCard": {
           "cancel": "Abbrechen",
           "clean": "Sauber",

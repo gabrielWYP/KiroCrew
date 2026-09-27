@@ -1028,6 +1028,14 @@
           "run_live_notice": "Esta revisão ainda está em andamento. As constatações podem mudar até ela terminar, portanto ainda não há o que perguntar.",
           "loading": "Carregando…"
         },
+        "reviewQueue": {
+          "empty": "Nenhum pull request aguarda sua revisão.",
+          "filter_by_repo": "Filtrar por repositório ou título",
+          "setup_required": "Configure a CLI do GitHub para ver os pedidos de revisão",
+          "starts_review": "Cada escolha executa uma revisão do Sage. Os resultados aparecem em Revisões e só são publicados no GitHub se você decidir.",
+          "starts_review_truncated": "Só as 100 solicitações mais recentes aparecem. Cada escolha executa uma revisão do Sage. Os resultados aparecem em Revisões e só são publicados no GitHub se você decidir.",
+          "tab": "Pedidos"
+        },
         "runCard": {
           "cancel": "Cancelar",
           "clean": "Limpa",

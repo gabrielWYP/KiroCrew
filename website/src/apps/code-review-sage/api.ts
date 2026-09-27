@@ -13,6 +13,7 @@ import type {
   PinnedRepo,
   RecentReposResponse,
   RepoPrsResponse,
+  ReviewQueueResponse,
   Run,
   RunReport,
   RunsResponse,
@@ -169,6 +170,9 @@ export const sageApi = {
 
   repoPrs: (repo: string): Promise<RepoPrsResponse> =>
     getJSON(`/repo-prs?repo=${encodeURIComponent(repo)}`),
+
+  /** Open PRs across GitHub that request the gh user's review. */
+  reviewQueue: (): Promise<ReviewQueueResponse> => getJSON('/review-queue'),
 
   // --- Settings + learning ---
   settings: (): Promise<SettingsResponse> => getJSON('/settings'),

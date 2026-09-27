@@ -1469,6 +1469,24 @@ async def _handle_my_repos(request: web.Request) -> web.Response:
         return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
 
 
+async def _handle_review_queue(request: web.Request) -> web.Response:
+    """GET .../review-queue — open PRs where the ``gh`` user is a requested
+    reviewer. Like ``/my-repos``, an unusable ``gh`` is a 200 ``setup_required``."""
+    try:
+        rows, truncated = await asyncio.to_thread(discovery.list_review_requested)
+    except discovery.GhSetupError as exc:
+        return web.json_response({"prs": [], "setup_required": True, "error": str(exc)})
+    except discovery.GhError as exc:
+        logger.warning("review queue failed: %s", exc)
+        return web.json_response(
+            {"code": "provider_unavailable", "error": "upstream service error"}, status=502)
+    # The same change id the repo list carries: the detail pane scopes posting by
+    # it, and an empty one would publish every change of a multi-PR run.
+    for row in rows:
+        row["change_id"] = review_driver.change_id_for(row["url"])
+    return web.json_response({"prs": rows, "truncated": truncated})
+
+
 def _pull_request_ref(link: str) -> dict | None:
     """Parse a pasted GitHub PR URL into the repo plus the PR's identity.
 
@@ -2465,6 +2483,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/apps/code-review-sage/repo-prs", _handle_repo_prs)
     app.router.add_get("/api/apps/code-review-sage/recent-repos", _handle_recent_repos)
     app.router.add_get("/api/apps/code-review-sage/my-repos", _handle_my_repos)
+    app.router.add_get("/api/apps/code-review-sage/review-queue", _handle_review_queue)
     app.router.add_get("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_post("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_delete("/api/apps/code-review-sage/repos", _handle_repos)

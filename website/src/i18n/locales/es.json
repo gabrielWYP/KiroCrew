@@ -1028,6 +1028,14 @@
           "run_live_notice": "Esta revisión sigue en curso. Sus hallazgos pueden cambiar hasta que termine, así que aún no hay nada que preguntar.",
           "loading": "Cargando…"
         },
+        "reviewQueue": {
+          "empty": "Ningún pull request espera tu revisión.",
+          "filter_by_repo": "Filtrar por repositorio o título",
+          "setup_required": "Configura la CLI de GitHub para ver las solicitudes de revisión",
+          "starts_review": "Cada selección ejecuta una revisión de Sage. Los resultados aparecen en Revisiones y no se publican en GitHub salvo que tú lo decidas.",
+          "starts_review_truncated": "Solo se muestran las 100 solicitudes más recientes. Cada selección ejecuta una revisión de Sage. Los resultados aparecen en Revisiones y no se publican en GitHub salvo que tú lo decidas.",
+          "tab": "Solicitudes"
+        },
         "runCard": {
           "cancel": "Cancelar",
           "clean": "Limpio",

@@ -724,6 +724,14 @@
           "run_live_notice": "This review is still running. Its findings can change until it finishes, so there is nothing to ask about yet.",
           "loading": "Loading…"
         },
+        "reviewQueue": {
+          "empty": "No pull requests await your review.",
+          "filter_by_repo": "Filter by repo or title",
+          "setup_required": "Set up the GitHub CLI to see review requests",
+          "starts_review": "Each pick runs a Sage review. Findings appear under Reviews and are not posted to GitHub unless you choose to.",
+          "starts_review_truncated": "Only the newest 100 requests are shown. Each pick runs a Sage review. Findings appear under Reviews and are not posted to GitHub unless you choose to.",
+          "tab": "Requests"
+        },
         "runCard": {
           "cancel": "Cancel",
           "clean": "Clean",

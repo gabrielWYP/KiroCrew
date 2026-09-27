@@ -984,6 +984,14 @@
           "run_live_notice": "이 리뷰는 아직 진행 중입니다. 끝나기 전에는 지적 사항이 바뀔 수 있어 질문할 내용이 아직 없습니다.",
           "loading": "받아오는 중…"
         },
+        "reviewQueue": {
+          "empty": "리뷰를 기다리는 풀 리퀘스트가 없습니다.",
+          "filter_by_repo": "저장소 또는 제목으로 필터링",
+          "setup_required": "리뷰 요청을 보려면 GitHub CLI를 설정하세요",
+          "starts_review": "선택한 PR마다 Sage 리뷰가 실행됩니다. 결과는 리뷰에 표시되며 직접 선택하지 않으면 GitHub에 게시되지 않습니다.",
+          "starts_review_truncated": "최신 요청 100개만 표시됩니다. 선택한 PR마다 Sage 리뷰가 실행됩니다. 결과는 리뷰에 표시되며 직접 선택하지 않으면 GitHub에 게시되지 않습니다.",
+          "tab": "요청"
+        },
         "runCard": {
           "cancel": "취소",
           "clean": "문제 없음",
