@@ -238,8 +238,17 @@ jobs:
           # the honest claim. The script fails closed on a file listed here that
           # it cannot read, so a manifest that vanishes mid-job cannot be
           # silently dropped from the stamp's coverage.
+          #
+          # Listed as `pathlist:`, which digests the manifest's content with
+          # every line that starts with `/` reduced to its basename. The manifest
+          # embeds $SHOTS with `cat`, and $SHOTS holds "$DEST_DIR/$name" lines,
+          # so hashing its raw bytes would put this run's temp directory in the
+          # stamp and move it on a re-run that read byte-identical evidence. The
+          # counts, the headings and each recording's repository path do not
+          # start with `/`, so normalizing costs the stamp nothing the manifest
+          # is the predicate for.
           : > "$EVIDENCE_LIST"
-          [ -r "$DESIGN_EVIDENCE" ] && printf '%s\n' "$DESIGN_EVIDENCE" >> "$EVIDENCE_LIST" || :
+          [ -r "$DESIGN_EVIDENCE" ] && printf 'pathlist:%s\n' "$DESIGN_EVIDENCE" >> "$EVIDENCE_LIST" || :
           . "$GITHUB_WORKSPACE/.github/scripts/pr-description-capture.sh"
 
       # Prefetch the diff as a DATA file, so the model needs no Bash at all.

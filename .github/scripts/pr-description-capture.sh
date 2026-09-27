@@ -19,6 +19,18 @@
 #                        keeps that lane's digest exactly $INTENT's. See the
 #                        digest block below for why it exists.
 #
+#                        A line may instead read `pathlist:<absolute path>`,
+#                        which folds that file in by its NORMALIZED content
+#                        rather than its bytes: every line starting with `/` is
+#                        reduced to its basename, every other line is kept
+#                        verbatim, and the rendering always ends in a newline.
+#                        Use it for a file whose own bytes are per-run paths --
+#                        the screenshot list, and the rendered-evidence manifest
+#                        that embeds it -- so the stamp covers WHAT the list
+#                        says without covering the runner temp root it says it
+#                        in. Use the plain form for evidence whose bytes are the
+#                        evidence, which is every downloaded image.
+#
 # Outputs:
 #   $INTENT              the captured title + description, media stripped,
 #                        capped at 8000 bytes of well-formed UTF-8
@@ -50,6 +62,23 @@
 #
 #   REPO=<owner/repo> PR=<number> INTENT=$(mktemp) \
 #     bash -c '. .github/scripts/pr-description-capture.sh; echo "$INTENT_DIGEST"'
+#
+# THAT REPRODUCES THE $INTENT-ONLY DIGEST, which is the published stamp in the
+# two first-principles lanes and only there. The other four lanes hand over an
+# $EVIDENCE_LIST, so their stamp is the manifest's digest and this command
+# cannot equal it -- by construction, not because the description moved. Read
+# the `### Description read` heading: it states the evidence count, and a
+# non-zero count means the manifest form. To reproduce that, rebuild the
+# manifest by hand from the lane's step summary, which lists each ordinal:
+#
+#   description <sha256 of pr-intent.txt>
+#   evidence-1 <sha256 of the first listed file>
+#   ...
+#
+# one line each, newline-terminated, in the order the lane listed them, then
+# digest that file. A `pathlist:` entry is hashed after normalizing to basenames
+# (see $EVIDENCE_LIST above), which is what makes this reproducible off the
+# runner at all -- the raw list carries that run's temp directory.
 #
 # A mismatch means the description moved after that verdict was formed, so any
 # finding the verdict drew from the description is unproven. A match means the
@@ -161,6 +190,21 @@ INTENT_DIGEST="$($_kc_sha < "$INTENT" | cut -d' ' -f1)"
 # two evidence files cannot be confused for one longer one. The manifest holds
 # ordinals, never paths: a runner temp path is per-run, so digesting it would
 # change the stamp on a re-run that read identical bytes.
+#
+# THAT RULE BINDS A LISTED FILE'S CONTENTS TOO, which is what `pathlist:` is
+# for. Two of the evidence files a lane hands over are themselves lists of
+# absolute paths: the screenshot list, written as "$DEST_DIR/$name" by
+# pr-attachment-evidence.sh and pr-committed-evidence.sh, and the design lanes'
+# rendered-evidence manifest, which embeds that list with `cat`. Hashing those
+# bytes puts the runner temp root inside the stamp, so a re-run that read
+# byte-identical evidence publishes a different digest -- the same defect the
+# ordinal labels were chosen to avoid, one level down. Normalizing to basenames
+# keeps everything those lists are read FOR: the `TRUNCATED: ...` notices a cap
+# appends, and each opaque name's origin URL or repository path, both of which
+# sit on lines that do not start with `/` and so pass through untouched. What it
+# drops is only the directory the run happened to use. Discrimination is not
+# lost either: a swapped attachment changes the origin map, and the image bytes
+# are folded in under their own ordinals.
 if [ -n "${EVIDENCE_LIST:-}" ] && [ -r "${EVIDENCE_LIST:-}" ]; then
   _kc_manifest="$(mktemp)"
   printf 'description %s\n' "$INTENT_DIGEST" > "$_kc_manifest"
@@ -168,6 +212,13 @@ if [ -n "${EVIDENCE_LIST:-}" ] && [ -r "${EVIDENCE_LIST:-}" ]; then
   while IFS= read -r _kc_ev || [ -n "$_kc_ev" ]; do
     [ -n "$_kc_ev" ] || continue
     _kc_ordinal=$((_kc_ordinal + 1))
+    _kc_flatten=""
+    case "$_kc_ev" in
+      pathlist:*)
+        _kc_ev="${_kc_ev#pathlist:}"
+        _kc_flatten="yes"
+        ;;
+    esac
     if [ ! -r "$_kc_ev" ]; then
       # An unreadable file the lane named as evidence cannot be named by
       # digest, and a stamp that silently omitted it would claim to cover
@@ -177,12 +228,24 @@ if [ -n "${EVIDENCE_LIST:-}" ] && [ -r "${EVIDENCE_LIST:-}" ]; then
       rm -f "$_kc_manifest"
       exit 1
     fi
-    printf 'evidence-%s %s\n' "$_kc_ordinal" "$($_kc_sha < "$_kc_ev" | cut -d' ' -f1)" >> "$_kc_manifest"
+    if [ -n "$_kc_flatten" ]; then
+      _kc_flat="$(mktemp)"
+      while IFS= read -r _kc_line || [ -n "$_kc_line" ]; do
+        case "$_kc_line" in
+          /*) printf '%s\n' "${_kc_line##*/}" ;;
+          *) printf '%s\n' "$_kc_line" ;;
+        esac
+      done < "$_kc_ev" > "$_kc_flat"
+      printf 'evidence-%s %s\n' "$_kc_ordinal" "$($_kc_sha < "$_kc_flat" | cut -d' ' -f1)" >> "$_kc_manifest"
+      rm -f "$_kc_flat"
+    else
+      printf 'evidence-%s %s\n' "$_kc_ordinal" "$($_kc_sha < "$_kc_ev" | cut -d' ' -f1)" >> "$_kc_manifest"
+    fi
   done < "$EVIDENCE_LIST"
   INTENT_DIGEST="$($_kc_sha < "$_kc_manifest" | cut -d' ' -f1)"
   EVIDENCE_COUNT="$_kc_ordinal"
   rm -f "$_kc_manifest"
-  unset _kc_manifest _kc_ordinal _kc_ev
+  unset _kc_manifest _kc_ordinal _kc_ev _kc_flatten _kc_flat _kc_line
 else
   EVIDENCE_COUNT=0
 fi

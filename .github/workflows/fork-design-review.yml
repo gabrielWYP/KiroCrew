@@ -382,9 +382,13 @@ jobs:
           # erases what tells one attachment from another, so an image URL
           # swapped for a non-image one leaves the captured prose identical while
           # the manifest loses an image. Listed only when readable; the script
-          # fails closed on a listed file it cannot read.
+          # fails closed on a listed file it cannot read. Listed as `pathlist:`
+          # for the same reason as well: the manifest embeds $SHOTS with `cat`,
+          # whose lines are "$DEST_DIR/$name", so hashing its raw bytes would put
+          # this run's temp directory in the stamp and move it on a re-run that
+          # read byte-identical evidence.
           : > "$EVIDENCE_LIST"
-          [ -r "$DESIGN_EVIDENCE" ] && printf '%s\n' "$DESIGN_EVIDENCE" >> "$EVIDENCE_LIST" || :
+          [ -r "$DESIGN_EVIDENCE" ] && printf 'pathlist:%s\n' "$DESIGN_EVIDENCE" >> "$EVIDENCE_LIST" || :
           . "$GITHUB_WORKSPACE/.github/scripts/pr-description-capture.sh"
 
       # Mint short-lived, Bedrock-only creds immediately before the model call,

@@ -462,16 +462,19 @@ jobs:
             exit 0
           fi
           # Same construction and the same two reasons as ux-review.yml. The
-          # LIST FILES go in as content -- their bytes carry each copy's origin,
-          # the recordings the model is told about, and a `TRUNCATED: ...` notice
-          # when a cap drops evidence -- and then only those lines of $SHOTS that
-          # are really files. $SHOTS is not a pure path list despite the evidence
-          # script's header: it carries that prose notice too, and passing it as a
-          # path would trip the capture's fail-closed readability guard and take
-          # this lane RED on any PR with more than MAX_SHOTS images.
+          # LIST FILES go in as `pathlist:` content -- their bytes carry each
+          # copy's origin, the recordings the model is told about, and a
+          # `TRUNCATED: ...` notice when a cap drops evidence, while every line
+          # that starts with `/` is reduced to its basename so this run's temp
+          # directory does not enter the stamp -- and then only those lines of
+          # $SHOTS that are really files. $SHOTS is not a pure path list despite
+          # the evidence script's header: it carries that prose notice too, and
+          # passing it as a path would trip the capture's fail-closed readability
+          # guard and take this lane RED on any PR with more than MAX_SHOTS
+          # images.
           : > "$EVIDENCE_LIST"
           for f in "$SHOTS" "$SHOT_MAP" "$CLIPS"; do
-            [ -r "$f" ] && printf '%s\n' "$f" >> "$EVIDENCE_LIST" || :
+            [ -r "$f" ] && printf 'pathlist:%s\n' "$f" >> "$EVIDENCE_LIST" || :
           done
           if [ -r "$SHOTS" ]; then
             while IFS= read -r p || [ -n "$p" ]; do

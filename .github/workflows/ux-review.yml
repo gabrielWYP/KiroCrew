@@ -376,6 +376,15 @@ jobs:
           # evidence -- so a description edit that changes WHICH evidence is
           # dropped moves the digest even though no kept file changed.
           #
+          # They go in as `pathlist:`, which digests their content with every
+          # line that starts with `/` reduced to its basename. $SHOTS holds
+          # "$DEST_DIR/$name" lines, so its raw bytes carry this run's temp
+          # directory: hashing them would move the stamp on a re-run that read
+          # byte-identical evidence, which is the very thing the manifest's
+          # ordinal labels exist to prevent. The notices and the origin map sit
+          # on lines that do not start with `/`, so normalizing costs this lane
+          # nothing it listed the files for.
+          #
           # Then the image bytes, taking ONLY lines that are really files.
           # $SHOTS is NOT a pure path list despite what the evidence script's
           # header says: a `TRUNCATED: more than $MAX_SHOTS images` prose line is
@@ -387,7 +396,7 @@ jobs:
           # covered, so filtering here loses nothing.
           : > "$EVIDENCE_LIST"
           for f in "$SHOTS" "$SHOT_MAP" "$CLIPS"; do
-            [ -r "$f" ] && printf '%s\n' "$f" >> "$EVIDENCE_LIST" || :
+            [ -r "$f" ] && printf 'pathlist:%s\n' "$f" >> "$EVIDENCE_LIST" || :
           done
           if [ -r "$SHOTS" ]; then
             while IFS= read -r p || [ -n "$p" ]; do

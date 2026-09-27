@@ -15572,6 +15572,8 @@ class TestCaptureDigestNamesTheModelsInput:
         evidence: list[bytes] | None = None,
         evidence_names: list[str] | None = None,
         list_missing: bool = False,
+        pathlists: list[tuple[str, bytes]] | None = None,
+        pathlist_missing: bool = False,
     ) -> tuple[str, str, bytes]:
         bash = _bash()
         if bash is None:
@@ -15586,7 +15588,10 @@ class TestCaptureDigestNamesTheModelsInput:
         outputs = tmp_path / "gh-output"
         outputs.write_text("", encoding="utf-8")
         extra: dict[str, str] = {}
-        if evidence is not None or list_missing:
+        wants_list = (
+            evidence is not None or list_missing or pathlists is not None or pathlist_missing
+        )
+        if wants_list:
             # Write the evidence files the lane would have collected, then the
             # list naming them -- the same two-file shape the lanes build, so the
             # pin exercises the real contract rather than a paraphrase of it.
@@ -15597,7 +15602,18 @@ class TestCaptureDigestNamesTheModelsInput:
                 target.write_bytes(blob)
                 paths.append(target)
             listing = tmp_path / "intent-evidence-list.txt"
-            lines = [str(p) for p in paths]
+            # A lane lists the files whose own bytes are per-run paths FIRST and
+            # marks them `pathlist:`, then the evidence whose bytes ARE the
+            # evidence. Same order as the four real lanes, so an ordinal here
+            # means what it means there.
+            lines = []
+            for name, blob in pathlists or []:
+                target = tmp_path / name
+                target.write_bytes(blob)
+                lines.append(f"pathlist:{target}")
+            if pathlist_missing:
+                lines.append(f"pathlist:{tmp_path / 'never-written.txt'}")
+            lines += [str(p) for p in paths]
             if list_missing:
                 lines.append(str(tmp_path / "never-written.bin"))
             listing.write_text("".join(f"{ln}\n" for ln in lines), encoding="utf-8", newline="\n")
@@ -15635,7 +15651,7 @@ class TestCaptureDigestNamesTheModelsInput:
             env=env,
             cwd=tmp_path,
         )
-        if list_missing:
+        if list_missing or pathlist_missing:
             # The fail-closed path is the subject of its own pin, so hand the
             # caller the failure instead of asserting success here.
             return (
@@ -15839,13 +15855,16 @@ class TestCaptureDigestNamesTheModelsInput:
         of its lines that are really files; this pin holds the capture's half of
         that contract by proving a prose-bearing list file is digestible.
         """
-        listing = tmp_path / "shots.txt"
-        listing.parent.mkdir(parents=True, exist_ok=True)
-        listing.write_bytes(
-            b"/nonexistent/shot-01.png\nTRUNCATED: more than 40 images; one was not listed\n"
-        )
         reported, outputs, _ = self._capture(
-            tmp_path, "prose", evidence=[listing.read_bytes()], evidence_names=["shots.txt"]
+            tmp_path,
+            "prose",
+            pathlists=[
+                (
+                    "shots.txt",
+                    b"/nonexistent/shot-01.png\n"
+                    b"TRUNCATED: more than 40 images; one was not listed\n",
+                )
+            ],
         )
         assert len(reported) == 64, reported
         assert f"description_digest={reported}" in outputs, outputs
@@ -15855,20 +15874,133 @@ class TestCaptureDigestNamesTheModelsInput:
         load-bearing: an edit that changes WHICH evidence a cap drops changes that
         list's bytes even when no kept file changed, so the verdict's stamp moves.
         Filtering the notice out and digesting only real paths would lose this.
+
+        Held in the `pathlist:` form, which is what the four lanes list. The
+        notice does not start with `/`, so normalizing to basenames leaves it
+        whole and this property survives that change -- which is the point of
+        pinning it here rather than on the plain form.
         """
+        kept = b"/x/_temp/shots/shot-01.png\n"
         one, _, _ = self._capture(
             tmp_path / "a",
             "same prose",
-            evidence=[b"/x/shot-01.png\nTRUNCATED: more than 40 images; one was not listed\n"],
-            evidence_names=["shots.txt"],
+            pathlists=[
+                ("shots.txt", kept + b"TRUNCATED: more than 40 images; one was not listed\n")
+            ],
         )
         two, _, _ = self._capture(
             tmp_path / "b",
             "same prose",
-            evidence=[b"/x/shot-01.png\nTRUNCATED: more than 40 images; two were not listed\n"],
-            evidence_names=["shots.txt"],
+            pathlists=[
+                ("shots.txt", kept + b"TRUNCATED: more than 40 images; two were not listed\n")
+            ],
         )
         assert one != two, one
+
+    def test_a_marked_lists_temp_root_stays_out_of_the_digest(self, tmp_path: Path) -> None:
+        """The screenshot list holds `"$DEST_DIR/$name"` lines and $DEST_DIR is
+        under `runner.temp`, so digesting its BYTES puts a per-run directory
+        inside the stamp: a re-run that read byte-identical evidence publishes a
+        different digest, and a reader recomputing is told a sound verdict is
+        stale. That is the same defect the manifest's ordinal labels exist to
+        prevent, one level down -- in a listed file's contents rather than in its
+        label. The `pathlist:` form reduces every line starting with `/` to its
+        basename, so the same evidence under two temp roots hashes the same.
+
+        The two renderings are asserted DIFFERENT first. Without that the pin
+        would also pass on a harness that fed identical bytes twice, which is how
+        an invariance test passes while measuring nothing.
+        """
+        one_bytes = b"/home/runner/work/_temp/ux-shots/shot-01.png\n"
+        two_bytes = b"/mnt/other/_work/_temp/ux-shots/shot-01.png\n"
+        assert one_bytes != two_bytes
+        one, _, _ = self._capture(
+            tmp_path / "a", "same prose", pathlists=[("shots.txt", one_bytes)]
+        )
+        two, _, _ = self._capture(
+            tmp_path / "b", "same prose", pathlists=[("shots.txt", two_bytes)]
+        )
+        assert one == two, (one, two)
+
+    def test_a_marked_map_still_moves_when_an_attachment_is_swapped(self, tmp_path: Path) -> None:
+        """Normalizing must drop the directory and nothing else. The origin map is
+        `<opaque name>\\t<origin>` and does not start with `/`, so it survives
+        whole -- which is what keeps a swapped attachment nameable. The strip
+        replaces both URLs with the same placeholder, so the captured prose is
+        byte-identical across this edit and the map is the only thing that moves.
+        Had normalizing reduced the map too, the swap would go unstamped.
+        """
+        one, _, _ = self._capture(
+            tmp_path / "a",
+            "same prose",
+            pathlists=[("map.txt", b"shot-01.png\thttps://example.com/one.png\n")],
+        )
+        two, _, _ = self._capture(
+            tmp_path / "b",
+            "same prose",
+            pathlists=[("map.txt", b"shot-01.png\thttps://example.com/two.png\n")],
+        )
+        assert one != two, one
+
+    def test_an_unreadable_marked_list_file_still_fails_closed(self, tmp_path: Path) -> None:
+        """The marker changes HOW a listed file is folded in, never WHETHER it has
+        to be readable. A stamp that quietly skipped a marked file it could not
+        open would overstate its coverage exactly as the plain form would.
+        """
+        code, outputs, stderr = self._capture(tmp_path, "prose", pathlist_missing=True)
+        assert code != "0", (code, stderr)
+        assert "description_digest=" not in outputs, outputs
+
+    def test_every_lane_marks_the_path_lists_it_hands_over(self) -> None:
+        """Enumerated from source, because a named site is a sample. Two shapes
+        carry absolute paths in their own bytes: the screenshot list a UX lane
+        hands over directly, and the rendered-evidence manifest a design lane
+        hands over, which embeds that list with `cat`. Each must be listed
+        `pathlist:` or this run's temp directory enters the stamp.
+
+        The converse is pinned in the same pass: a line appending ONE image must
+        NOT be marked. Those bytes are the evidence, and normalizing a PNG would
+        hash a reading of its lines instead of its content.
+        """
+        source_line = '. "$GITHUB_WORKSPACE/.github/scripts/pr-description-capture.sh"'
+        marker = "printf 'pathlist:%s\\n'"
+        offenders = []
+        covered = 0
+        for name in _every_workflow():
+            text = _workflow(name)
+            if "EVIDENCE_LIST" not in text or source_line not in text:
+                continue
+            doc = yaml.safe_load(text)
+            for job_id, job in doc["jobs"].items():
+                for step in job.get("steps") or []:
+                    run = step.get("run") or ""
+                    if source_line not in run or "EVIDENCE_LIST" not in run:
+                        continue
+                    covered += 1
+                    appends = 0
+                    for line in run.splitlines():
+                        stripped = line.strip()
+                        if not stripped.endswith('>> "$EVIDENCE_LIST" || :'):
+                            continue
+                        appends += 1
+                        marked = marker in stripped
+                        # `"$f"` is the UX loop over its three list files;
+                        # `"$DESIGN_EVIDENCE"` is the design lanes' manifest.
+                        # Anything else appending to the list is one file whose
+                        # bytes are the evidence.
+                        a_path_list = '"$f"' in stripped or '"$DESIGN_EVIDENCE"' in stripped
+                        if a_path_list and not marked:
+                            offenders.append((name, job_id, "path list unmarked", stripped))
+                        if marked and not a_path_list:
+                            offenders.append((name, job_id, "byte evidence marked", stripped))
+                    if appends == 0:
+                        offenders.append((name, job_id, "no append line found", ""))
+        # Control: exactly four lanes hand evidence to the capture -- two UX and
+        # two design. The two first-principles lanes read prose plus the diff and
+        # set no EVIDENCE_LIST, so a count other than four means this walk stopped
+        # matching the lanes rather than that they are clean.
+        assert covered == 4, covered
+        assert offenders == [], offenders
 
     def test_every_ux_lane_covers_its_recording_list(self) -> None:
         """The recording list is named in each UX lane's prompt as a data file the
