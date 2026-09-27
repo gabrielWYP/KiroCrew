@@ -96,6 +96,7 @@ from kiro_crew.acp.mcp_ref_guard import warn_unresolved_server_refs
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.session_mcp import agent_spec_snapshot, session_mcp_deny_rules
+from kiro_crew.acp import evaluator_lock
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
@@ -8018,6 +8019,10 @@ class AcpClient:
             # depth: nothing here routes a tool call to Crew's gate.
             env[_ENV_DEEPSEEK_PERMISSION_MODE] = DEEPSEEK_PERMISSION_MODE
         self._apply_session_identity_env(env)
+        # codex-sandbox A3: CODEX_HOME by role, same rule as AcpRuntime.spawn
+        # (raises rather than start a locked identity on ~/.codex).
+        _ident = self._evaluator_lock_identity()
+        evaluator_lock.apply_role_codex_env(env, self.backend, *_ident.names, *_ident.extra)
         if self._channel_id:
             env["KIROCREW_CHANNEL_ID"] = self._channel_id
         else:
@@ -9449,9 +9454,32 @@ class AcpClient:
         self._last_activity = time.monotonic()
         return req_id
 
+    def _evaluator_lock_identity(self) -> "evaluator_lock.SessionIdentity":
+        """codex-sandbox A3: this client's identity (one process, one session),
+        snapshotted on first use and only ever tightened afterwards."""
+        prev = getattr(self, "_a3_lock_identity", None)
+        ident = (
+            evaluator_lock.make_identity(self.backend, self._agent, source="AcpClient")
+            if prev is None
+            else prev.tightened(self._agent)
+        )
+        self._a3_lock_identity = ident
+        return ident
+
+    def _evaluator_lock_reason(self) -> str | None:
+        """codex-sandbox A3 lock verdict for this client (see acp/evaluator_lock.py)."""
+        return evaluator_lock.identity_lock_reason(self._evaluator_lock_identity())
+
     async def _send_response(self, request_id: str | int, result: dict) -> None:
         if not self._process or not self._process.stdin:
             raise AcpError("ACP process not running")
+        # codex-sandbox A3 wire backstop: no ALLOW leaves a locked session, even
+        # from a caller that bypassed approve_tool.
+        if evaluator_lock.is_allow_outcome(result):
+            _lock = self._evaluator_lock_reason()
+            if _lock:
+                evaluator_lock.log_lock("AcpClient._send_response", request_id, _lock)
+                result = evaluator_lock.CANCELLED_RESULT
 
         msg = {"jsonrpc": "2.0", "id": request_id, "result": result}
         data = json.dumps(msg) + "\n"
@@ -10908,6 +10936,13 @@ class AcpClient:
         keeps kiro-cli ("allow_once"/"allow_always") and claude-agent-acp
         ("allow"/"allow_always") working without caller knowledge.
         """
+        # codex-sandbox A3: a locked read-only evaluator session is NEVER
+        # approved, whatever rung asked for it -- the approve becomes a reject.
+        _lock = self._evaluator_lock_reason()
+        if _lock:
+            evaluator_lock.log_lock("AcpClient.approve_tool", request_id, _lock)
+            await self.reject_tool(request_id)
+            return
         # An approved call may complete; forget the envelope mapping so the map
         # stays bounded by the calls still awaiting an answer.
         getattr(self, "_pi_gate_request_tool", {}).pop(str(request_id), None)

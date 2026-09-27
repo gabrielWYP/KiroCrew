@@ -1,0 +1,65 @@
+# CODEX_HOME dedicado a codex-evaluator (KiroCrew) -- variante A3. Ver ../README.md.
+# @RO_FS_ROOTS@ y @EVAL_HOME@ los sustituye apply.sh (ro_fs_mcp.py se COPIA al
+# propio CODEX_HOME, fuera del workspace compartido). verify_core.py lo parsea
+# con tomllib y exige EXACTAMENTE estas claves/valores (cualquier otra = FAIL).
+#
+# KiroCrew (parche A3) solo usa este CODEX_HOME al lanzar codex-acp para
+# codex-evaluator*: el gateway y el resto de agentes Codex siguen con ~/.codex.
+# codex-acp manda approvalPolicy/sandboxPolicy en cada turn/start según su "mode"
+# (KiroCrew fija read-only), así que estas dos claves NO bastan solas: hace falta
+# codex-acp-readonly.diff. Aquí quedan como defensa en profundidad.
+sandbox_mode = "read-only"
+approval_policy = "never"
+approvals_reviewer = "user"
+web_search = "disabled"
+
+[features]
+# Sin shell. OJO: codex 0.157.1 IGNORA unified_exec=false (features list sigue
+# diciendo true); lo que retira exec_command/write_stdin es shell_tool=false.
+# Evidencia: evidence/tool-surface.json (lista de herramientas enviada al modelo).
+shell_tool = false
+unified_exec = false
+unified_exec_tty = false
+shell_snapshot = false
+# view_image lee cualquier imagen del disco EN PROCESO (sin bwrap): fuera.
+view_image = false
+# code mode: el modelo escribe JS que el host ejecuta y que llama a las
+# herramientas. Apagado: ver evidence/tool-surface.json para lo que queda
+# (las herramientas MCP de ro_fs siguen expuestas como funciones directas).
+code_mode_host = false
+code_mode = false
+# Todo lo que lanza procesos, servicios, red o descubre/instala cosas: fuera.
+apps = false
+plugins = false
+remote_plugin = false
+plugin_sharing = false
+recommended_plugins = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+in_app_browser = false
+in_app_local_automation = false
+computer_use = false
+image_generation = false
+multi_agent = false
+multi_agent_v2 = false
+hooks = false
+memories = false
+skill_search = false
+skill_mcp_dependency_install = false
+tool_suggest = false
+workspace_dependencies = false
+worktrees = false
+daemon_auto_start = false
+realtime_conversation = false
+goals = false
+
+# Único canal de lectura: servidor MCP de solo lectura (read_file/list_dir/grep),
+# confinado a RO_FS_ROOTS (separadas por ':') con openat2 obligatorio.
+# "approve" es seguro SOLO porque ro_fs no tiene ninguna ruta de escritura
+# (verify.sh comprueba su hash contra expected.json).
+[mcp_servers.ro_fs]
+command = "/usr/bin/python3"
+args = ["-I", "@EVAL_HOME@/ro_fs_mcp.py"]
+env = { RO_FS_ROOTS = "@RO_FS_ROOTS@", RO_FS_MAX_BYTES = "262144", RO_FS_TIME_LIMIT = "10" }
+default_tools_approval_mode = "approve"

@@ -2882,6 +2882,28 @@ class RunEventCoordinator(ManagerComponent):
         # Member capability and native prompt documents are prepared at launch.
         if info.execution_context is not None and info.execution_context.member_id is not None:
             return False
+        # codex-sandbox A3: a read-only evaluator never shares a parent's
+        # process: it needs its own codex-acp spawned with the evaluator
+        # CODEX_HOME. Fail-closed: an error deciding it also forces dedicated.
+        try:
+            from kiro_crew.acp.evaluator_lock import is_evaluator_agent
+
+            _names = (
+                info.agent,
+                getattr(info.execution_context, "template_id", None)
+                if info.execution_context is not None
+                else None,
+            )
+            if any(is_evaluator_agent(n) for n in _names):
+                logger.info(
+                    "Subagent %s: evaluator agent %r forces a dedicated process "
+                    "(own CODEX_HOME, no session sharing)",
+                    info.id,
+                    info.agent,
+                )
+                return False
+        except Exception:
+            return False
         try:
             cfg = KiroCrewConfig.load()
             if not cfg.agent.session_sharing:

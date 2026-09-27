@@ -96,6 +96,7 @@ from kiro_crew.acp.liveness import (
 )
 from kiro_crew.acp.mcp_session_report import KasMcpReadiness, McpSessionReport
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks, summarize_prompt_structure
+from kiro_crew.acp import evaluator_lock
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -762,6 +763,10 @@ class AcpSessionHandle:
     Owns one sessionId + asyncio.Queue. Reads events from the queue (fed by
     AcpRuntime's reader task) and provides prompt/cancel/approve/reject API.
     """
+
+    #: codex-sandbox A3: immutable lock identity, set by the runtime at
+    #: create/load time (None only for handles built outside the runtime).
+    _lock_identity: "evaluator_lock.SessionIdentity | None" = None
 
     def __init__(
         self,
@@ -1737,6 +1742,18 @@ class AcpSessionHandle:
         ("allow_once"/"allow_always") and claude-agent-acp ("allow"/"allow_always")
         working without the caller knowing the backend.
         """
+        # codex-sandbox A3: decided by the identity of the session that EMITTED
+        # this request (recorded by the runtime reader) and this session's own
+        # immutable identity -- never by the runtime's identity. Locked -> the
+        # approve becomes a reject, whatever rung asked for it.
+        _lock = self._evaluator_lock_reason(request_id)
+        if _lock:
+            evaluator_lock.log_lock("AcpSessionHandle.approve_tool", request_id, _lock)
+            await self.reject_tool(request_id)
+            return
+        _note = getattr(self._runtime, "note_permission_answerer", None)
+        if callable(_note):
+            _note(request_id, self._effective_lock_identity())
         resolved_id = option_id
         recorded = self._permission_options.pop(request_id, None)
         # Answered — the turn is no longer waiting on a human. Also closes the
@@ -1756,6 +1773,28 @@ class AcpSessionHandle:
             request_id,
             {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": resolved_id}},
         )
+
+    def _effective_lock_identity(self) -> "evaluator_lock.SessionIdentity":
+        """The runtime-registered identity; for a handle built outside the
+        runtime, one derived now from this session's crew agent and the
+        runtime's agent/backend."""
+        if self._lock_identity is not None:
+            return self._lock_identity
+        rt = self._runtime
+        return evaluator_lock.make_identity(
+            evaluator_lock.backend_of(rt),
+            self._crew_agent,
+            getattr(rt, "_agent", None),
+            source="handle-fallback",
+        )
+
+    def _evaluator_lock_reason(self, request_id: str | int | None = None) -> str | None:
+        """codex-sandbox A3 verdict for one permission request of this session."""
+        ident = self._effective_lock_identity()
+        fn = getattr(self._runtime, "permission_lock_reason_for_request", None)
+        if callable(fn) and request_id is not None:
+            return fn(request_id, fallback=ident)
+        return evaluator_lock.identity_lock_reason(ident)
 
     async def reject_tool(self, request_id: str | int) -> None:
         """Reject a pending permission request.
@@ -2704,6 +2743,14 @@ class AcpSessionHandle:
         practice) for callers without an off-loop path.
         """
         self._crew_agent = crew_agent
+        # codex-sandbox A3: a rekey may ADD a lock to this session, never drop
+        # the one it was created with (the lock identity is not _crew_agent).
+        if crew_agent:
+            if self._lock_identity is not None:
+                self._lock_identity = self._lock_identity.tightened(crew_agent)
+            _tighten = getattr(self._runtime, "tighten_lock_identity", None)
+            if callable(_tighten):
+                _tighten(self._session_id, crew_agent)
         self._watchdog = settings if settings is not None else _load_watchdog_settings(crew_agent)
         self._oracle._sample_min_secs = self._watchdog.wellness_sample_secs
 

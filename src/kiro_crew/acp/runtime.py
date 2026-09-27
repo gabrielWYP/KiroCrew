@@ -88,6 +88,7 @@ from kiro_crew.acp.session_handle import (
     advertised_models_from_session,
 )
 from kiro_crew.acp.session_mcp import agent_spec_snapshot
+from kiro_crew.acp import evaluator_lock
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -1561,6 +1562,12 @@ class AcpRuntime:
         # (e.g. session/prompt response signals turn completion and must reach the session)
         self._routed_requests: dict[int, str] = {}
         self._session_queues: dict[str, asyncio.Queue[JsonRpcMessage | None]] = {}
+        # codex-sandbox A3: each session's immutable lock identity (fixed at
+        # create/load), the session that emitted each inbound permission
+        # request, and the CODEX_HOME role this process was spawned with.
+        self._lock_identities: dict[str, evaluator_lock.SessionIdentity] = {}
+        self._permission_origins = evaluator_lock.PermissionOrigins()
+        self._codex_role = "n/a"
         # OAuth notifications can precede the session/new or session/load
         # response that reveals which queue to register. Stage only those
         # frames while an init is active, then transfer the matching session's
@@ -2314,6 +2321,21 @@ class AcpRuntime:
             # Called here, before the scrub below, so a host can both add its own
             # variables and remove one this generic path would pass through.
             self._harness.apply_spawn_env(env)
+            # codex-sandbox A3: CODEX_HOME by role. A codex process whose
+            # identity is locked gets the evaluator home (or the spawn fails,
+            # never falling back to ~/.codex); no other codex process may
+            # inherit that home. Nothing is exported to the gateway. Sticky
+            # across respawns: a rekey can add a lock, never drop one.
+            _prev = getattr(self, "_runtime_lock_identity", None)
+            _rt = (
+                evaluator_lock.make_identity(self._acp_backend, self._agent, self._crew_agent)
+                if _prev is None
+                else _prev.tightened(self._agent, self._crew_agent)
+            )
+            self._runtime_lock_identity = _rt
+            self._codex_role = evaluator_lock.apply_role_codex_env(
+                env, self._acp_backend, *_rt.names, *_rt.extra
+            )
 
         await self._to_thread_guarding_sandbox(_resolve_env_off_loop)
         # Parent-side equivalent of the launcher scrub. This is required on
@@ -3873,6 +3895,11 @@ class AcpRuntime:
                 # _answer_ownerless_request below, rather than being left to
                 # hang.
 
+                # codex-sandbox A3: remember which session emitted every
+                # permission request, before any routing/answer path runs.
+                if msg.id is not None and msg.is_method(METHOD_REQUEST_PERMISSION):
+                    self._note_permission_origin(msg)
+
                 # Route notifications by sessionId
                 session_id = (msg.params or {}).get("sessionId")
                 if not session_id and _subagent_list_update and msg.method == _subagent_list_update:
@@ -4524,12 +4551,93 @@ class AcpRuntime:
 
         self._last_activity = time.monotonic()
 
+    # ── codex-sandbox A3: per-session permission lock ──
+
+    def _lock_identity_for(
+        self, agent: str | None, crew_agent: str | None, source: str
+    ) -> "evaluator_lock.SessionIdentity":
+        """The identity a session created/loaded with these arguments RUNS as."""
+        return evaluator_lock.make_identity(
+            self._acp_backend,
+            agent or self._agent,
+            crew_agent if crew_agent is not None else self._crew_agent,
+            source=source,
+        )
+
+    def _refuse_locked_session_on_default_runtime(
+        self, ident: "evaluator_lock.SessionIdentity"
+    ) -> None:
+        """A locked codex session may only run on a process spawned with the
+        evaluator CODEX_HOME (fail-closed: never on a ~/.codex process)."""
+        reason = evaluator_lock.identity_lock_reason(ident)
+        if reason and ident.backend == evaluator_lock.CODEX_BACKEND and self._codex_role != "evaluator":
+            raise AcpRuntimeError(
+                f"refusing a locked evaluator session on a codex process spawned with "
+                f"role {self._codex_role!r} ({reason}); it needs its own evaluator runtime"
+            )
+
+    def _register_lock_identity(
+        self, session_id: str, ident: "evaluator_lock.SessionIdentity"
+    ) -> "evaluator_lock.SessionIdentity":
+        """Register BEFORE the session queue exists, so no permission request of
+        this session can be recorded without it. Re-registration only tightens."""
+        prev = self._lock_identities.get(session_id)
+        merged = ident if prev is None else prev.tightened(*ident.names, *ident.extra)
+        self._lock_identities[session_id] = merged
+        return merged
+
+    def tighten_lock_identity(self, session_id: str, *names: str) -> None:
+        """A later identity observation (warm-pool rekey) may ADD a lock only."""
+        prev = self._lock_identities.get(session_id)
+        if prev is not None:
+            self._lock_identities[session_id] = prev.tightened(*names)
+
+    def _note_permission_origin(self, msg: JsonRpcMessage) -> None:
+        """Record which session emitted an inbound session/request_permission."""
+        params = msg.params if isinstance(msg.params, dict) else {}
+        sid = params.get("sessionId")
+        ident = self._lock_identities.get(sid) if isinstance(sid, str) else None
+        if ident is None and sid in self._subagent_sessions and self._subagent_owner:
+            # A backend-internal child is routed to (and answered by) its owner.
+            ident = self._lock_identities.get(self._subagent_owner)
+        self._permission_origins.record(msg.id, ident)
+
+    def note_permission_answerer(
+        self, request_id: str | int, ident: "evaluator_lock.SessionIdentity | None"
+    ) -> None:
+        """Attribute an UNSEEN request id to the session answering it."""
+        seen, _ = self._permission_origins.lookup(request_id)
+        if not seen and ident is not None:
+            self._permission_origins.record(request_id, ident)
+
+    def permission_lock_reason_for_request(
+        self,
+        request_id: str | int,
+        fallback: "evaluator_lock.SessionIdentity | None" = None,
+    ) -> str | None:
+        return evaluator_lock.request_lock_reason(
+            self._acp_backend,
+            self._permission_origins,
+            list(self._lock_identities.values()),
+            request_id,
+            fallback,
+        )
+
     async def send_response(self, request_id: str | int, result: dict[str, Any]) -> None:
         """Send a JSON-RPC response (for server→client requests like permission)."""
         if not self._process or not self._process.stdin:
             raise AcpRuntimeDead("process not running")
         if self._dead:
             raise AcpRuntimeDead("runtime is dead")
+        # codex-sandbox A3 wire backstop, decided by the identity of the session
+        # that EMITTED this request (not by the runtime's own identity): no ALLOW
+        # leaves for a locked session, whoever the caller is.
+        if evaluator_lock.is_allow_outcome(result):
+            _lock = self.permission_lock_reason_for_request(request_id)
+            if _lock:
+                evaluator_lock.log_lock("AcpRuntime.send_response", request_id, _lock)
+                result = evaluator_lock.CANCELLED_RESULT
+        self._permission_origins.forget(request_id)
 
         msg = {"jsonrpc": "2.0", "id": request_id, "result": result}
         data = json.dumps(msg) + "\n"
@@ -5509,6 +5617,9 @@ class AcpRuntime:
             self._stderr_lines.clear()
         if not self._initialized:
             raise AcpRuntimeError("Runtime not initialized — call spawn() first")
+        # codex-sandbox A3: the identity this session runs as, fixed now.
+        _lock_ident = self._lock_identity_for(agent, crew_agent, "create_session")
+        self._refuse_locked_session_on_default_runtime(_lock_ident)
 
         # Inject the shared gateway's broker stubs unless the caller supplied an
         # explicit list. A session-injected server outranks the same-named entry
@@ -5605,6 +5716,12 @@ class AcpRuntime:
         # ``hoist_managed_servers``). The kiro path returns None here and is
         # untouched.
         kas_agents, mcp_servers = hoist_managed_servers(kas_agents, active_agent, mcp_servers)
+        if evaluator_lock.identity_lock_reason(_lock_ident):
+            # codex-sandbox A3: a locked evaluator session gets NO session MCP
+            # server. (Spawned under its skill-view alias, the projection would
+            # otherwise mount kirocrew-core/kirocrew-cron, whose tools write.)
+            # Its only tools come from its own CODEX_HOME (ro_fs).
+            mcp_servers = []
         # The host's last word on its own tool surface. A host that reads an
         # agent spec passes the list straight back; one that has nothing else
         # describing its tools narrows it to the transports it advertised at
@@ -5901,6 +6018,11 @@ class AcpRuntime:
         staged the frames while this id was unknown: the runtime's in-flight
         scope on the direct path, the collector on an adoption.
         """
+        # codex-sandbox A3: the session's immutable lock identity is registered
+        # BEFORE its queue, so every permission request it emits is attributed.
+        _lock_ident = self._register_lock_identity(
+            session_id, self._lock_identity_for(active_agent, crew_agent, "create_session")
+        )
         # Register session queue
         queue: asyncio.Queue[JsonRpcMessage | None] = asyncio.Queue()
         self._session_queues[session_id] = queue
@@ -5921,6 +6043,7 @@ class AcpRuntime:
             watchdog=_wd,
             crew_agent=_crew,
         )
+        handle._lock_identity = _lock_ident
         handle.memory_mode = memory_mode
         # The token this session's stubs carry, so a later claim (warm-pool
         # rekey) can name THIS session instead of every session on the runtime.
@@ -6205,6 +6328,10 @@ class AcpRuntime:
             raise AcpRuntimeError("Runtime not initialized — call spawn() first")
         if not self._can_load_session:
             raise AcpRuntimeError("Backend does not advertise session/load support")
+        # codex-sandbox A3: same identity rule as create_session (spawn_continue
+        # resumes through here on a fresh runtime).
+        _lock_ident = self._lock_identity_for(agent, crew_agent, "load_session")
+        self._refuse_locked_session_on_default_runtime(_lock_ident)
 
         # Re-declare the pooled broker stubs so a resumed session keeps talking
         # to the broker — same injection as create_session() and the AcpClient
@@ -6276,6 +6403,10 @@ class AcpRuntime:
                     "the DM thread runs as plain chat this session",
                     member_session_key,
                 )
+        if evaluator_lock.identity_lock_reason(_lock_ident):
+            # codex-sandbox A3: a resumed evaluator gets NO session MCP server
+            # either (session/load re-initializes the array).
+            mcp_servers = []
         # Narrowed by the host for the same reason session/new is, and it matters
         # MORE here: session/load re-initializes the session's servers, so a
         # rejected array does not just fail to add tools -- it takes them away from
@@ -6373,6 +6504,8 @@ class AcpRuntime:
         # arriving AFTER this point (from future prompt() calls) reach the queue.
         # The load response itself routes via _pending_requests, not the session
         # queue, so this reorder is safe.
+        # codex-sandbox A3: identity registered before the queue (see _post_new).
+        _lock_ident = self._register_lock_identity(resume_sid, _lock_ident)
         queue: asyncio.Queue[JsonRpcMessage | None] = asyncio.Queue()
         self._session_queues[resume_sid] = queue
         for msg in buffered_init:
@@ -6389,6 +6522,7 @@ class AcpRuntime:
             watchdog=_wd,
             crew_agent=_crew,
         )
+        handle._lock_identity = _lock_ident
         # Mirrors create_session: the resumed session's own stub token.
         handle.stub_session_token = stub_token
         # Mirrors create_session: the resumed session re-declares the array, so it
