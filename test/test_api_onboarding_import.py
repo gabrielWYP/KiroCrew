@@ -14,7 +14,9 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew import onboarding_apply
 from kiro_crew.dashboard import handlers
+from kiro_crew.onboarding_sources import gemini as gemini_source
 
 
 class _AuditLog:
@@ -906,7 +908,10 @@ async def test_scan_never_writes(monkeypatch, tmp_path) -> None:
     def refuse_write(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("preview wrote to a destination")
 
+    # Both bindings: the facade flushes the ledger with it, and the apply owner
+    # writes every destination file through it.
     monkeypatch.setattr(backend, "_write_json", refuse_write)
+    monkeypatch.setattr(onboarding_apply, "_write_json", refuse_write)
     monkeypatch.setattr(backend, "apply_import", refuse_write)
 
     async with TestClient(TestServer(_make_app(module, SimpleNamespace()))) as client:
@@ -1143,7 +1148,7 @@ def test_handler_category_tables_match_the_backend() -> None:
     # rows, where a missing label silently falls back to "General". Pin every
     # category the unsupported-dirs table can emit to a real label.
     assert set(module._CATEGORY_NAMES) >= {
-        category for _, category in backend._GEMINI_UNSUPPORTED_DIRS
+        category for _, category in gemini_source._GEMINI_UNSUPPORTED_DIRS
     }
 
 

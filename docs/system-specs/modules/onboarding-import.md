@@ -29,6 +29,51 @@ Gemini CLI stopped serving Pro/Ultra/free individual accounts on 2026-06-18 and
 Antigravity replaced it, so that one root holds both a displaced Gemini CLI
 user's config and a current Antigravity install.
 
+## Structure and ownership
+
+The engine is four owners behind one facade. Each module imports only the
+modules listed above it in this table, so there is no cycle and any module can be
+the first one a process imports.
+
+| Module | Owns |
+|--------|------|
+| `onboarding_scan.py` | The scan accumulator (`_Scan`), the candidate item (`_Item`, whose `fingerprint` is the identity the ledger and outcomes key on) and `CATEGORY_IDS`. Also: the never-raising probes (`_exists_safe`, `_is_link_like`, `_stat_kind`); bounded, symlink-safe reads (`_safe_regular_file`, `_walk_files`, `_read_bytes`); the parsers (JSON, JSON5, TOML through the `_toml` tomllib/tomli ladder, and YAML through `_load_no_alias_yaml`); the SQLite snapshot helpers, including the hardlink refusal in `_sqlite_database_is_safe`; and the shared content screens: `_sanitize_text`, `_count_secret_fields`, `_decoded_value_is_unsafe`, and the skill activation screen (`_frontmatter`, `_column0_activation_declared`, `_skill_package`, which refuses `triggers`). It is the only module that calls the credential redactor, so it is the "Onboarding import" row of `security_posture._REDACTION_SINKS`. Category-specific refusals (the MCP field allowlist and URL/argument secret checks, the persona identity guard, schedule semantics) sit with their projection in `onboarding_plan.py`. |
+| `onboarding_plan.py` | The normalized plan. It holds the category projections that turn parsed foreign data into `_Item` payloads through those screens (instructions and the identity guard, memories, database directives, MCP specs, skills, schedules, workspaces, settings). It also holds in-scan dedup (`_deduplicate_items`), the per-source summary, the plan document (`_plan_from_scans`), and the readers `apply_import` uses (`_selected_pairs`, `_plan_roots`, …). |
+| `onboarding_sources/` | The package's `__init__.py` is the registry: the builtin descriptors, `_normalize_source`, the per-context cache behind `_sources()`, root and context resolution (`_source_roots`, `_source_context`), failure-isolated dispatch (`_scan_source`), and the managed / superseded MCP name sets. Each adapter module (`codex`, `claude_code`, `gemini`, `openclaw`, `hermes`, `lineage`) knows one layout and reads it only through the two modules above. OpenClaw's bespoke root and context rules and the Hermes `%LOCALAPPDATA%` root live in their adapters. |
+| `onboarding_apply.py` | The file-backed half of apply: the ledger (`_load_ledger`, `_record_ledger`, `_write_json`), the conflict strategies and restore copies, and the writers whose destination is a Kiro Crew file (`_write_workspace`, `_write_settings`, `_write_mcp`, `_write_skill`). |
+| `onboarding_import.py` | The facade and the run-level orchestration: `detect_sources`, `preview_import` / `_preview`, `apply_import` (the rescan, the per-item dispatch loop and the ledger flush discipline), `_source_exists`, and the writers into Kiro Crew's own stores: `_write_instruction`, `_write_memory`, `_write_schedule`. |
+
+Placement rules that are load-bearing:
+
+- **The store writers stay in the facade.** The persistence-switch inventory
+  (`test_persistence_writer_inventory.py`) and the cron probe inventory
+  (`test_cron_store_unreadable_boundaries.py`) name them as
+  `onboarding_import.py::<function>`. The dispatch loop stays beside them rather
+  than behind a writer table.
+- **The Claude Code presence probe stays in the facade.** `_source_exists`
+  accepts a `claude_code` root that is absent when `~/.claude.json` sits beside
+  it; the adapter reads that same file for its configs.
+  `test_agent_sdk_provider_identity.py` pins the `"claude_code"` source-id literal
+  to `onboarding_import.py`, and this probe is where the facade uses it.
+- **Code outside the engine reaches names through the facade.** The dashboard
+  handler, `mcp_cleanup`, the managed-MCP registration tests and the frontmatter
+  tests import them; specs and comments cite others by their
+  `onboarding_import.<name>` path. The facade re-exports each as the owner's own
+  object. `test_onboarding_import_refactor_contract.py` pins the list, pins that
+  each re-export is the owner's object, and pins that the entry points and store
+  writers are defined in the facade itself.
+- **One logger.** Every owner logs through `kiro_crew.onboarding_import`, the
+  name operators and tests filter import warnings on.
+- **Managed MCP names are read from the live registry.** `_scan_source` wires the
+  registry's own `_managed_mcp_names` into `_Scan.managed_mcp_names`. The MCP
+  projection calls it exactly where and as often as it always has, so no
+  projection module imports the registry. A scan built any other way refuses
+  instead of guessing.
+- **Deferred imports stay deferred.** The dashboard MCP sidecar lock,
+  `configured_mcp_aliases` and `CronService` are imported at their one call
+  site. Importing the engine never loads the dashboard, MCP discovery or cron.
+  `mcp_cleanup` in turn imports the facade lazily.
+
 ## Scope: what is migrated
 
 The scope follows the de-facto industry consensus (cross-checked against
