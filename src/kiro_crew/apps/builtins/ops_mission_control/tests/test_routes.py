@@ -26,6 +26,50 @@ from aiohttp import web
 from kiro_crew.apps.builtins.ops_mission_control.backend import models, routes, store
 
 
+def _http_surface_modules() -> list:
+    """``routes`` plus every module of the ``http_routes`` package whose handlers it composes.
+
+    Enumerated from the package directory rather than listed, so a module added there later
+    is scanned by every source guard below without anyone remembering to add it.
+    """
+    import importlib
+
+    package = Path(routes.__file__).parent / "http_routes"
+    modules = [routes]
+    for path in sorted(package.rglob("*.py")):
+        dotted = ".".join(path.relative_to(package).with_suffix("").parts)
+        name = routes.__package__ + ".http_routes"
+        if dotted != "__init__":
+            name += "." + dotted.removesuffix(".__init__")
+        modules.append(importlib.import_module(name))
+    return modules
+
+
+def _http_surface_source() -> str:
+    """The source of the whole HTTP surface: the facade and every projection it composes."""
+    import inspect
+
+    return "\n".join(inspect.getsource(module) for module in _http_surface_modules())
+
+
+def _handler_source(name: str) -> str:
+    """``routes.<name>`` plus the same-named projection it delegates to, when it is a shell.
+
+    A facade handler that forwards to a projection holds none of the code a scan is about,
+    so scanning it alone would pass vacuously. Both are returned, so the scan covers the
+    object the router serves AND the body that does the work.
+    """
+    import inspect
+
+    served = getattr(routes, name)
+    sources = [inspect.getsource(served)]
+    for module in _http_surface_modules()[1:]:
+        projection = getattr(module, name, None)
+        if projection is not None and projection is not served:
+            sources.append(inspect.getsource(projection))
+    return "\n".join(sources)
+
+
 class TestRouteRegistration(unittest.IsolatedAsyncioTestCase):
     async def test_all_routes_are_namespaced_under_the_app(self):
         """A builtin registering outside its own namespace would shadow core APIs."""
@@ -1836,14 +1880,18 @@ class TestTheAutonomyGateIsAChokepoint(unittest.IsolatedAsyncioTestCase):
 
         backend = pathlib.Path(routes.__file__).parent
         offenders = []
-        for path in sorted(backend.glob("*.py")):
+        # `rglob`, not `glob`: the handlers live in `backend/http_routes/`, and a second
+        # caller hidden one directory down is exactly what this must not miss.
+        for path in sorted(backend.rglob("*.py")):
             # `encoding=` is required: these sources contain em-dashes, and a bare `read_text()`
             # decodes as cp1252 on Windows and raises before the assertion can run.
             for lineno, line in enumerate(
                 path.read_text(encoding="utf-8").splitlines(), 1
             ):
                 if re.search(r"\bsink\.execute\(|\.execute\(.*signal", line):
-                    offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+                    offenders.append(
+                        f"{path.relative_to(backend).as_posix()}:{lineno}: {line.strip()}"
+                    )
         self.assertEqual(
             len(offenders),
             1,
@@ -1859,10 +1907,9 @@ class TestTheAutonomyGateIsAChokepoint(unittest.IsolatedAsyncioTestCase):
         A permit built beside the write would be a rubber stamp: the type would still be
         satisfied while no gate had run.
         """
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         # Constructor calls, not the class definition or type annotations.
         constructions = [
             line.strip()
@@ -2094,13 +2141,19 @@ class TestRotationDescribeDoesNotBlockTheLoop(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_no_handler_evaluates_describe_on_the_loop(self):
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         # Code only: the comments explaining the fix necessarily quote the broken shape.
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+        # A floor on what the scan sees, so it cannot pass by finding nothing: `/state`,
+        # `/handover` and `/rotation` each resolve the rotation.
+        self.assertEqual(
+            len(re.findall(r"to_thread\(\s*rotation\.describe", code)),
+            3,
+            "expected the three rotation.describe sites (/state, /handover, /rotation)",
         )
         inline = [
             line.strip()
@@ -2171,10 +2224,9 @@ class TestStatePollDoesNotBlockOnEntryPointDiscovery(unittest.IsolatedAsyncioTes
     """
 
     def test_companion_discovery_is_off_the_loop(self):
-        import inspect
         import re
 
-        source = inspect.getsource(routes._handle_state)
+        source = _handler_source("_handle_state")
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
         )
@@ -2189,6 +2241,7 @@ class TestStatePollDoesNotBlockOnEntryPointDiscovery(unittest.IsolatedAsyncioTes
             [],
             f"companion_summary() scans installed distributions; keep it off-loop: {inline}",
         )
+        self.assertIn("companion_summary", code, "the scan must see the /state call it guards")
 
     async def test_a_slow_entry_point_scan_does_not_stall_the_loop(self):
         import asyncio
@@ -2316,9 +2369,8 @@ class TestOutboundNotesAreRedacted(unittest.IsolatedAsyncioTestCase):
 
     def test_redaction_happens_before_the_length_clip(self):
         """Clipping first could sever a token so the pattern does not match."""
-        import inspect
 
-        source = inspect.getsource(routes._handle_action)
+        source = _handler_source("_handle_action")
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
         )
@@ -2334,12 +2386,17 @@ class TestOutboundNotesAreRedacted(unittest.IsolatedAsyncioTestCase):
 
     def test_no_outbound_note_bypasses_the_floor(self):
         """Guards the class, not just the two sites — the URL slip taught that lesson."""
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+        # The action note, the drafted proposal note and the approved proposal's stored note.
+        self.assertGreaterEqual(
+            len(re.findall(r'(body|proposal)\.get\(\s*"note"', code)),
+            3,
+            "the scan must see every note heading to a provider",
         )
         raw = [
             ln.strip()
@@ -2568,7 +2625,7 @@ class TestOnlyOneApprovalCanWin(unittest.IsolatedAsyncioTestCase):
 
 
 class TestNoHandlerParsesAStoredFileOnTheLoop(unittest.IsolatedAsyncioTestCase):
-    """Every store/ledger read in `routes.py` must go through `asyncio.to_thread`.
+    """Every store/ledger read on the HTTP surface must go through `asyncio.to_thread`.
 
     These helpers parse a JSON/JSONL file whose size grows with use, and they sit on POLLED
     endpoints. Measured in this environment:
@@ -2742,10 +2799,16 @@ class TestNoHandlerParsesAStoredFileOnTheLoop(unittest.IsolatedAsyncioTestCase):
         rotation.describe(shift))` — and reads as fixed at a glance, which is why it needs
         its own check.
         """
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
+        # A floor, so the scan cannot pass by finding nothing: the three `rotation.describe`
+        # hops are `to_thread` lines this guard reads on every run.
+        self.assertGreaterEqual(
+            len(re.findall(r"to_thread\(\s*rotation\.describe", source)),
+            3,
+            "the scan must see the surface's to_thread calls",
+        )
         offenders = []
         for lineno, line in enumerate(source.splitlines(), 1):
             if line.strip().startswith("#") or "to_thread(" not in line:
@@ -2787,10 +2850,13 @@ class TestNoHandlerParsesAStoredFileOnTheLoop(unittest.IsolatedAsyncioTestCase):
 
         Fails against the pre-fix source, which had both helpers inside `to_thread(...)`.
         """
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
+        # The transition handler calls both of these on the loop; a scan that cannot find
+        # them is not checking them.
+        for helper in self.LOOP_OWNED_STATE_HELPERS[:2]:
+            self.assertRegex(source, rf"\b{re.escape(helper)}\(", f"{helper} is not on the surface")
         offenders = []
         for lineno, line in enumerate(source.splitlines(), 1):
             if line.strip().startswith("#") or "to_thread(" not in line:
@@ -2917,9 +2983,8 @@ class TestManualClaimResolvesTheSignalServerSide(unittest.IsolatedAsyncioTestCas
 
     def test_the_route_does_not_authorize_against_the_request_body(self):
         """Structural: the claimed signal must come from poll_all, not Signal.from_dict."""
-        import inspect
 
-        source = inspect.getsource(routes._handle_claim)
+        source = _handler_source("_handle_claim")
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
         )
@@ -3035,12 +3100,12 @@ class TestTheSlotKeyIsDerivedNotTrusted(unittest.TestCase):
         A behavioural test would need a live slot registry; what actually matters is that the
         field is never consulted, so that is asserted directly.
         """
-        import inspect
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
         )
+        self.assertIn("canonical_slot_key(", code, "the scan must see the key derivation")
         self.assertNotIn(
             "inc.slot_key",
             code,
@@ -3271,10 +3336,9 @@ class TestApprovedProposalSchedulesVerification(unittest.IsolatedAsyncioTestCase
         expression to `_schedule_verification` — a future edit to one has to touch the other or
         this fails. Cheaper than discovering the drift from a false ledger miss.
         """
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         calls = re.findall(r"_schedule_verification,\s*(.*?)\)", source, re.DOTALL)
         # The `def` line has no `incident` argument name; keep only the two call sites.
         arg_blobs = [c for c in calls if "incident" in c]
