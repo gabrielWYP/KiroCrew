@@ -32,6 +32,23 @@ def resolved_row_identity(slot: Any) -> str:
     return str(getattr(slot, "key", "") or "")
 
 
+def live_trust_scope(slot: Any) -> str:
+    """The slot's ``SafetyOverride`` scoped-grant key while that grant is live, else "".
+
+    Display only. It answers whether the scope the slot carries still has time on
+    it, through ``scope_remaining_secs`` -- a pure read -- because this runs on
+    every slots poll and must never expire a grant or write a SEL record. The
+    approval paths decide through ``is_scope_active``; nothing reads this value
+    back into ``_trust`` or into a stored approval policy.
+    """
+    scope = str(getattr(slot, "_trust_scope", "") or "")
+    if not scope:
+        return ""
+    from kiro_crew.safety_override import safety_override
+
+    return scope if safety_override().scope_remaining_secs(scope) > 0 else ""
+
+
 class SlotProjection:
     """Build cached source links and the public summary of a slot.
 
@@ -340,6 +357,7 @@ class SlotProjection:
             "options": [redact(option) for option in options],
             "prompt_preview": prompt_preview,
             "trust": slot._trust,
+            "trust_scope": live_trust_scope(slot),
             "trust_reads": slot._trust_reads,
             "trusted_patterns_count": len(slot._trusted_patterns),
             "slack_linked": slot._slack_linked,

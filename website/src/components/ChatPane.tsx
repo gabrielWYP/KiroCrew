@@ -79,6 +79,7 @@ import { classifyDrop } from '../utils/dropClassify'
 import { prepareSendPayload, serializeDirTokens, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
 import { Composer, type ComposerHandle, type ComposerVoiceOptions } from '../chat-core/composer/Composer'
 import { displayModel } from '../lib/model'
+import { slotApprovalMode } from '../utils/slotApprovalMode'
 
 
 import { i18nT } from '../i18n/t'
@@ -404,7 +405,7 @@ export default function ChatPane({
   )
   const approvalMode = useAppSelector((s) => s.dashboard.approvalMode)
   const title = paneSlot?.title || slotKey
-  const displayMode = approvalMode === 'yolo' ? 'yolo' : paneSlot?.trust ? 'trust' : paneSlot?.trust_reads ? 'trust_reads' : 'normal'
+  const displayMode = slotApprovalMode(approvalMode, paneSlot)
   // Queued messages render in the QueueStack, not inline in the message list.
   // System injections are excluded from the interactive stack (isNonInteractiveQueued):
   // sub-agent deliveries collapse into one progress line, and synthetic

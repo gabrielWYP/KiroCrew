@@ -116,8 +116,10 @@ from kiro_crew.dashboard import cautious_boot, start_dashboard
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_runner import (
     _arm_queued_delivery_settlement,
+    _auto_approve_reason,
     _resolve_channel_target,
     _run_chat,
+    _slot_is_trusted,
 )
 from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
@@ -2701,7 +2703,14 @@ class GatewayOrchestrator:
 
                 if _parent_slot_key:
                     _ps = (self.dashboard_state._slots or {}).get(_parent_slot_key)
-                    if _ps and _ps._trust and not _child_grant_eligible:
+                    # The same verdict the slot's own tool approvals take: the
+                    # human's session flag OR a live SafetyOverride scoped grant,
+                    # re-checked here per request and never renewed from here.
+                    _ps_trusted = bool(_ps) and _slot_is_trusted(_ps)
+                    _ps_via_scope = (
+                        _ps_trusted and _auto_approve_reason(_ps, False) == "trust_scope"
+                    )
+                    if _ps_trusted and not _child_grant_eligible:
                         # Slot IS trusted; the fidelity gate is what blocks
                         # the auto-approve. A distinct audit reason — an
                         # auditor reading "not_trusted" for a trusted slot
@@ -2712,7 +2721,15 @@ class GatewayOrchestrator:
                             outcome="not_auto_approved",
                             resources=_safe_title,
                         )
-                    elif _ps and _ps._trust:
+                    elif _ps_via_scope:
+                        _sel_log(
+                            caller=f"slot:{_parent_slot_key}",
+                            operation=f"{source}.trust_scope_auto_approve",
+                            outcome="ok",
+                            resources=f"scope:{getattr(_ps, '_trust_scope', '')} {_safe_title}",
+                        )
+                        return True
+                    elif _ps_trusted:
                         _sel_log(
                             caller=f"slot:{_parent_slot_key}",
                             operation=f"{source}.scoped_trust_auto_approve",
