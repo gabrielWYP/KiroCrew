@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 # letting them overflow deeper in the scheduler.
 _MAX_RECURRENCE_MINUTES = 10 * 366 * 24 * 60
 
+# A reminder is a sentence, and a fire copies its text into the persisted pending
+# queue, so an unbounded text could push the store past its load cap and wedge every tick.
+_MAX_TEXT_CHARS = 500
+
 APP_NAME = "crew-companion"
 _BASE = f"/api/apps/{APP_NAME}"
 
@@ -159,6 +163,14 @@ async def _handle_pending_get(request: web.Request) -> web.StreamResponse:
 # ── writes ──────────────────────────────────────────────────────────────────
 
 
+def _text_error(text: Any) -> web.Response | None:
+    if not isinstance(text, str) or not text.strip():
+        return _bad_request("text is required", "text_required")
+    if len(text) > _MAX_TEXT_CHARS:
+        return _bad_request("text is too long", "text_too_long")
+    return None
+
+
 async def _handle_add(request: web.Request) -> web.StreamResponse:
     """Store an already-resolved reminder.
 
@@ -173,8 +185,8 @@ async def _handle_add(request: web.Request) -> web.StreamResponse:
 
     text = body.get("text")
     fire_at = body.get("fireAt")
-    if not isinstance(text, str) or not text.strip():
-        return _bad_request("text is required", "text_required")
+    if (bad := _text_error(text)) is not None:
+        return bad
     if not isinstance(fire_at, str) or not fire_at.strip():
         return _bad_request("fireAt is required", "fire_at_required")
 
@@ -195,7 +207,7 @@ async def _handle_add(request: web.Request) -> web.StreamResponse:
 
     try:
         result = await asyncio.to_thread(
-            store.add, text, fire_at, int(every) if every else None
+            store.add, str(text), fire_at, int(every) if every else None
         )
     except ValueError as exc:
         return _bad_request(str(exc), "invalid_reminder")
@@ -209,6 +221,21 @@ async def _handle_remove(request: web.Request) -> web.StreamResponse:
     if not isinstance(ident, str) or not ident:
         return _bad_request("id is required", "id_required")
     return web.json_response(await asyncio.to_thread(store.remove, ident))
+
+
+async def _handle_update(request: web.Request) -> web.StreamResponse:
+    store = get_store()
+    assert store is not None
+    body = await _body(request)
+    ident, text = body.get("id"), body.get("text")
+    if not isinstance(ident, str) or not ident:
+        return _bad_request("id is required", "id_required")
+    if (bad := _text_error(text)) is not None:
+        return bad
+    result = await asyncio.to_thread(store.update, ident, str(text))
+    if not result["ok"]:
+        return web.json_response({"error": "not found", "code": "reminder_not_found"}, status=404)
+    return web.json_response(result)
 
 
 async def _handle_skip(request: web.Request) -> web.StreamResponse:
@@ -375,6 +402,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post(f"{_BASE}/reminders/add", _require_enabled(_handle_add))
     app.router.add_post(f"{_BASE}/reminders/remove", _require_enabled(_handle_remove))
     app.router.add_post(f"{_BASE}/reminders/skip", _require_enabled(_handle_skip))
+    app.router.add_post(f"{_BASE}/reminders/update", _require_enabled(_handle_update))
     app.router.add_post(f"{_BASE}/reminders/config", _require_enabled(_handle_config))
     app.router.add_get(f"{_BASE}/stats", _require_enabled(_handle_stats_get))
     app.router.add_get(f"{_BASE}/pending", _require_enabled(_handle_pending_get))

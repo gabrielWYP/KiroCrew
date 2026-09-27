@@ -497,6 +497,21 @@ class CompanionStore:
                 self._save_locked()
         return {"ok": found}
 
+    def update(self, ident: str, text: str) -> dict[str, Any]:
+        cleaned = text.strip()
+        if not cleaned:
+            raise ValueError("text is required")
+        with self._lock:
+            rows = self._state.reminders.reminders
+            if not any(r.id == ident for r in rows):
+                return {"ok": False}
+            edited = tuple(replace(r, text=cleaned) if r.id == ident else r for r in rows)
+            self._state = replace(
+                self._state, reminders=replace(self._state.reminders, reminders=edited)
+            )
+            self._save_locked()
+        return {"ok": True}
+
     def skip(self, ident: str) -> dict[str, Any]:
         """Push a recurring reminder past its next occurrence. No-op for one-time."""
         with self._lock:

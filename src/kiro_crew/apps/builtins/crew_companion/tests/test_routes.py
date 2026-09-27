@@ -120,6 +120,7 @@ class TestGate:
                 ("post", f"{BASE}/reminders/add"),
                 ("post", f"{BASE}/reminders/remove"),
                 ("post", f"{BASE}/reminders/skip"),
+                ("post", f"{BASE}/reminders/update"),
                 ("post", f"{BASE}/reminders/config"),
                 ("post", f"{BASE}/presence"),
                 ("post", f"{BASE}/breathing-done"),
@@ -152,6 +153,52 @@ class TestReminderRoundTrip:
             assert (await r.json())["ok"] is True
             rows = (await (await client.get(f"{BASE}/reminders")).json())["reminders"]
             assert rows == []
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_update_changes_only_the_text(self, enabled, store):
+        client = await _client()
+        try:
+            fire_at = to_iso(NOW + timedelta(hours=1))
+            r = await client.post(
+                f"{BASE}/reminders/add",
+                json={"text": "drink watr", "fireAt": fire_at, "everyMinutes": 60},
+            )
+            ident = (await r.json())["id"]
+
+            r = await client.post(
+                f"{BASE}/reminders/update", json={"id": ident, "text": "  drink water "}
+            )
+            assert r.status == 200
+            assert (await r.json())["ok"] is True
+            [row] = (await (await client.get(f"{BASE}/reminders")).json())["reminders"]
+            assert row["text"] == "drink water"
+            assert row["fireAt"] == fire_at
+            assert row["recurrence"] == {"everyMinutes": 60}
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_empty_text_and_unknown_ids(self, enabled, store):
+        client = await _client()
+        try:
+            r = await client.post(f"{BASE}/reminders/add", json={"text": "a", "fireAt": to_iso(NOW)})
+            ident = (await r.json())["id"]
+            r = await client.post(f"{BASE}/reminders/update", json={"id": ident, "text": " "})
+            assert r.status == 400
+            assert (await r.json())["code"] == "text_required"
+            r = await client.post(
+                f"{BASE}/reminders/update", json={"id": ident, "text": "x" * 501}
+            )
+            assert (await r.json())["code"] == "text_too_long"
+            r = await client.post(f"{BASE}/reminders/update", json={"text": "b"})
+            assert (await r.json())["code"] == "id_required"
+            r = await client.post(f"{BASE}/reminders/update", json={"id": "nope", "text": "b"})
+            assert r.status == 404
+            assert (await r.json())["code"] == "reminder_not_found"
+            rows = (await (await client.get(f"{BASE}/reminders")).json())["reminders"]
+            assert [x["text"] for x in rows] == ["a"]
         finally:
             await client.close()
 
