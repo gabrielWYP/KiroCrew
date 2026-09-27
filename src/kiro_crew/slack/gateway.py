@@ -381,6 +381,7 @@ if TYPE_CHECKING:
     from kiro_crew.memory_startup import MemoryStartup
     from kiro_crew.messaging.registry import ChannelDescriptor
     from kiro_crew.providers.base import LLMProvider
+    from kiro_crew.slack.events import SeenCache
     from kiro_crew.subagent_scale import SubagentEventCoalescer
     from kiro_crew.task_models import Task
     from kiro_crew.teams.client import TeamsClient
@@ -2094,6 +2095,13 @@ class GatewayOrchestrator:
         self._session_tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         self._pending_queue: dict[str, list] = {}
         self._socket_client: WSSocketModeClient | None = None
+        # Slack reconnect (POST /api/slack/reconnect -> ``reconnect_slack``):
+        # the boot-time dedup cache is kept so a reconnect keeps dropping the
+        # envelopes Slack redelivers across the handshake, and one in-flight
+        # reconnect is shared by every concurrent caller (a double-click must
+        # not race two Socket Mode handshakes against one client slot).
+        self._slack_seen: SeenCache | None = None
+        self._slack_reconnect_task: asyncio.Task[dict[str, object]] | None = None
         self._wecom_client: "WeComClient | None" = None  # set by maybe_start_wecom
         # Registry-owned live channel handles ({channel_type: client}). The
         # per-channel _<type>_client attributes are legacy mirrors kept in sync
@@ -11276,6 +11284,11 @@ class GatewayOrchestrator:
             self.dashboard_state.slack_client = self.slack
         if self.dashboard_state:
             self.dashboard_state.no_crons = self._no_crons  # dashboard mode
+            # POST /api/slack/reconnect reaches the socket owner through this
+            # callback, the same seam the MCP-gateway handlers use: the handler
+            # runs on the gateway loop, so awaiting it here keeps
+            # ``init_socket_mode`` on the loop that owns the socket client.
+            self.dashboard_state._slack_reconnect = self.reconnect_slack
 
     async def _init_api_server(self) -> None:
         """Start a minimal API-only HTTP server for MCP tool transport."""
@@ -13748,7 +13761,8 @@ class GatewayOrchestrator:
         dashboard, cron, and task runner keep running in dashboard-only mode.
 
         ponytail: no background retry of the initial connect — Slack DM stays
-        disabled until the next gateway restart.
+        disabled until the operator reconnects (``reconnect_slack``, behind
+        ``POST /api/slack/reconnect``) or the gateway restarts.
 
         Slack is a GOVERNED transport like every other channel: a ``channels``
         policy that denies ``slack`` must stop it from CONNECTING, not merely drop
@@ -13793,6 +13807,123 @@ class GatewayOrchestrator:
                 "(check network/proxy; details in gateway.log)"
             )
             return False
+
+    async def reconnect_slack(self) -> dict[str, object]:
+        """Re-run the Slack Socket Mode handshake from the saved credentials.
+
+        The in-process equivalent of a gateway restart for the Slack socket,
+        behind ``POST /api/slack/reconnect``. Slack is host-managed rather than
+        a registry channel: its tokens live in the credential store, which the
+        config watcher never watches, and ``__init__`` is the only place that
+        reads them -- so a token or owner ID saved from the dashboard could
+        previously take effect only through ``POST /api/restart``, which
+        ``execv``s the gateway and tears down every in-flight run.
+
+        Order, and why (``_reconnect_slack_once``):
+
+        1. Re-read the credential store (off-loop: it reads ``.env``) BEFORE
+           touching the live client, so a store that cannot be read leaves the
+           current connection exactly as it was and the caller gets the error.
+        2. Close the old socket client (bounded) and forget it: a second
+           client on the same app token would compete for the same envelopes.
+        3. Reassign ``_app_token`` / ``_bot_token`` / ``_owner_id`` /
+           ``_allowed_users`` and RECOMPUTE ``_slack_enabled`` from the tokens
+           now on disk. ``init_socket_mode`` early-returns on a stale False and
+           its own failure paths set it False, so without this step a retry
+           after any earlier failure is a silent no-op.
+        4. Rebuild the Web API client (``self.slack`` and the dashboard
+           mirror) on the current bot token.
+        5. Await ``init_socket_mode`` and ``_connect_slack`` ON THIS LOOP,
+           never offloaded: ``WSSocketModeClient.__init__`` needs a current
+           event loop in the constructing thread.
+        6. Record the outcome where the settings badge reads it.
+
+        Concurrent callers share ONE in-flight attempt: a request arriving
+        mid-handshake awaits the running task and returns its result instead of
+        racing a second handshake against the same client slot, and the shield
+        keeps a cancelled HTTP request from cancelling the shared attempt.
+        Returns the ``connected`` / ``connect_error`` pair ``GET
+        /api/slack/config`` reports (plus ``configured``) so the panel renders
+        both from one vocabulary. Raises when the credential store cannot be
+        read.
+        """
+        running = getattr(self, "_slack_reconnect_task", None)
+        if running is not None and not running.done():
+            return await asyncio.shield(running)
+        task = asyncio.create_task(self._reconnect_slack_once())
+        self._slack_reconnect_task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if self._slack_reconnect_task is task and task.done():
+                self._slack_reconnect_task = None
+
+    async def _reconnect_slack_once(self) -> dict[str, object]:
+        """One reconnect attempt; see ``reconnect_slack`` for the ordering."""
+        from kiro_crew.slack.events import SeenCache, init_socket_mode
+
+        # 1. Read first: an unreadable store must not cost the live connection.
+        creds = await asyncio.to_thread(self._cfg.load_credentials)
+
+        # 2. Tear down the old client. Bounded like shutdown's close and
+        # best-effort: a client whose websocket is already gone must not stop
+        # the new handshake.
+        old = self._socket_client
+        self._socket_client = None
+        if old is not None:
+            try:
+                await asyncio.wait_for(old.close(), timeout=2.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "slack reconnect: closing the previous socket client failed", exc_info=True
+                )
+
+        # 3. Hoist the current credentials -- the same assignments __init__ makes.
+        self._app_token = creds.get(CRED_SLACK_APP_TOKEN, "")
+        self._bot_token = creds.get(CRED_SLACK_BOT_TOKEN, "")
+        self._owner_id = creds.get(CRED_OWNER_ID, "")
+        self._allowed_users = {self._owner_id} if self._owner_id else set()
+        self._slack_enabled = bool(self._app_token and self._bot_token)
+        self._slack_connect_error = ""
+
+        # 4. Web API client on the current bot token; the dashboard mirror follows.
+        self.slack = RealSlackClient(self._bot_token) if self._slack_enabled else None
+        if self.dashboard_state is not None:
+            self.dashboard_state.slack_client = self.slack
+
+        connected = False
+        if not self._slack_enabled:
+            self._slack_connect_error = "tokens_missing"
+        else:
+            seen = getattr(self, "_slack_seen", None)
+            if seen is None:
+                seen = self._slack_seen = SeenCache()
+            # 5. On the loop, never offloaded (see reconnect_slack).
+            await init_socket_mode(self, seen)
+            if self._socket_client is None:
+                # init_socket_mode declined -- owner ID missing, or the
+                # workspace failed enterprise validation. It logged the
+                # reason; name it for the badge.
+                self._slack_connect_error = (
+                    "owner_id_missing" if not self._owner_id else "enterprise_validation_failed"
+                )
+            else:
+                connected = await self._connect_slack()
+                if not connected and not self._slack_connect_error:
+                    # The channels governance gate drops the client silently.
+                    self._slack_connect_error = "denied_by_policy"
+
+        # 6. Record where GET /api/slack/config reads it.
+        if self.dashboard_state is not None:
+            self.dashboard_state.slack_socket_connected = connected
+            self.dashboard_state.slack_connect_error = self._slack_connect_error
+        return {
+            "connected": connected,
+            "connect_error": self._slack_connect_error,
+            "configured": bool(self._app_token and self._bot_token and self._owner_id),
+        }
 
     def _write_marker_worker(self, run_marker: Any, port: int) -> None:
         """Write the run marker; self-clear if shutdown flagged a clear.
@@ -13939,6 +14070,9 @@ class GatewayOrchestrator:
         await cautious_boot.initialize()
 
         seen = SeenCache()
+        # Shared with ``reconnect_slack`` so a re-handshake keeps the dedup
+        # history of the connection it replaces.
+        self._slack_seen = seen
         await self._init_services()
 
         # Wire in-process embeddings (always-on) and kick background model download

@@ -86,7 +86,7 @@ function config(over: Partial<SlackConfigData> = {}): SlackConfigData {
   }
 }
 
-const OK: SaveResult = { ok: true, restart_required: false, verify_warning: '' }
+const OK: SaveResult = { ok: true, restart_required: false, reconnect_required: false, verify_warning: '' }
 
 interface SeedOpts {
   /** Fail the manifest query instead of resolving it. */
@@ -162,7 +162,7 @@ describe('SlackPanel connection status', () => {
     seed({ connected: true })
     await hydrated()
     expect(screen.getByText('Connected')).toBeInTheDocument()
-    expect(screen.queryByText(/Restart the gateway to connect/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Click Reconnect to connect/)).not.toBeInTheDocument()
   })
 
   it('reads Needs setup when no credentials are configured yet', async () => {
@@ -172,12 +172,12 @@ describe('SlackPanel connection status', () => {
     expect(screen.queryByText(/not yet active/)).not.toBeInTheDocument()
   })
 
-  it('explains a saved-but-inactive channel as needing a restart', async () => {
+  it('explains a saved-but-inactive channel as needing a reconnect', async () => {
     seed()
     await hydrated()
     expect(screen.getByText('Not connected')).toBeInTheDocument()
     expect(
-      screen.getByText('Tokens are saved but not yet active. Restart the gateway to connect.'),
+      screen.getByText('Tokens are saved but not yet active. Click Reconnect to connect.'),
     ).toBeInTheDocument()
   })
 
@@ -190,7 +190,115 @@ describe('SlackPanel connection status', () => {
   it('surfaces any other startup failure with its own error string', async () => {
     seed({ connect_error: 'dns_failure' })
     await hydrated()
-    expect(screen.getByText(/Slack connection failed at startup \(dns_failure\)/)).toBeInTheDocument()
+    expect(screen.getByText(/Slack connection failed \(dns_failure\)/)).toBeInTheDocument()
+  })
+})
+
+/* ── reconnect ────────────────────────────────────────────────────────────── */
+
+type ReconnectResult = Awaited<ReturnType<typeof api.reconnectSlack>>
+
+/** The reconnect button, present only on a writable session. */
+function reconnectBtn() {
+  return screen.getByRole('button', { name: /^Reconnect$/ })
+}
+
+describe('SlackPanel reconnect', () => {
+  it('re-runs the handshake in place and confirms the connection', async () => {
+    seed()
+    const reconnect = vi
+      .spyOn(api, 'reconnectSlack')
+      .mockResolvedValue({ connected: true, connect_error: '', configured: true })
+    await hydrated()
+    // The saved-but-inactive hint is what the button answers.
+    expect(screen.getByText(/Click Reconnect to connect/)).toBeInTheDocument()
+
+    fireEvent.click(reconnectBtn())
+
+    await waitFor(() => expect(reconnect).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText('Connected to Slack.')).toBeInTheDocument()
+    // The outcome supersedes the hint; the badge follows the refetched GET.
+    expect(screen.queryByText(/Click Reconnect to connect/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('shows a pending label and disables the button while the handshake runs', async () => {
+    seed()
+    let settle: (v: ReconnectResult) => void = () => {}
+    vi.spyOn(api, 'reconnectSlack').mockReturnValue(new Promise<ReconnectResult>(r => { settle = r }))
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const pending = await screen.findByRole('button', { name: 'Reconnecting…' })
+    expect(pending).toBeDisabled()
+    // A second click mid-flight is inert: the disabled button never fires.
+    fireEvent.click(pending)
+    expect(api.reconnectSlack).toHaveBeenCalledTimes(1)
+
+    await act(async () => { settle({ connected: true, connect_error: '', configured: true }) })
+    expect(await screen.findByRole('button', { name: 'Reconnect' })).toBeEnabled()
+  })
+
+  it('explains a rejected reconnect inside the panel, in the same words as a startup failure', async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'invalid_auth', configured: true })
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const notice = await screen.findByRole('alert')
+    expect(notice).toHaveTextContent(/Slack rejected the stored tokens \(invalid_auth\)/)
+    expect(notice).toHaveTextContent(/then click Reconnect/)
+    expect(screen.queryByText('Connected to Slack.')).not.toBeInTheDocument()
+  })
+
+  it('names the gateway-side reasons a reconnect declines', async () => {
+    seed({ configured: false })
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'owner_id_missing', configured: false })
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/owner Slack member ID is missing/)
+  })
+
+  it('tells a transport failure apart from a reconnect that ran and failed', async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockRejectedValue(new Error('{"error":"Slack reconnect unavailable"}'))
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Slack reconnect unavailable')
+  })
+
+  it('falls back to a plain-language transport error when the body is not JSON', async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockRejectedValue(new Error(''))
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Reconnect failed. Is the gateway running?')
+  })
+
+  it('is hidden on a read-only remote session, like Save', async () => {
+    seed({ read_only: true })
+    await hydrated()
+    expect(screen.queryByRole('button', { name: /Reconnect/ })).not.toBeInTheDocument()
+  })
+
+  it('points a saved credential change at Reconnect, not at a restart', async () => {
+    seed({}, { save: { ok: true, restart_required: false, reconnect_required: true, verify_warning: '' } })
+    await hydrated()
+
+    fireEvent.click(saveBtn())
+
+    expect(
+      await screen.findByText('Saved. Click Reconnect to apply.', undefined, { timeout: 5_000 }),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/Restart the gateway/)).not.toBeInTheDocument()
   })
 })
 
@@ -406,7 +514,8 @@ describe('SlackPanel save payload', () => {
   })
 
   it('sends pasted credentials and confirms they were verified with Slack', async () => {
-    const { save } = seed({}, { save: { ok: true, restart_required: true, verify_warning: '' } })
+    // A credential write is applied by Reconnect (reconnect_required), never a restart.
+    const { save } = seed({}, { save: { ok: true, restart_required: false, reconnect_required: true, verify_warning: '' } })
     await hydrated()
 
     fireEvent.change(screen.getByLabelText('Slack bot token'), { target: { value: ' xoxb-not-a-real-value ' } })
@@ -419,7 +528,7 @@ describe('SlackPanel save payload', () => {
       app_token: 'xapp-not-a-real-value',
     })
     expect(
-      await screen.findByText('Verified with Slack and saved. Restart the gateway to connect.', undefined, {
+      await screen.findByText('Verified with Slack and saved. Click Reconnect to connect.', undefined, {
         timeout: 5_000,
       }),
     ).toBeInTheDocument()
@@ -440,7 +549,7 @@ describe('SlackPanel save payload', () => {
   it('omits the restart hint when a verified save applied live', async () => {
     // restart_required=false is the hot-reload path: the tokens verified AND
     // the channel is already running them, so a restart claim would be a lie.
-    const { save } = seed({}, { save: { ok: true, restart_required: false, verify_warning: '' } })
+    const { save } = seed({}, { save: { ok: true, restart_required: false, reconnect_required: false, verify_warning: '' } })
     await hydrated()
 
     fireEvent.change(screen.getByLabelText('Slack bot token'), { target: { value: 'xoxb-not-a-real-value' } })
@@ -454,12 +563,13 @@ describe('SlackPanel save payload', () => {
     // the restart-flavoured verified text must not also render (a separate
     // channel-not-running banner may legitimately mention a restart)
     expect(
-      screen.queryByText('Verified with Slack and saved. Restart the gateway to connect.'),
+      screen.queryByText('Verified with Slack and saved. Click Reconnect to connect.'),
     ).not.toBeInTheDocument()
   })
 
   it('reports a restart-only save when nothing was verified', async () => {
-    seed({}, { save: { ok: true, restart_required: true, verify_warning: '' } })
+    // restart_required alone is the slash-command path (the one boot-read field).
+    seed({}, { save: { ok: true, restart_required: true, reconnect_required: false, verify_warning: '' } })
     await hydrated()
 
     fireEvent.click(saveBtn())
@@ -471,7 +581,7 @@ describe('SlackPanel save payload', () => {
   it('shows the verify warning alongside the saved pill and withholds the verified claim', async () => {
     seed(
       {},
-      { save: { ok: true, restart_required: false, verify_warning: 'App-level credential not checked.' } },
+      { save: { ok: true, restart_required: false, reconnect_required: false, verify_warning: 'App-level credential not checked.' } },
     )
     await hydrated()
 
