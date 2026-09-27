@@ -31,6 +31,7 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_VALUE,
 )
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
+from kiro_crew.runtime_ownership import PidRefcount, authorize_runtime_kill
 
 logger = logging.getLogger(__name__)
 
@@ -1966,6 +1967,7 @@ def _sync_kill_provider(provider: object) -> None:
     leaves carry ``LLMProvider = Any`` runtime stubs and why this module reaches
     acp.client through function-local imports.  ``test_agent_lifecycle_cycle.py``
     pins the absence; keep this leaf ignorant of the agent layer.
+
     """
     # ACP provider: long-lived process via client._pid
     client = getattr(provider, "_client", None)
@@ -1991,6 +1993,36 @@ def _sync_kill_provider(provider: object) -> None:
     # excludes the kill(0)/kill(-n) process-group semantics outright.
     if not isinstance(pid, int) or pid <= 1:
         logger.debug("_sync_kill_provider: refusing to signal invalid pid %r", pid)
+        return
+    # Asked ONCE, here, before any signal. Everything below is one careful
+    # escalation -- a group resolved while the leader was alive, a SIGTERM grace,
+    # a recorded descendant sweep -- and asking per signal would both write the
+    # same shot three times and leave a window where the answer changed
+    # mid-escalation.
+    #
+    # This is the ONE gate every hard kill of a provider passes: all three
+    # ``_dispatch_hard_kill`` implementations (the facade's static seam, the
+    # allocator's, and the warm pool's) resolve their killer through
+    # ``get_sync_kill_provider()``, and the dashboard's reset-all fallback calls
+    # this function directly.
+    #
+    # A caller legitimately ending this runtime releases its lease first. The
+    # owning provider does so as the first statement of its shutdown's owning
+    # branch -- a plain statement, not a ``finally``, so a shutdown cancelled
+    # BEFORE it has no release and this gate would refuse the cleanup that
+    # follows. The two paths where that is reachable release explicitly:
+    # ``session_allocation``'s handler that spans registration, and the
+    # dashboard's reset-all timeout arm.
+    #
+    # At ``cap=1`` a refusal therefore does NOT mean a second tenant exists --
+    # one runtime has one owning session. It means a lease outlived the session
+    # that took it, so read a ``REFUSED`` line as a release site that did not
+    # run, not as a near miss the gate handled.
+    if not authorize_runtime_kill(
+        pid,
+        reason="leaked provider teardown",
+        caller="session_pid._sync_kill_provider",
+    ):
         return
     # Deny-by-default on the ROOT's own identity -- but only where the pid can go
     # stale. ``_client._pid`` is a RECORDED number that outlives a failed start, so
@@ -2917,7 +2949,14 @@ def _untrack_session_pid(pid: int) -> bool:
 # Live agent-process PIDs tracked in the PID file but NOT registered as
 # SessionMap sessions (e.g. app-managed worker pools / shared ACP runtimes).
 # The periodic orphan sweep consults _protected_pids() to avoid killing them.
-_PROTECTED_PIDS: set[int] = set()
+#
+# COUNTED, not listed. Several independent holders shield one pid -- an
+# app-managed worker pool, the knowledge LLM pool, a shared ACP runtime -- and
+# each pairs its own register with its own unregister. As a plain set the first
+# holder to leave tore the shield off a process the others were still using, and
+# the sweep then reaped a live runtime. A pid stays shielded until the LAST
+# holder drops it.
+_PROTECTED_PIDS: PidRefcount = PidRefcount()
 _PROTECTED_LOCK = threading.Lock()
 
 
@@ -2926,14 +2965,20 @@ def register_protected_pid(pid: int) -> None:
 
     For app-managed worker pools whose processes are tracked in the PID file but
     not registered as SessionMap sessions. Pair every call with
-    ``unregister_protected_pid`` on worker shutdown/replacement."""
+    ``unregister_protected_pid`` on worker shutdown/replacement -- the shield is
+    reference counted, so a second holder of the same pid takes its own
+    reference and an unpaired call leaks one."""
     if isinstance(pid, int) and pid > 0:
         with _PROTECTED_LOCK:
             _PROTECTED_PIDS.add(pid)
 
 
 def unregister_protected_pid(pid: int) -> None:
-    """Drop a PID from the sweep-protected set (worker shut down / replaced)."""
+    """Drop ONE reference on a sweep-protected PID (worker shut down / replaced).
+
+    The pid stops being shielded only when the last holder drops it, so a pool
+    that replaces one of several workers on a shared process does not expose the
+    process to the sweep."""
     with _PROTECTED_LOCK:
         _PROTECTED_PIDS.discard(pid)
 

@@ -28,6 +28,11 @@ from kiro_crew.metrics.sessions import (
     record_session_ended,
     record_session_started,
 )
+from kiro_crew.runtime_ownership import (
+    PidRefcount,
+    acquire_session_lease,
+    release_session_lease,
+)
 from kiro_crew.validation import bounded_session_id
 
 if TYPE_CHECKING:
@@ -176,7 +181,11 @@ class SessionRegistryState:
     update_pause_owned: bool = False
     update_restart_fenced: bool = False
     start_sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
-    starting_pids: set[int] = field(default_factory=set)
+    #: COUNTED, not listed: two starts can legitimately shield one pid (the
+    #: allocator carries a race budget for starting one session twice), and as a
+    #: plain set the first to finish tore the shield off a process the other was
+    #: still cold-starting. Reads like the set it replaces.
+    starting_pids: PidRefcount = field(default_factory=PidRefcount)
     allocation_reservations: dict[str, set[object]] = field(default_factory=dict)
     inbound_callback_reservations: set[object] = field(default_factory=set)
     ownership_generations: dict[str, int] = field(default_factory=dict)
@@ -432,11 +441,11 @@ class SessionAllocationService:
         self.state.start_sem = value
 
     @property
-    def _starting_pids(self) -> set[int]:
+    def _starting_pids(self) -> PidRefcount:
         return self.state.starting_pids
 
     @_starting_pids.setter
-    def _starting_pids(self, value: set[int]) -> None:
+    def _starting_pids(self, value: PidRefcount) -> None:
         self.state.starting_pids = value
 
     @property
@@ -2454,12 +2463,24 @@ class SessionAllocationService:
                     self._install_work_dir_claim_probe(key, provider)
                     self._sessions[key] = session
                     self.advance_ownership_generation(key)
+                    # Registered: from here a live session is using this runtime,
+                    # so record the claim the kill gate reads. Paired with the
+                    # release inside the provider's own shutdown, and with the
+                    # release on the failure arm below that deregisters without
+                    # one. Before this line no tenant exists, which is why every
+                    # earlier cleanup path may kill unconditionally.
+                    await acquire_session_lease(provider)
                     try:
                         await record_session_started(key)
                     except BaseException:
                         # See open_task_session: a cancellation here would leave a
                         # registered session whose provider the caller is about to
                         # kill, plus a crumb the next boot reads as a crash.
+                        #
+                        # No release here: this re-raises into the handler at the
+                        # end of this method, which releases before it kills. A
+                        # second release would be a call whose effect is already
+                        # guaranteed, and one the ordering test cannot protect.
                         if self._sessions.get(key) is session:
                             del self._sessions[key]
                             self.advance_ownership_generation(key)
@@ -2512,6 +2533,13 @@ class SessionAllocationService:
         except BaseException:
             if preparation.revision:
                 self._remember_capability_failure(key, preparation)
+            # The ONE of these cleanup paths that can be past registration: this
+            # handler spans the lock section that registers the session, so a
+            # failure after it leaves a tenant holding a lease. Release before the
+            # kill or the gate refuses it and the process leaks -- the cleanup
+            # would be refusing its own teardown. Every earlier hard-kill site in
+            # this file is pre-registration and holds no lease.
+            await release_session_lease(provider)
             owner._dispatch_hard_kill(provider)
             raise
         finally:
