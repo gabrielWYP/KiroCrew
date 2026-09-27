@@ -425,7 +425,22 @@ def _staging_dir() -> Path:
     # No parents=True: the leaf sits directly under the data home, which
     # ``config_dir()`` resolves and creates. A missing parent is a real error
     # here, not something to paper over with a freshly minted tree.
-    staging.mkdir(exist_ok=True)
+    #
+    # ``exist_ok=True`` forgives an existing DIRECTORY and nothing else, so a
+    # regular file, a socket or a fifo sitting at the leaf raises here -- before
+    # the resolve check below ever runs. That refusal has to carry the staging
+    # message: ``cli_cloud`` only catches ``AWSError``/``ValidationError``/
+    # ``CloudActionDenied``, so a bare OSError reaches the operator as a
+    # traceback that names no remedy.
+    try:
+        staging.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise aws.AWSError(
+            f"the source staging directory '{staging}' could not be created ({exc.strerror or exc}) "
+            "-- refusing to build the source tarball. Remove whatever occupies that name, or move "
+            "the data home somewhere this directory can be created.",
+            action="source:PackageLocalCheckout",
+        ) from exc
     # Re-check after mkdir: exist_ok=True happily accepts a pre-existing link,
     # and resolving both sides is what catches a component swapped higher up.
     if staging.resolve() != (base.resolve() / _STAGING_DIR_LEAF) or not staging.is_dir():
@@ -466,25 +481,56 @@ class _HashingWriter:
         return getattr(self._fh, name)
 
 
+def _discard_staged(handle: Any) -> None:
+    """Close a staged temp *handle* and remove its name, in that order.
+
+    The order is load-bearing on Windows, which refuses to unlink a file while a
+    handle on it is open, so a name removed first would leave the handle dangling
+    and the file behind. ``unlink`` acts on the directory entry, so it removes a
+    link rather than whatever a link points at. A ``None`` handle is accepted so
+    callers can dispose of a temp that was never minted.
+    """
+    if handle is None:
+        return
+    handle.close()
+    Path(handle.name).unlink(missing_ok=True)
+
+
 def _write_tar_gz(
-    dest: Path, fill: Callable[[tarfile.TarFile], None], digest: Optional["hashlib._Hash"]
+    fh: Any, fill: Callable[[tarfile.TarFile], None], digest: Optional["hashlib._Hash"]
 ) -> None:
-    """Write a gzip tarball to *dest* via *fill*, updating *digest* as it goes.
+    """Write a gzip tarball through the open handle *fh* via *fill*, updating *digest*.
 
     The single place a final source tarball's bytes are produced, so the checksum
-    :func:`upload_source` pins cannot drift from the file it describes. *dest*
-    already exists (minted owner-only by :func:`tempfile.NamedTemporaryFile`
-    inside the locked-down staging directory); opening it ``wb`` truncates it and
-    keeps that mode.
+    :func:`upload_source` pins cannot drift from the file it describes.
+
+    *fh* is the OPEN handle its caller still holds on a temp minted by
+    :func:`tempfile.NamedTemporaryFile`, and the bytes go through that descriptor
+    rather than through a fresh ``open`` of its pathname. The descriptor is the
+    security boundary, not the name: the staging leaf sits under the data home,
+    which a same-uid process can write, so between a mint that closes its handle
+    and a write that reopens the name, that name can be made to resolve somewhere
+    else -- a link to a governance file such as ``security_policy.json``, or a
+    hard link to it, which a link check on the final component does not catch.
+    Tarball bytes written through either would land on the target while the launch
+    still reported success. ``mkstemp`` creates the temp with ``O_CREAT|O_EXCL``,
+    so the handle names an inode nothing else can substitute, and writing through
+    it keeps the owner-only mode the mint established.
+
+    The file is truncated first so the handle behaves like a fresh ``wb`` open for
+    a caller that reuses one, and flushed at the end so the size and the bytes are
+    on disk before the caller reads either.
 
     *digest* is an accumulator the caller owns and reads afterwards, which is why
     it is passed in rather than returned: the producers stay ``-> Path`` and a
     caller that does not need a checksum passes ``None`` and pays nothing.
     """
-    with open(dest, "wb") as fh:
-        sink: Any = fh if digest is None else _HashingWriter(fh, digest)
-        with tarfile.open(fileobj=sink, mode="w:gz") as tar:
-            fill(tar)
+    fh.seek(0)
+    fh.truncate()
+    sink: Any = fh if digest is None else _HashingWriter(fh, digest)
+    with tarfile.open(fileobj=sink, mode="w:gz") as tar:
+        fill(tar)
+    fh.flush()
 
 
 def _use_git_archive(root: Path, *, digest: Optional["hashlib._Hash"] = None) -> Optional[Path]:
@@ -496,18 +542,25 @@ def _use_git_archive(root: Path, *, digest: Optional["hashlib._Hash"] = None) ->
     """
     out = None
     try:
-        out = tempfile.NamedTemporaryFile(  # noqa: SIM115 - handed to caller
+        out = tempfile.NamedTemporaryFile(  # noqa: SIM115 - held open, never reopened by name
             prefix="kirocrew-src-", suffix=".tar.gz", delete=False, dir=str(_staging_dir())
         )
-        out.close()
+        # `git archive` writes to the held descriptor through stdout rather than to
+        # `-o <path>`: a pathname handed to the child is a name it opens itself,
+        # which is the same substitutable name a reopen would be. stderr alone is
+        # piped, because stdout is spoken for.
         rc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-C", str(root), "archive", "--format=tar.gz", "-o", out.name, "HEAD"],
-            capture_output=True,
+            ["git", "-C", str(root), "archive", "--format=tar.gz", "HEAD"],
+            stdout=out,
+            stderr=subprocess.PIPE,
             timeout=120,
             **UTF8_TEXT,
         )
-        if rc.returncode == 0 and Path(out.name).stat().st_size > 0:
-            return _refilter_archive(Path(out.name), digest=digest)
+        # fstat on the handle, not stat on the name, for the same reason.
+        if rc.returncode == 0 and os.fstat(out.fileno()).st_size > 0:
+            filtered = _refilter_archive(out, digest=digest)
+            _discard_staged(out)
+            return filtered
     except (OSError, subprocess.SubprocessError, tarfile.TarError):
         # Includes a corrupt archive from _refilter_archive — fall through to
         # the tarfile fallback rather than propagate, after cleaning up below.
@@ -517,26 +570,30 @@ def _use_git_archive(root: Path, *, digest: Optional["hashlib._Hash"] = None) ->
         # the same cleanup the fallback path below does and then propagates: the
         # staging dir lives under the data home, which no reboot clears, so a
         # half-written copy of the whole checkout would stay there for good.
-        if out is not None:
-            Path(out.name).unlink(missing_ok=True)
+        _discard_staged(out)
         raise
     # git archive failed (or the re-filter raised) — remove the temp file so it
     # doesn't leak, then signal the caller to use the tarfile fallback.
-    if out is not None:
-        Path(out.name).unlink(missing_ok=True)
+    _discard_staged(out)
     return None
 
 
-def _refilter_archive(archive: Path, *, digest: Optional["hashlib._Hash"] = None) -> Path:
-    """Rewrite a tarball keeping only members that pass :func:`_exclude_filter`."""
+def _refilter_archive(archive: Any, *, digest: Optional["hashlib._Hash"] = None) -> Path:
+    """Rewrite a tarball keeping only members that pass :func:`_exclude_filter`.
+
+    *archive* is the open handle its caller holds on the unfiltered tarball, read
+    through that descriptor rather than reopened by name, for the reason
+    :func:`_write_tar_gz` records. The caller keeps ownership of *archive* and
+    disposes of it; this function owns only the filtered temp it mints.
+    """
     filtered = tempfile.NamedTemporaryFile(  # noqa: SIM115 - handed to caller
         prefix="kirocrew-src-", suffix=".tar.gz", delete=False, dir=str(_staging_dir())
     )
-    filtered.close()
     try:
+        archive.seek(0)
 
         def _fill(dst: tarfile.TarFile) -> None:
-            with tarfile.open(archive, "r:gz") as src:
+            with tarfile.open(fileobj=archive, mode="r:gz") as src:
                 for member in src:
                     if _exclude_filter(member) is None:
                         logger.info("excluding %s from source tarball", member.name)
@@ -544,15 +601,15 @@ def _refilter_archive(archive: Path, *, digest: Optional["hashlib._Hash"] = None
                     fh = src.extractfile(member) if member.isreg() else None
                     dst.addfile(member, fh)
 
-        _write_tar_gz(Path(filtered.name), _fill, digest)
+        _write_tar_gz(filtered, _fill, digest)
     except BaseException:
         # A corrupt source archive (TarError) or any failure must not leak the
         # half-written filtered temp — the caller (_use_git_archive) only cleans
         # up `archive`, not this file. Remove it, then re-raise for the caller's
         # fall-through-to-tarfile-fallback handling.
-        Path(filtered.name).unlink(missing_ok=True)
+        _discard_staged(filtered)
         raise
-    archive.unlink(missing_ok=True)
+    filtered.close()
     return Path(filtered.name)
 
 
@@ -663,10 +720,9 @@ def _tar_fallback(root: Path, *, digest: Optional["hashlib._Hash"] = None) -> Pa
             return True
         return False
 
-    out = tempfile.NamedTemporaryFile(  # noqa: SIM115
+    out = tempfile.NamedTemporaryFile(  # noqa: SIM115 - held open, never reopened by name
         prefix="kirocrew-src-", suffix=".tar.gz", delete=False, dir=str(_staging_dir())
     )
-    out.close()
     try:
 
         def _fill(tar: tarfile.TarFile) -> None:
@@ -691,14 +747,15 @@ def _tar_fallback(root: Path, *, digest: Optional["hashlib._Hash"] = None) -> Pa
                     continue
                 tar.add(abs_path, arcname=rel, recursive=False)
 
-        _write_tar_gz(Path(out.name), _fill, digest)
+        _write_tar_gz(out, _fill, digest)
     except BaseException:
         # An unreadable tracked file or a full disk must not leave a half-written
         # tarball behind: the staging dir lives under the data home, which no
         # reboot clears, and only the caller that gets a path back knows to
         # remove it. Drop it here, then re-raise for the caller's own handling.
-        Path(out.name).unlink(missing_ok=True)
+        _discard_staged(out)
         raise
+    out.close()
     return Path(out.name)
 
 
@@ -714,23 +771,41 @@ def build_source_tarball(root: Optional[Path] = None) -> StagedSource:
     a read-back of the finished file, and :func:`upload_source` hands it to S3 as
     ``--checksum-sha256``. That is what makes a substituted tarball a refused
     upload rather than a shipped one: see that function for why the check has to
-    live at S3 rather than in a pre-flight inspection of this path.
+    live at S3 rather than in a pre-flight inspection of this path. It describes
+    exactly ONE attempt's bytes -- each attempt below owns its own accumulator,
+    because an attempt that fails part way has already fed bytes to the one it
+    was given.
     """
     root = root or repo_root()
-    digest = hashlib.sha256()
 
-    def _staged(path: Path) -> StagedSource:
+    def _staged(path: Path, digest: "hashlib._Hash") -> StagedSource:
         return StagedSource(path, base64.b64encode(digest.digest()).decode("ascii"))
 
+    # Every attempt below hashes into its OWN accumulator, and each digest is read
+    # only for the attempt that filled it. One shared accumulator would be wrong,
+    # not merely untidy: a producer that fails PART WAY through has already pushed
+    # bytes through _HashingWriter (see _write_tar_gz), and _use_git_archive
+    # SWALLOWS a mid-write _refilter_archive failure in order to fall through to
+    # the fallback here. Those discarded bytes would then be folded into the
+    # fallback's checksum, which would then describe bytes the named file does not
+    # contain -- and S3 would refuse a perfectly good tarball on a
+    # --checksum-sha256 mismatch.
     if _tracked_tree_is_dirty(root):
         logger.info("working tree has uncommitted tracked changes; packaging the working tree")
-        return _staged(_tar_fallback(root, digest=digest))
-    archive = _use_git_archive(root, digest=digest)
+        dirty_digest = hashlib.sha256()
+        packaged = _tar_fallback(root, digest=dirty_digest)
+        return _staged(packaged, dirty_digest)
+
+    archive_digest = hashlib.sha256()
+    archive = _use_git_archive(root, digest=archive_digest)
     if archive is not None:
         logger.info("packaged source via git archive: %s", archive)
-        return _staged(archive)
+        return _staged(archive, archive_digest)
+
     logger.info("git archive unavailable; using tracked-file tarfile fallback")
-    return _staged(_tar_fallback(root, digest=digest))
+    fallback_digest = hashlib.sha256()
+    fallback = _tar_fallback(root, digest=fallback_digest)
+    return _staged(fallback, fallback_digest)
 
 
 def _account_id(profile: str, region: str) -> str:

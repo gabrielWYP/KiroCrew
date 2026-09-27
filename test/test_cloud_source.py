@@ -277,12 +277,12 @@ class TestBuildTarball:
                 ti.size = len(data)
                 tf.addfile(ti, io.BytesIO(data))
 
-        filtered = source._refilter_archive(raw)
+        with raw.open("rb") as raw_fh:
+            filtered = source._refilter_archive(raw_fh)
         try:
             with tarfile.open(filtered) as tf:
                 names = tf.getnames()
             assert names == ["src/app.py"]
-            assert not raw.exists()  # unfiltered original removed
         finally:
             filtered.unlink()
 
@@ -308,8 +308,9 @@ class TestBuildTarball:
 
         bad = tmp_path / "corrupt.tar.gz"
         bad.write_bytes(b"not a gzip tarball")
-        with pytest.raises(_tf.TarError):
-            _src._refilter_archive(bad)
+        with bad.open("rb") as bad_fh:
+            with pytest.raises(_tf.TarError):
+                _src._refilter_archive(bad_fh)
         assert created, "NamedTemporaryFile was never called"
         leaked = [p for p in created if Path(p).exists()]
         assert not leaked, f"refilter leaked temp file(s): {leaked}"
@@ -419,7 +420,9 @@ class TestTarballStagingDirectory:
 
         def _fake_run(argv, **kw):
             if argv[:1] == ["git"] and "archive" in argv:
-                Path(argv[argv.index("-o") + 1]).write_bytes(payload.read_bytes())
+                # The real command writes to stdout, which is the caller's held handle.
+                kw["stdout"].write(payload.read_bytes())
+                kw["stdout"].flush()
                 return subprocess.CompletedProcess(argv, 0, "", "")
             return real_run(argv, **kw)
 
@@ -442,7 +445,9 @@ class TestTarballStagingDirectory:
         home, temp_root = self._pin_home_and_temp_root(monkeypatch, tmp_path)
         archive = self._tiny_targz(tmp_path / "archive.tar.gz")
 
-        filtered = source._refilter_archive(archive)
+        filtered = None
+        with archive.open("rb") as archive_fh:
+            filtered = source._refilter_archive(archive_fh)
         try:
             assert filtered.parent == home / source._STAGING_DIR_LEAF
             assert list(temp_root.iterdir()) == []
@@ -514,6 +519,21 @@ class TestTarballStagingDirectory:
         elsewhere.mkdir()
         make_dir_link(home / source._STAGING_DIR_LEAF, elsewhere)
         with pytest.raises(aws.AWSError, match="staging directory"):
+            source._staging_dir()
+
+    def test_a_regular_file_at_the_staging_leaf_is_refused_as_an_awserror(
+        self, monkeypatch, tmp_path
+    ):
+        # mkdir(exist_ok=True) forgives an existing DIRECTORY only, so a regular
+        # file at the leaf raises OSError before the resolve check below it runs.
+        # cli_cloud catches AWSError/ValidationError/CloudActionDenied and nothing
+        # else, so the refusal has to BE an AWSError -- otherwise 'cloud launch'
+        # ends in a traceback that names no remedy. Asserting the type is the pin:
+        # without the try/except this raises FileExistsError and never matches.
+        home, _ = self._pin_home_and_temp_root(monkeypatch, tmp_path)
+        leaf = home / source._STAGING_DIR_LEAF
+        leaf.write_text("not a directory", encoding="utf-8")
+        with pytest.raises(aws.AWSError, match="could not be created"):
             source._staging_dir()
 
     def test_a_linked_ancestor_above_the_data_home_is_followed(self, monkeypatch, tmp_path):
@@ -1114,7 +1134,8 @@ class TestSourceChecksumPin:
         with tarfile.open(src_tar, "w:gz") as tf:
             tf.add(member, arcname="keep.py")
         digest = hashlib.sha256()
-        out = source._refilter_archive(src_tar, digest=digest)
+        with src_tar.open("rb") as src_fh:
+            out = source._refilter_archive(src_fh, digest=digest)
         try:
             import base64
 
@@ -1152,21 +1173,23 @@ class TestSourceChecksumPin:
             staged.path.unlink(missing_ok=True)
 
     def test_the_digest_never_re_reads_the_staged_file(self, monkeypatch, tmp_path):
-        """The digest must come from the write, not from reopening the file.
+        """The digest comes from the write, through a handle, never from the name.
 
         A read-back yields the SAME digest on a quiet host, so no value comparison
-        can tell the two apart -- what separates them is that one reopens the path
-        and the other does not. Reopening is the whole bug: between the write and
-        the reread the name can come to mean a different file, which is the
-        substitution the pin exists to catch. So this asserts the file is opened
-        exactly once, for writing, and that reading it is never attempted.
+        can tell the two apart -- what separates them is that one resolves the path
+        again and the other does not. Resolving it again is the whole bug: between
+        the mint and the write the name can come to mean a different file, which is
+        the substitution the pin exists to catch. So this asserts the writer resolves
+        the staged name ZERO times, and that reading it is never attempted.
         """
         import builtins
         import hashlib
 
         dest = tmp_path / "out.tar.gz"
-        dest.write_bytes(b"")
         real_open = builtins.open
+        # Opened before the spy is installed, so the writer's own handle is not one
+        # of the resolutions being counted.
+        handle = real_open(dest, "w+b")
         modes: list[str] = []
 
         def _spy_open(file, mode="r", *a, **k):
@@ -1180,14 +1203,71 @@ class TestSourceChecksumPin:
         monkeypatch.setattr(builtins, "open", _spy_open)
         monkeypatch.setattr(Path, "read_bytes", _no_read_bytes)
         digest = hashlib.sha256()
-        source._write_tar_gz(dest, lambda tar: None, digest)
-        monkeypatch.undo()
+        try:
+            source._write_tar_gz(handle, lambda tar: None, digest)
+        finally:
+            monkeypatch.undo()
+            handle.close()
 
-        assert modes == ["wb"], f"staged file opened {len(modes)} time(s): {modes}"
-        # Control: the digest really was fed, so "opened once" is not passing
+        assert modes == [], f"the writer resolved the staged name: {modes}"
+        # Control: the digest really was fed, so an empty `modes` is not passing
         # because nothing happened.
         assert digest.digest() != hashlib.sha256(b"").digest()
         assert digest.digest() == hashlib.sha256(dest.read_bytes()).digest()
+
+    def test_a_link_planted_at_the_staged_name_takes_no_tarball_bytes(self, monkeypatch, tmp_path):
+        """Tarball bytes land on the minted inode, never on what its name points at.
+
+        The staging leaf sits under the data home, which a same-uid process can
+        write, so the window between minting a temp and writing it is one in which
+        that name can be replaced by a link. A writer that resolves the name again
+        sends the whole source tarball through the link and onto its target -- a
+        governance file such as ``security_policy.json``, whose absent or
+        unparseable form resolves to the permissive default -- while the launch
+        still reports success. Writing through the held descriptor puts the target
+        out of reach: ``mkstemp`` creates the inode with ``O_CREAT|O_EXCL`` and the
+        handle keeps pointing at it however the name is rebound.
+
+        POSIX only, because planting the link means unlinking a name whose
+        descriptor is still open, which Windows refuses outright -- there the
+        rebind this pin simulates cannot be staged in the first place.
+        """
+        import tempfile as _tmp
+
+        if os.name != "posix":
+            pytest.skip("rebinding a name while its descriptor is open")
+        ceiling = b'{"ceiling": "strict"}\n'
+        victim = tmp_path / "security_policy.json"
+        victim.write_bytes(ceiling)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+
+        real_ntf = _tmp.NamedTemporaryFile
+        planted: list[str] = []
+
+        def _rebind_the_name_to_the_victim(*a, **kw):
+            fh = real_ntf(*a, **kw)
+            # Exactly the race: the name is rebound the instant after the mint,
+            # while the caller still holds the descriptor.
+            Path(fh.name).unlink()
+            Path(fh.name).symlink_to(victim)
+            planted.append(fh.name)
+            return fh
+
+        monkeypatch.setattr(_tmp, "NamedTemporaryFile", _rebind_the_name_to_the_victim)
+        try:
+            source._tar_fallback(repo)
+        finally:
+            monkeypatch.undo()
+            for name in planted:
+                Path(name).unlink(missing_ok=True)
+
+        assert planted, "the mint was never intercepted -- the test is broken"
+        assert (
+            victim.read_bytes() == ceiling
+        ), "tarball bytes were written through the planted link onto the victim"
 
     def test_every_tarball_writer_goes_through_the_hashing_writer(self):
         """No producer may write tarball bytes outside ``_write_tar_gz``.
@@ -1235,6 +1315,84 @@ class TestSourceChecksumPin:
         assert writes, "found no tarfile write-mode open at all -- the scan is broken"
         assert reads, "found no tarfile read-mode open at all -- the scan is broken"
         assert set(writes) == {"_write_tar_gz"}, f"tarball bytes written outside the pin: {writes}"
+
+    def test_a_failed_archive_attempt_does_not_contaminate_the_fallback_digest(
+        self, monkeypatch, tmp_path
+    ):
+        """A digest must never span two tarball attempts.
+
+        ``_use_git_archive`` SWALLOWS a mid-write ``_refilter_archive`` failure so it
+        can fall through to the tarfile fallback. By then the gzip header has already
+        gone through ``_HashingWriter``, so ONE shared accumulator would fold those
+        discarded bytes into the fallback's checksum -- the pin would describe bytes
+        the named file does not contain, and S3 would refuse a perfectly good
+        tarball.
+
+        Real ``_use_git_archive`` and real ``_refilter_archive`` run here. Only
+        ``git archive`` itself is stubbed, and it is stubbed to SUCCEED with a corrupt
+        archive, which is what makes the re-filter raise after it has begun writing.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+        # A clean tree, so the git-archive attempt is the one that runs first.
+        monkeypatch.setattr(source, "_tracked_tree_is_dirty", lambda root: False)
+        real_run = subprocess.run
+
+        def _git_archive_writes_a_corrupt_tarball(argv, **kw):
+            if argv[:1] == ["git"] and "archive" in argv:
+                # The real command writes to stdout, which is the caller's held handle.
+                kw["stdout"].write(b"not a gzip stream")
+                kw["stdout"].flush()
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _git_archive_writes_a_corrupt_tarball)
+
+        staged = source.build_source_tarball(repo)
+        try:
+            assert staged.sha256 == self._b64_sha256_of(staged.path)
+        finally:
+            staged.path.unlink(missing_ok=True)
+
+    def test_each_tarball_attempt_gets_its_own_digest(self, monkeypatch, tmp_path):
+        """The same property stated as identity, so it holds however an attempt fails.
+
+        ``_use_git_archive`` dirtying the accumulator it was handed and then returning
+        ``None`` is the reachable case, but any future producer that fails part way is
+        the same hazard. What keeps the checksum honest is that no accumulator is ever
+        read for an attempt other than the one that filled it.
+        """
+        (tmp_path / "app.py").write_text("x = 1\n")
+        monkeypatch.setattr(source, "_git_tracked_files", lambda root: ["app.py"])
+        monkeypatch.setattr(source, "_tracked_tree_is_dirty", lambda root: False)
+        handed: list[object] = []
+        real_fallback = source._tar_fallback
+
+        def _dirties_its_digest_then_gives_up(root, *, digest=None):
+            handed.append(digest)
+            if digest is not None:
+                digest.update(b"bytes from an attempt that produced no file")
+            return None
+
+        def _recording_fallback(root, *, digest=None):
+            handed.append(digest)
+            return real_fallback(root, digest=digest)
+
+        monkeypatch.setattr(source, "_use_git_archive", _dirties_its_digest_then_gives_up)
+        monkeypatch.setattr(source, "_tar_fallback", _recording_fallback)
+
+        staged = source.build_source_tarball(tmp_path)
+        try:
+            assert len(handed) == 2, f"expected two attempts, got {len(handed)}: {handed}"
+            # Control: both attempts really were handed an accumulator, so the
+            # identity check below is comparing two digests rather than two Nones.
+            assert handed[0] is not None and handed[1] is not None
+            assert handed[0] is not handed[1], "the fallback reused the failed attempt's digest"
+            assert staged.sha256 == self._b64_sha256_of(staged.path)
+        finally:
+            staged.path.unlink(missing_ok=True)
 
 
 class TestBucketNaming:
