@@ -100,9 +100,18 @@ logger = logging.getLogger(__name__)
 # Matches the plain-text quarantine/context fence keyword phrase, tolerant of
 # case, surrounding dashes, and whitespace, so attacker-controlled forwarded
 # text cannot forge a boundary line. Used to neutralize embedded markers BEFORE
-# the fence is interpolated around untrusted content (XPIA hardening).
+# the fence is interpolated around untrusted content (XPIA hardening). Matching
+# runs on the normalized view, so each word join is one run of whitespace,
+# underscore or hyphen, possibly empty; no two optional classes are adjacent.
+_FENCE_WORD_JOIN = r"[\s_-]*"
 _FENCE_MARKER_RE = re.compile(
-    r"-{0,}\s*(?:UNTRUSTED FORWARDED CONTENT|CONTEXT ENTRY)\s+(?:BEGIN|END)\s*-{0,}",
+    r"-{0,}\s*(?:"
+    + _FENCE_WORD_JOIN.join(("UNTRUSTED", "FORWARDED", "CONTENT"))
+    + "|"
+    + _FENCE_WORD_JOIN.join(("CONTEXT", "ENTRY"))
+    + ")"
+    + _FENCE_WORD_JOIN
+    + r"(?:BEGIN|END)\s*-{0,}",
     re.IGNORECASE,
 )
 _FENCE_MARKER_NEUTRALIZED = "[removed embedded fence marker]"

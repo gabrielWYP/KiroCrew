@@ -526,32 +526,61 @@ _THREAD_FENCE_NEUTRALIZED = "[fence-marker-removed]"
 
 
 def _fence_marker_regex(marker: str) -> re.Pattern[str]:
-    """Compile a case-insensitive, whitespace-tolerant matcher for a fence marker.
+    """Compile a case-insensitive, separator-tolerant matcher for a fence marker.
 
-    A literal, case-sensitive ``str.replace`` only neutralizes the exact marker
-    text. An attacker who controls the fenced thread-parent content could
-    smuggle a lowercase, title-case, or internally-spaced variant (e.g.
-    ``<<< untrusted thread parent``) that a literal replace would miss, letting
-    the forged marker "break out" of the UNTRUSTED DATA block. To close that
-    gap we match each significant character of the marker separated by optional
-    whitespace, treat underscores as interchangeable with whitespace, and
-    compile with ``re.IGNORECASE``.
+    Each significant character of the marker may be separated by optional
+    whitespace, and matching is case-insensitive. An underscore position is
+    one separator run of any whitespace, underscore or hyphen, including an
+    empty run: markers are matched on the normalized view, which removes
+    default-ignorable characters and folds Unicode dashes to ``-``, so a
+    separator may have been removed or folded before matching.
+
+    The underscore run REPLACES the optional-whitespace joins on either side of
+    it rather than sitting between them, so no two nullable classes are ever
+    adjacent and matching stays linear in the input length.
     """
-    chars: list[str] = [r"[\s_]" if ch == "_" else re.escape(ch) for ch in marker]
-    return re.compile(r"\s*".join(chars), re.IGNORECASE)
+    separator = r"[\s_-]*"
+    pieces: list[str] = []
+    for ch in marker:
+        if ch == "_":
+            if pieces and pieces[-1] == r"\s*":
+                pieces.pop()
+            if not pieces or pieces[-1] != separator:
+                pieces.append(separator)
+            continue
+        if pieces and pieces[-1] != separator:
+            pieces.append(r"\s*")
+        pieces.append(re.escape(ch))
+    return re.compile("".join(pieces), re.IGNORECASE)
 
 
 _THREAD_FENCE_OPEN_RE = _fence_marker_regex(_THREAD_FENCE_OPEN)
 _THREAD_FENCE_CLOSE_RE = _fence_marker_regex(_THREAD_FENCE_CLOSE)
 
+# Delimiters that wrap untrusted calendar/meeting metadata in a meetings agent's
+# first message. Content inside the block is neutralized of every untrusted
+# fence, so no fenced surface can close another surface's block either.
+UNTRUSTED_CALENDAR_FENCE_OPEN = "<<<UNTRUSTED_CALENDAR_EVENT"
+UNTRUSTED_CALENDAR_FENCE_CLOSE = ">>>END_UNTRUSTED_CALENDAR_EVENT"
+_CALENDAR_FENCE_OPEN_RE = _fence_marker_regex(UNTRUSTED_CALENDAR_FENCE_OPEN)
+_CALENDAR_FENCE_CLOSE_RE = _fence_marker_regex(UNTRUSTED_CALENDAR_FENCE_CLOSE)
+
+_UNTRUSTED_FENCE_RES: tuple[re.Pattern[str], ...] = (
+    _THREAD_FENCE_CLOSE_RE,
+    _THREAD_FENCE_OPEN_RE,
+    _CALENDAR_FENCE_CLOSE_RE,
+    _CALENDAR_FENCE_OPEN_RE,
+)
+
 
 def _neutralize_fence_markers(text: str) -> str:
-    """Replace Unicode-normalized variants of either thread fence in *text*.
+    """Replace Unicode-normalized variants of every untrusted fence in *text*.
 
-    The shared marker matcher supplies NFKC, default-ignorable removal, and
+    Covers the thread-parent and calendar-event fences, open and close. The
+    shared marker matcher supplies NFKC, default-ignorable removal, and
     original-coordinate spans; the replacement remains fence-specific.
     """
-    spans = _marker_spans(text, (_THREAD_FENCE_CLOSE_RE, _THREAD_FENCE_OPEN_RE))
+    spans = _marker_spans(text, _UNTRUSTED_FENCE_RES)
     return _apply_marker_spans(text, spans, _THREAD_FENCE_NEUTRALIZED)
 
 
@@ -930,6 +959,17 @@ def _neutralize_structural_markers(text: str) -> str:
     exotic-character forgeries are caught without mutating legitimate text.
     """
     return _apply_marker_spans(text, _structural_marker_spans(text))
+
+
+def neutralize_untrusted_text(text: str) -> str:
+    """Neutralize untrusted fence markers and primary boundary markers in *text*.
+
+    Public entry point for surfaces outside this module that frame untrusted
+    content inside an untrusted-data fence: the result carries no fence marker
+    (thread-parent or calendar-event) and no forgeable prompt boundary marker.
+    Span-local, like both underlying scrubs.
+    """
+    return _neutralize_structural_markers(_neutralize_fence_markers(text))
 
 
 def _fit_folder_steering_into_envelope(

@@ -41,7 +41,6 @@ _MAX_EPISODIC_RETIRED_PER_WRITE = 3
 _INJECTION_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"ignore\s+(all\s+)?previous\s+instructions",
         r"ignore\s+(all\s+)?above",
         r"you\s+are\s+now",
         r"new\s+instructions?:",
@@ -51,6 +50,11 @@ _INJECTION_PATTERNS = [
         r"IMPORTANT:\s*override",
         r"forget\s+(everything|all)",
         r"disregard\s+(all|previous|your)\s+instructions",
+        # Synonyms of "previous" for the ignore/disregard/forget directive.
+        # Each optional group opens on a distinct literal word followed by
+        # required whitespace, so matching stays linear.
+        r"(ignore|disregard|forget)\s+(all\s+)?(of\s+)?(the\s+|your\s+)?"
+        r"(previous|prior|earlier|preceding|above|foregoing)\s+instructions",
         r"act\s+as\s+if",
         r"pretend\s+you\s+are",
         r"new\s+persona",
