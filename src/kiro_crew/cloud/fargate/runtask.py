@@ -104,6 +104,17 @@ CONTAINER_OVERRIDE_KEYS = frozenset({"name", "environment"})
 #: bound entirely, which is the one thing a cost cap may not allow.
 TASK_TTL_ENV = "SMC_TASK_TTL_SECONDS"
 
+#: The container variable carrying the internal-only trust boundary.
+#:
+#: Derived from the lane's own ``cloud.json`` block, never accepted from a caller. It
+#: is the one derived name that LOOSENS a posture -- with it the container starts the
+#: model subprocess unsandboxed on a host with no user namespace -- so a caller who
+#: could supply it could grant that posture to a lane whose operator never claimed the
+#: boundary, which is the whole property the setting carries. It sits on the
+#: "who may reach it" limb of :data:`CLOSED_ENV`: the claim is precisely that nobody
+#: outside the operator does.
+INTERNAL_ONLY_ENV = "SMC_INTERNAL_ONLY"
+
 #: Container variables whose value this module DERIVES and writes itself. A
 #: caller cannot supply them, so a request cannot contradict the spec it was
 #: built from. ``SMC_CREW_NAME`` comes from the crew the spec's secrets name, and
@@ -112,8 +123,12 @@ TASK_TTL_ENV = "SMC_TASK_TTL_SECONDS"
 #: ``SMC_SINGLE_PRINCIPAL`` is forced true because this backend exists for one
 #: owner; leaving it to the caller made a task that exits at startup
 #: constructible, which is not a posture worth offering. The task's lifetime is
-#: here because it is a cost bound: see :data:`TASK_TTL_ENV`.
-DERIVED_ENV: frozenset[str] = frozenset({"SMC_CREW_NAME", "SMC_SINGLE_PRINCIPAL", TASK_TTL_ENV})
+#: here because it is a cost bound: see :data:`TASK_TTL_ENV`. The trust boundary is
+#: here because it is a claim only the lane's operator can make: see
+#: :data:`INTERNAL_ONLY_ENV`.
+DERIVED_ENV: frozenset[str] = frozenset(
+    {"SMC_CREW_NAME", "SMC_SINGLE_PRINCIPAL", TASK_TTL_ENV, INTERNAL_ONLY_ENV}
+)
 
 #: Container variables this module neither writes nor accepts. Each is either a
 #: credential (so it belongs in the task definition's ``secrets`` or nowhere), or
@@ -231,7 +246,9 @@ def _refuse_unusable_size(size: TaskSize) -> None:
         )
 
 
-def derived_environment(binding: CrewBinding, *, ttl_seconds: int = 0) -> dict[str, str]:
+def derived_environment(
+    binding: CrewBinding, *, ttl_seconds: int = 0, internal_only: bool = False
+) -> dict[str, str]:
     """The identity, trust-domain and lifetime variables this module writes, not accepts.
 
     ``SMC_CREW_NAME`` is the crew the spec's secrets name. Writing it here is what
@@ -251,11 +268,20 @@ def derived_environment(binding: CrewBinding, *, ttl_seconds: int = 0) -> dict[s
     as ``"0"``, which the container reads as unbounded: the variable is always
     present so its absence never has to be told apart from a launcher that forgot
     it, and a caller who wants no bound gets the behaviour they already have.
+
+    ``SMC_INTERNAL_ONLY`` is the lane operator's own claim, read from their
+    ``cloud.json`` block and passed down by the engine. Unlike the three above it
+    LOOSENS a posture, so it is written from the lane's configuration and refused from
+    a caller: see :data:`INTERNAL_ONLY_ENV`. It is always present, ``"0"`` or ``"1"``,
+    for the reason the lifetime is -- so a container never has to tell a launcher that
+    did not claim the boundary apart from one that forgot the variable, and the safe
+    reading is the one a missing value would have had anyway.
     """
     return {
         "SMC_CREW_NAME": binding.crew,
         "SMC_SINGLE_PRINCIPAL": "1",
         TASK_TTL_ENV: str(ttl_seconds),
+        INTERNAL_ONLY_ENV: "1" if internal_only else "0",
     }
 
 
@@ -343,6 +369,7 @@ def run_task_request(
     environment: Mapping[str, str] | None = None,
     started_by: str = "",
     ttl_seconds: int = 0,
+    internal_only: bool = False,
 ) -> dict[str, Any]:
     """The ``RunTask`` request body for one crew task, or refuse.
 
@@ -375,6 +402,14 @@ def run_task_request(
     content, so a lifetime written there would mint a revision per distinct bound,
     and the digest-pinned document would have to widen to hold a number that is
     not part of what the image is.
+
+    ``internal_only`` is the lane operator's trust-boundary claim, carried to the
+    container as :data:`INTERNAL_ONLY_ENV`. It is in the OVERRIDE rather than the
+    definition for the reason ``ttl_seconds`` is: the definition is keyed on its
+    content, so a claim written there would mint a revision per posture, and a
+    digest-pinned document should not have to change shape to hold a statement about
+    who sends prompts. Defaults to ``False``, so a caller that says nothing produces a
+    task that keeps the sandboxed-only refusal.
     """
     if revision < 1:
         raise DocumentRefused(
@@ -414,7 +449,9 @@ def run_task_request(
     binding = spec_binding(taskdef)
     container_override: dict[str, Any] = {"name": CREW_CONTAINER_NAME}
     emitted = dict(environment)
-    emitted.update(derived_environment(binding, ttl_seconds=ttl_seconds))
+    emitted.update(
+        derived_environment(binding, ttl_seconds=ttl_seconds, internal_only=internal_only)
+    )
     container_override["environment"] = [
         {"name": name, "value": emitted[name]} for name in sorted(emitted)
     ]

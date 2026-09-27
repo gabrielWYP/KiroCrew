@@ -17,6 +17,13 @@ channel or a sandbox knob added there reds this test until the container decides
 to do about it, which is the difference between an isolation claim and an isolation
 that holds.
 
+The sandbox rule is in two halves, and the second exists so the first never has to
+bend. ``FORCED_AGENT_SETTINGS`` is the baseline every container gets and is held
+UNIVERSALLY protective. ``INTERNAL_ONLY_AGENT_SETTINGS`` is the named exception the
+internal-only Fargate lane needs, and its own rules -- containment in the baseline, only
+real sandbox keys, unreachable without the deployment's claim -- are additive. Nothing
+in the second half relaxes the first, which is the whole point of splitting them.
+
 The container's source is READ, never imported. ``crew/runtime/`` is a docker build
 context whose modules import each other as top-level ``container.*``, and
 ``test_spawn_audit.py::test_container_image_assets_are_not_imported`` pins that the
@@ -297,3 +304,181 @@ def test_the_container_forces_no_agent_setting_the_gateway_does_not_have() -> No
     forced = set(_literal("FORCED_AGENT_SETTINGS"))
     unknown = sorted(forced - known)
     assert not unknown, f"these are not settings on AgentConfig: {unknown}"
+
+
+# ── The internal-only exception, and why it is stated as a SECOND rule ──
+#
+# The Fargate lane is internal-only (RFC section 7): it serves the operator's own crews
+# and takes no external prompts, so an unsandboxed model subprocess is accepted there.
+# That is the one posture the container may loosen, and the rules below are what keep it
+# the only one.
+#
+# The ratchet above is deliberately NOT edited to accommodate it. Its universal
+# assertion -- every boolean `sandbox*` setting in `FORCED_AGENT_SETTINGS` is `False` --
+# still holds verbatim over the baseline every container gets, so relaxing a value there
+# reds exactly as it did before this exception existed. Rewriting that rule into "False,
+# or True when a flag is set" would have turned a universal property into an allowlist
+# whose entries are this change's own new code, which is the failure mode a ratchet
+# exists to prevent.
+#
+# So the exception lives in its own constant with its own rules, and those rules are
+# strictly ADDITIVE: the loosened set may only override a key the baseline already
+# decided protectively, may only name a real sandbox setting, and must be unreachable
+# without the deployment's claim. Nothing below weakens anything above.
+
+
+def _function_def(source: Path, name: str) -> ast.FunctionDef:
+    """The named module-level function, read from *source* rather than imported.
+
+    Same reason as everything else in this file: ``crew/runtime/`` is a docker build
+    context the gateway must never import.
+    """
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{source} no longer defines {name}")
+
+
+def test_the_internal_only_loosening_names_only_real_sandbox_settings(sandbox_keys) -> None:
+    """The exception may only relax a sandbox knob the gateway actually reads.
+
+    Two failures this catches. A typo naming no real setting would be written into
+    ``config.json`` and ignored, so the container would still refuse to start and the
+    constant would read as though it had done something. And a NON-sandbox agent setting
+    smuggled in here would be a posture change riding the sandbox exception -- the
+    `acp_backend` key one line up decides which process owns the model credential, and
+    the internal-only boundary says nothing about that.
+    """
+    loosened = set(_literal("INTERNAL_ONLY_AGENT_SETTINGS"))
+    outside = sorted(loosened - sandbox_keys)
+    assert not outside, (
+        "the internal-only exception names settings that are not sandbox settings: "
+        f"{outside}. The boundary accepts an unsandboxed model subprocess; it does not "
+        "license any other posture change, and a typo here loosens nothing while "
+        "reading as though it did."
+    )
+
+
+def test_the_internal_only_loosening_can_only_override_a_stated_protective_value(
+    sandbox_keys,
+) -> None:
+    """Every loosened key must ALSO be in the baseline, so the ratchet above covers it.
+
+    This is what keeps the two rules from having a gap between them. The universal
+    assertion reads ``FORCED_AGENT_SETTINGS``, so a key present ONLY here would have its
+    protective value stated nowhere and would never be judged by that rule at all --
+    the exception would be the only place it appears, and "is it False by default?"
+    would have no answer to check.
+
+    Requiring containment means the baseline still states the protective value for every
+    key this exception can touch, and this constant can only ever be an override of a
+    value the ratchet already guards.
+    """
+    baseline = set(_literal("FORCED_AGENT_SETTINGS"))
+    loosened = set(_literal("INTERNAL_ONLY_AGENT_SETTINGS"))
+    orphans = sorted(loosened - baseline)
+    assert not orphans, (
+        f"these are loosened without the baseline stating a protective value: {orphans}. "
+        "Add them to FORCED_AGENT_SETTINGS first, so the universal rule above judges "
+        "their default and this constant is only ever an override of it."
+    )
+    # And it must stay an EXCEPTION rather than become the posture: a set that grew to
+    # every sandbox key would leave the baseline's protective values unreachable in an
+    # internal-only task, which is a different design and not a wider exception.
+    assert loosened < sandbox_keys, (
+        f"the internal-only exception loosens every sandbox setting ({sorted(loosened)}). "
+        "That is not an exception to the protective posture, it is the absence of one."
+    )
+
+
+def test_the_internal_only_loosening_is_unreachable_without_the_deployments_claim() -> None:
+    """The constant must be applied ONLY under the flag, read from the source.
+
+    The behavioural half of this cannot be asserted here -- this file never imports the
+    container tree -- so the guard is structural and deliberately exact: the one place
+    ``INTERNAL_ONLY_AGENT_SETTINGS`` is read inside ``build_backend_config`` must sit
+    inside an ``if`` whose condition names ``internal_only``.
+
+    Checked structurally rather than by trusting the parameter's default, because a
+    default of ``False`` says what happens when a caller is silent and says nothing at
+    all about whether the branch is guarded. An edit that applied the constant
+    unconditionally would keep the parameter, keep its default, and hand every
+    container -- local hosts included -- the loosened posture.
+
+    ``container_tests/test_supervisor_backend.py`` asserts the resulting VALUES in both
+    directions against the real function. Both are needed: that one proves the behaviour
+    today, this one proves the guard is the reason.
+    """
+    fn = _function_def(BACKEND_SRC, "build_backend_config")
+    args = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
+    assert "internal_only" in args, (
+        "build_backend_config takes no internal_only parameter, so the loosened posture "
+        f"cannot be conditioned on the deployment's claim: {sorted(args)}"
+    )
+
+    def _reads_constant(node: ast.AST) -> bool:
+        return any(
+            isinstance(n, ast.Name) and n.id == "INTERNAL_ONLY_AGENT_SETTINGS"
+            for n in ast.walk(node)
+        )
+
+    guarded = [
+        branch
+        for branch in ast.walk(fn)
+        if isinstance(branch, ast.If)
+        and _reads_constant(branch)
+        and any(
+            isinstance(n, ast.Name) and n.id == "internal_only" for n in ast.walk(branch.test)
+        )
+    ]
+    assert guarded, (
+        "INTERNAL_ONLY_AGENT_SETTINGS is not applied inside an `if` that tests "
+        "internal_only, so the loosened sandbox posture is reachable without the "
+        "deployment claiming the internal-only boundary. Every container would get it, "
+        "including one on a local host."
+    )
+    # Nowhere ELSE in the function, or the guarded branch above would be one of two
+    # application sites and the unguarded one would decide.
+    reads_outside = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Name)
+        and node.id == "INTERNAL_ONLY_AGENT_SETTINGS"
+        and not any(node in ast.walk(branch) for branch in guarded)
+    ]
+    assert not reads_outside, (
+        "INTERNAL_ONLY_AGENT_SETTINGS is read outside the guarded branch as well, so "
+        "the guard is not the only path to the loosened posture."
+    )
+
+
+def test_the_sandbox_guard_refuses_or_accepts_on_the_deployments_claim() -> None:
+    """``verify_sandbox`` must read the claim, and its refusal must name the setting.
+
+    The guard is what turns the claim into a start, so a claim the guard does not read
+    is a setting that changes a config file and nothing else -- the container would
+    still refuse on Fargate while the whole chain above it looked wired.
+
+    And the refusal an operator meets when they have NOT claimed it has to name
+    ``SMC_INTERNAL_ONLY``. Before this existed the message ended in "run where
+    unprivileged user namespaces are permitted", which on Fargate is advice with no
+    action behind it: there is no such host in that lane. A refusal that names the
+    setting is the difference between a dead end and a decision.
+    """
+    fn = _function_def(MAIN_SRC, "verify_sandbox")
+    attrs = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+    assert "internal_only" in attrs, (
+        "verify_sandbox does not read settings.internal_only, so the deployment's claim "
+        f"cannot decide whether it refuses: {sorted(attrs)}"
+    )
+    text = " ".join(
+        node.value
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+    assert "SMC_INTERNAL_ONLY" in text, (
+        "no message in verify_sandbox names SMC_INTERNAL_ONLY, so an operator refused on "
+        "a host that cannot sandbox is told to move to one that can -- which in the "
+        "Fargate lane does not exist."
+    )

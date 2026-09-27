@@ -894,6 +894,23 @@ class FargateLaunchSpec:
     #: caller constructing a spec has to pass the confirmation to get a usable one, rather
     #: than getting a launch it never confirmed.
     confirmed_recipient: str = ""
+    #: The lane operator's internal-only trust-boundary claim, read from their
+    #: ``cloud.json`` block (``FargateConfig.internal_only``) and carried into every
+    #: task this spec launches as ``SMC_INTERNAL_ONLY``.
+    #:
+    #: With it the container starts the model subprocess UNSANDBOXED on a host with no
+    #: unprivileged user namespace, which is every Fargate host. Without it that host
+    #: refuses to start, which is the behaviour this lane had before the key existed --
+    #: so the default is the pre-existing posture and not a new one.
+    #:
+    #: It is NOT part of ``confirmed_recipient``'s confirmation, and the two answer
+    #: different questions. The confirmation exists because ``cloud.json`` chooses which
+    #: container receives the credential, so a rewritten file must not silently
+    #: substitute a recipient. This field grants no new reach: the worker could already
+    #: decrypt the crew's vault under the backend's uid on any host, sandbox or not, so
+    #: a rewrite that set this reaches nothing a rewrite of ``image`` did not already
+    #: reach, and the file's own seals are what stand behind it.
+    internal_only: bool = False
 
 
 def _tier_as_pair(size_key: str) -> Optional[str]:
@@ -1182,6 +1199,10 @@ class FargateLaunchEngine:
             # still holds where the sweep cannot reach: a cluster whose last launch
             # has already happened is never swept again.
             ttl_seconds=self._bounds.ttl_seconds,
+            # The lane operator's trust-boundary claim, read from the spec rather than
+            # from anything this method decides. It is what lets the container start on
+            # a Fargate host, which has no unprivileged user namespace.
+            internal_only=spec.internal_only,
         )
         result = aws.checked_json(
             ["ecs", "run-task", "--cli-input-json", _json(request)],

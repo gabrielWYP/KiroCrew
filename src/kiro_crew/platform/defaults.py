@@ -790,6 +790,13 @@ class DefaultRemoteProvisionerProvider:
                 # be the file confirming itself. ``provision`` resolves the recipient from
                 # the spec and compares, and it refuses an empty value.
                 confirmed_recipient=confirmed_recipient,
+                # The operator's own trust-boundary claim, read from the block they
+                # wrote. It is the only field here that loosens a posture, and it is
+                # read rather than asked for at launch because the statement it makes --
+                # this lane takes no external prompts -- is a property of the lane, not
+                # of one launch. Absent means not claimed, so a lane that says nothing
+                # keeps the container's sandboxed-only refusal.
+                internal_only=config.internal_only,
             ),
             # What bounds the task's cost. Passed rather than left to default, which is
             # the whole point: the engine defaults to six hours, and until this argument

@@ -101,6 +101,31 @@ class TestFargateLane:
         assert spec.image == block["image"]
         assert spec.cpu_architecture == block["cpu_architecture"]
 
+    def test_the_configured_internal_only_claim_reaches_the_engine(self, monkeypatch, tmp_path):
+        """The wiring for the one field that LOOSENS a posture.
+
+        Asserted on the engine the provider BUILT, for the reason the bound's test gives:
+        a ``FargateConfig`` holding the right value proves nothing about a launch, and
+        this test would pass with the wiring deleted. The spec is the only place the
+        file's claim can change what a task gets.
+
+        Both directions, because the safe one is the one a deletion produces. A test that
+        only checked the claimed case would pass if the field were hardcoded true, which
+        is the failure that hands every lane an unsandboxed worker.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        from kiro_crew.config.loader import config_dir
+
+        self._write_config(config_dir(), {**self._complete_block(), "internal_only": True})
+        engine = DefaultRemoteProvisionerProvider().engine_for(FARGATE_PROVISIONER_ID)
+        assert engine._require_spec().internal_only is True
+
+        block = self._complete_block()
+        assert "internal_only" not in block, "the fixture must not claim it"
+        self._write_config(config_dir(), block)
+        engine = DefaultRemoteProvisionerProvider().engine_for(FARGATE_PROVISIONER_ID)
+        assert engine._require_spec().internal_only is False
+
     def test_the_configured_bound_reaches_the_engine(self, monkeypatch, tmp_path):
         """The wiring, which is the whole point: a number in the file bounds a launch.
 

@@ -14,6 +14,12 @@ vouching that only one principal can reach the task. Renaming the prefix would
 touch the image, the task definition and every test that constructs an
 environment, so the names stay and this paragraph is the correction.
 
+`SMC_INTERNAL_ONLY` is the second declaration of that kind and the only one that
+LOOSENS anything: it is the deployment vouching that this task serves the
+operator's own crews and no external prompts, which is what makes an unsandboxed
+model subprocess acceptable on a host that cannot sandbox one. Both default to
+"not claimed", because a claim is what unlocks a posture and silence must never.
+
 Two values are deliberately NOT configurable.
 
 `BACKEND_HOST` is fixed at 127.0.0.1. The Kiro Crew backend must never be
@@ -107,6 +113,32 @@ class Settings:
     # stack. It closes the case that rule cannot see: an image run by any other path.
     single_principal: bool = False
 
+    # Whether the DEPLOYMENT vouches that this task serves the operator's OWN crews and
+    # nobody else's prompts -- the internal-only trust boundary.
+    #
+    # It exists because the container is sandboxed-only and Fargate cannot be sandboxed.
+    # kiro-cli sandboxes the model subprocess in an unprivileged user namespace; Fargate's
+    # default seccomp profile denies `unshare(CLONE_NEWUSER)` and offers no
+    # `privileged`, no `dockerSecurityOptions` and no capability that changes it, so the
+    # supervisor refused to start there. Measured on a real task, not inferred.
+    #
+    # What accepting this setting accepts. On a host with no user namespace the model
+    # worker runs UNSANDBOXED, and that worker auto-approves every tool it calls. It is
+    # a child of the backend under the same uid, and the backend must be able to decrypt
+    # the crew's vault to answer the engine's token request -- so the worker can reach
+    # the model credential, and taking the credential out of its environment does not
+    # change that. Measured: a uid-1000 process reads and decrypts that vault directly.
+    # The exposure is therefore prompt content reaching a credential, and it is ACCEPTED
+    # here rather than fixed, on the one ground that makes it acceptable: no external
+    # party sends prompts to this task. A user namespace is the real containment, and a
+    # Firecracker-based runtime is the answer for multi-tenant or external callers.
+    #
+    # A security property the container cannot observe arrives as a setting, exactly as
+    # `single_principal` does. Defaults to False, which is the SAFE default: claiming the
+    # boundary is what unlocks the risky posture, so silence must mean "not claimed", and
+    # a local host or any other lane that says nothing keeps refusing.
+    internal_only: bool = False
+
     # How many seconds this task may run before the supervisor stops it, where zero
     # means unbounded.
     #
@@ -163,14 +195,30 @@ def _path(name: str, default: str) -> Path:
     return Path(os.environ.get(name) or default).expanduser()
 
 
-def _bool(name: str, default: bool) -> bool:
+#: Why an unreadable boolean is refused, when the caller names no reason of its own.
+#: Every boolean here is a security property the container cannot observe, so the
+#: general statement is the honest default rather than one setting's specifics.
+_BOOL_REFUSAL_REASON = (
+    "which is a security property this container cannot observe for itself, so a "
+    "value it cannot read is refused rather than guessed at"
+)
+
+
+def _bool(name: str, default: bool, *, why: str = _BOOL_REFUSAL_REASON) -> bool:
     """Parse a strict boolean. An unrecognised value is REFUSED, not falsy.
 
-    This gates a security-class setting (whether the deployment claims a single
-    principal), so the usual ``value.lower() in ("1", "true")`` idiom is the wrong
-    shape: it silently reads a typo such as ``ture`` or a templating artefact such
-    as ``${Claim}`` as "no", which is the safe direction here but hides that the
-    deployment did not say what it meant. Refusing makes the operator fix the value.
+    Every caller of this gates a security-class setting, so the usual
+    ``value.lower() in ("1", "true")`` idiom is the wrong shape: it silently reads a
+    typo such as ``ture`` or a templating artefact such as ``${Claim}`` as "no",
+    which is the safe direction here but hides that the deployment did not say what
+    it meant. Refusing makes the operator fix the value.
+
+    *why* is the setting's own reason, carried into the refusal. It is a parameter
+    rather than one sentence covering every caller because the settings decide
+    different things, and a message naming the wrong one sends an operator looking
+    at the wrong parameter. There is more than one such setting now
+    (``SMC_SINGLE_PRINCIPAL`` and ``SMC_INTERNAL_ONLY``), which is exactly when a
+    shared sentence starts being wrong for one of them.
     """
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -182,9 +230,7 @@ def _bool(name: str, default: bool) -> bool:
         return False
     raise ConfigError(
         f"{name} must be a boolean (true/false), got {raw!r}. It is not "
-        "interpreted loosely because it controls whether the deployment claims a "
-        "single principal, which decides whether one caller's turns may share a "
-        "conversation slot with another's."
+        f"interpreted loosely because it controls {why}."
     )
 
 
@@ -272,7 +318,25 @@ def load() -> Settings:
         # Absent or empty means "not claimed", which is the posture that refuses the
         # risky pairing rather than the one that permits it. A value that cannot be read
         # is REFUSED instead: see `_bool`.
-        single_principal=_bool("SMC_SINGLE_PRINCIPAL", False),
+        single_principal=_bool(
+            "SMC_SINGLE_PRINCIPAL",
+            False,
+            why=(
+                "whether the deployment claims a single principal, which decides "
+                "whether one caller's turns may share a conversation slot with another's"
+            ),
+        ),
+        # The internal-only trust boundary (see the field). Absent means "not claimed",
+        # so a deployment that says nothing keeps the sandboxed-only refusal.
+        internal_only=_bool(
+            "SMC_INTERNAL_ONLY",
+            False,
+            why=(
+                "whether this task serves the operator's own crews only, which decides "
+                "whether the model subprocess may run unsandboxed on a host that cannot "
+                "sandbox it"
+            ),
+        ),
         data_home=data_home,
         # Defaults to the data home itself, NOT a `config/` subdirectory.
         # Verified against a running gateway: Kiro Crew's `config_dir()` and

@@ -301,8 +301,39 @@ FORCED_AGENT_SETTINGS: Mapping[str, object] = {
     "sandbox_allow_unsandboxed_exec": False,
 }
 
+#: What the INTERNAL-ONLY boundary loosens, applied over the baseline above and only
+#: when the deployment claims that boundary (``SMC_INTERNAL_ONLY``).
+#:
+#: A separate constant rather than a conditional value inside
+#: :data:`FORCED_AGENT_SETTINGS`, because the two answer different questions and the
+#: ratchet over them must not be one rule. The baseline is what EVERY container gets
+#: and stays universally protective -- ``test_no_sandbox_setting_is_forced_to_a_permissive_value``
+#: still reads it and still requires every boolean to be ``False``, so loosening a
+#: setting there reds exactly as it did before this constant existed. This one is a
+#: named, reviewable exception whose own tests assert it is reachable ONLY through the
+#: flag. Folding the exception into the baseline would have made the ratchet's
+#: universal assertion impossible to state at all, which is how a security test becomes
+#: an allowlist.
+#:
+#: ``sandbox_allow_unsandboxed_exec`` is a FAIL-OPEN switch, not a sandbox-off switch:
+#: ``wrap_argv`` still sandboxes the subprocess wherever a backend exists, and this only
+#: decides what happens where none does. So a host that CAN sandbox is unaffected by
+#: this entry, and the one behaviour it buys is the one the boundary accepts -- a task
+#: that starts and serves turns on Fargate instead of refusing.
+#:
+#: ``sandbox`` stays ``auto`` and ``sandbox_allow_no_isolation`` stays ``False``
+#: deliberately. Neither is needed for a Fargate start: ``auto`` already uses whatever
+#: isolation the host offers, and the second only widens which absences are tolerated
+#: quietly. A boundary that accepts one consequence does not license every loosening
+#: that shares its file.
+INTERNAL_ONLY_AGENT_SETTINGS: Mapping[str, object] = {
+    "sandbox_allow_unsandboxed_exec": True,
+}
 
-def build_backend_config(existing: Mapping[str, object] | None = None) -> dict[str, object]:
+
+def build_backend_config(
+    existing: Mapping[str, object] | None = None, *, internal_only: bool = False
+) -> dict[str, object]:
     """The config the backend boots with: no messaging transport, a stated agent posture.
 
     Merges over *existing* rather than replacing it, so a crew bundle that ships
@@ -314,6 +345,12 @@ def build_backend_config(existing: Mapping[str, object] | None = None) -> dict[s
 
     A non-dict where a section should be is REPLACED, not merged. The gateway coerces
     such a section to defaults, and defaults are not what this function is for.
+
+    *internal_only* is the deployment's own claim that this task serves the operator's
+    crews and no external prompts, and it is the ONLY way
+    :data:`INTERNAL_ONLY_AGENT_SETTINGS` is applied. It defaults to ``False`` so a
+    caller that says nothing gets the protective baseline -- which is what every
+    existing call site and every other lane gets, unchanged.
     """
     config: dict[str, object] = dict(existing or {})
     for section in CHANNEL_SECTIONS:
@@ -324,6 +361,8 @@ def build_backend_config(existing: Mapping[str, object] | None = None) -> dict[s
     agent = config.get("agent")
     agent_merged = dict(agent) if isinstance(agent, dict) else {}
     agent_merged.update(FORCED_AGENT_SETTINGS)
+    if internal_only:
+        agent_merged.update(INTERNAL_ONLY_AGENT_SETTINGS)
     config["agent"] = agent_merged
     return config
 
@@ -365,12 +404,24 @@ def write_backend_config(settings: Settings) -> Path:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             existing = raw
-    payload = json.dumps(build_backend_config(existing), indent=2, sort_keys=True) + "\n"
+    payload = (
+        json.dumps(
+            build_backend_config(existing, internal_only=settings.internal_only),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
     _atomic_write_nofollow(path, payload.encode("utf-8"))
     log.info(
-        "backend config: %d messaging transports disabled, %d agent settings forced",
+        "backend config: %d messaging transports disabled, %d agent settings forced%s",
         len(CHANNEL_SECTIONS),
         len(FORCED_AGENT_SETTINGS),
+        (
+            f", {len(INTERNAL_ONLY_AGENT_SETTINGS)} loosened under the internal-only boundary"
+            if settings.internal_only
+            else ""
+        ),
     )
     return path
 

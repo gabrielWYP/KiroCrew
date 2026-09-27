@@ -385,12 +385,65 @@ def test_the_derived_values_win_over_nothing_because_a_collision_is_refused():
     assert set(rt.derived_environment(BINDING)) == rt.DERIVED_ENV
 
 
+def _emitted(produced: dict) -> dict[str, str]:
+    """The container override's environment, as a name -> value mapping."""
+    entries = produced["overrides"]["containerOverrides"][0]["environment"]
+    return {entry["name"]: entry["value"] for entry in entries}
+
+
+def test_the_boundary_is_absent_from_the_task_when_the_lane_does_not_claim_it():
+    """Written as "0", always present, never omitted.
+
+    Present-and-zero rather than absent for the reason the lifetime is: the container
+    must never have to tell a launcher that did not claim the boundary apart from one
+    that forgot the variable. The two would read identically, and the reading that
+    matters is a security posture.
+    """
+    emitted = _emitted(request())
+    assert emitted[rt.INTERNAL_ONLY_ENV] == "0"
+
+
+def test_the_boundary_is_carried_into_the_task_when_the_lane_claims_it():
+    """The one thing the claim has to do: reach the container that reads it."""
+    emitted = _emitted(request(internal_only=True))
+    assert emitted[rt.INTERNAL_ONLY_ENV] == "1"
+
+
+def test_a_caller_cannot_claim_the_boundary_the_lane_did_not():
+    """The sharpest reason this name is derived rather than accepted.
+
+    The other three derived names stop a caller CONTRADICTING the spec. This one stops a
+    caller GRANTING a posture: with it the container starts the model subprocess
+    unsandboxed, so a caller who could supply it could hand that to a lane whose operator
+    never claimed the boundary -- which is the entire property the setting carries.
+    """
+    assert rt.INTERNAL_ONLY_ENV in rt.DERIVED_ENV
+    with pytest.raises(DocumentRefused, match="derives or refuses"):
+        request(environment={rt.INTERNAL_ONLY_ENV: "1"})
+    # And the refusal holds when the lane HAS claimed it, so the caller can never be the
+    # one who decides -- agreeing with the lane is not the same as being permitted to say it.
+    with pytest.raises(DocumentRefused, match="derives or refuses"):
+        request(environment={rt.INTERNAL_ONLY_ENV: "1"}, internal_only=True)
+
+
+def test_the_boundary_stays_out_of_the_task_definition():
+    """It belongs in the OVERRIDE, like the lifetime and for the same reason.
+
+    The definition is keyed on its content, so a posture written there would mint a
+    revision per claim, and the digest-pinned document would have to widen to hold a
+    statement about who sends prompts rather than about what the image is.
+    """
+    definition = td.task_definition_document(TASKDEF)
+    assert rt.INTERNAL_ONLY_ENV not in set(strings(definition))
+
+
 def test_an_unrelated_environment_override_is_carried_as_a_sorted_list():
     produced = request(environment={"B": "2", "A": "1"})
     assert produced["overrides"]["containerOverrides"][0]["environment"] == [
         {"name": "A", "value": "1"},
         {"name": "B", "value": "2"},
         {"name": "SMC_CREW_NAME", "value": BINDING.crew},
+        {"name": rt.INTERNAL_ONLY_ENV, "value": "0"},
         {"name": "SMC_SINGLE_PRINCIPAL", "value": "1"},
         {"name": rt.TASK_TTL_ENV, "value": "0"},
     ]
@@ -464,7 +517,7 @@ def test_the_image_command_cannot_be_replaced():
 
 
 def test_the_derived_identity_is_emitted_even_with_no_caller_environment():
-    """The crew, the trust domain and the lifetime are written here, not requested."""
+    """The crew, the trust domain, the boundary and the lifetime are written, not requested."""
     produced = request()
     container_override = produced["overrides"]["containerOverrides"][0]
     assert set(container_override) == {"name", "environment"}
@@ -473,6 +526,7 @@ def test_the_derived_identity_is_emitted_even_with_no_caller_environment():
         "SMC_CREW_NAME": BINDING.crew,
         "SMC_SINGLE_PRINCIPAL": "1",
         rt.TASK_TTL_ENV: "0",
+        rt.INTERNAL_ONLY_ENV: "0",
     }
     assert "ephemeralStorage" not in produced["overrides"]
 
@@ -521,6 +575,7 @@ INPUT_DISPOSITION = {
     ("run_task_request", "environment"): "closed",
     ("run_task_request", "started_by"): "caller",
     ("run_task_request", "ttl_seconds"): "closed",
+    ("run_task_request", "internal_only"): "closed",
     # Placement fields
     ("Placement", "cluster"): "caller",
     ("Placement", "subnets"): "caller",

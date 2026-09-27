@@ -28,6 +28,7 @@ from kiro_crew.cloud.aws import AWSError
 from kiro_crew.cloud.ec2 import MANAGED_TAG_KEY
 from kiro_crew.cloud.fargate import (
     CREW_TAG_KEY,
+    INTERNAL_ONLY_ENV,
     TASK_TTL_ENV,
     Placement,
     SecretRef,
@@ -2599,6 +2600,32 @@ def test_the_launch_carries_the_same_lifetime_the_sweep_enforces(monkeypatch) ->
 
     sent = double.run_requests[0]["overrides"]["containerOverrides"][0]["environment"]
     assert {e["name"]: e["value"] for e in sent}[TASK_TTL_ENV] == "1234"
+
+
+def test_the_launch_carries_the_lanes_internal_only_claim(monkeypatch) -> None:
+    """The claim must reach the request this engine sends, and only when the lane made it.
+
+    This is the last link in the chain: operator file, spec, request, container. Every
+    other link is asserted elsewhere, and none of them proves the engine puts the value
+    in the document -- a spec holding the claim with the forwarding deleted would pass
+    all of them and launch a task that refuses to start.
+
+    Both directions in one test, because the interesting failure is a value hardcoded
+    rather than read: that hands the loosened posture to a lane whose operator never
+    claimed the boundary, and a one-direction test cannot see it.
+    """
+    for claimed, expected in ((True, "1"), (False, "0")):
+        double = _EcsDouble()
+        _patch_aws(monkeypatch, double)
+        spec = dataclasses.replace(_spec(), internal_only=claimed)
+
+        FargateLaunchEngine(spec).provision(
+            tag=TAG, size_key="1024/2048", profile="p", region="us-west-2"
+        )
+
+        sent = double.run_requests[0]["overrides"]["containerOverrides"][0]["environment"]
+        emitted = {e["name"]: e["value"] for e in sent}
+        assert emitted[INTERNAL_ONLY_ENV] == expected, f"internal_only={claimed}"
 
 
 def test_a_task_that_never_started_is_aged_from_when_it_was_created(monkeypatch) -> None:

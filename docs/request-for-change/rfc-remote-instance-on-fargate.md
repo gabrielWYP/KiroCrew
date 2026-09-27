@@ -306,6 +306,54 @@ reproducibility and it concentrates trust in the image build. What the image is
 built from, and how a launch verifies it is running the digest it asked for, both
 need to be answered.
 
+### The internal-only boundary, and what accepting it accepts
+
+Decided 2026-09-27. **The Fargate lane is internal-only: it serves the operator's
+own crews, and no external party sends prompts to it.** That sentence is the
+security property this section now rests on, and everything below is what follows
+from it.
+
+It had to be decided because the lane could not otherwise run at all. The crew
+container is sandboxed-only: kiro-cli sandboxes the model subprocess in an
+unprivileged user namespace, and Fargate's default seccomp profile denies one.
+Measured on a real task, which pulled its image, fetched both secrets, started
+the supervisor and then exited 1 at the sandbox check. No task-definition field
+changes that — Fargate accepts no `privileged`, offers no `dockerSecurityOptions`,
+and `linuxParameters` admits only `CAP_SYS_PTRACE`.
+
+Taking the model credential out of the worker's environment does not earn the
+other posture, and that was tried first. Reachability is the operative property,
+not residency: the backend answers the engine's token request from the crew's
+vault, so the backend's uid must be able to decrypt it, and the worker runs as a
+child of the backend under that same uid. Measured — a uid-1000 process reads and
+decrypts that vault directly. So an unsandboxed auto-approving worker can reach
+the credential wherever the credential is stored.
+
+**What the boundary accepts, stated plainly.** On a Fargate host the model
+subprocess runs unsandboxed, that subprocess auto-approves every tool it calls,
+and it can reach the model credential. This is ACCEPTED rather than fixed, on the
+single ground that makes it acceptable: there is no external prompt content for it
+to act on. Prompt injection needs a prompt from someone else, and by the boundary
+there is nobody else.
+
+**The claim is explicit, and the switch names the boundary rather than the
+consequence.** `cloud.json`'s `fargate` block carries `internal_only`; the
+launcher derives `SMC_INTERNAL_ONLY` from it and a caller cannot supply that
+variable; the container's supervisor reads it and takes one branch. An operator
+therefore cannot ask for "allow unsandboxed" — they can only state what makes it
+acceptable, and the loosening follows. Absent means not claimed, so a lane that
+says nothing keeps refusing, and every other lane and every local host is
+unchanged.
+
+**What this is not.** It is not the multi-tenant answer and must not be read as
+one. A user namespace is the real containment; where callers are external or a
+task is shared, the answer is a Firecracker-based runtime, which is a different
+design and not this one. `#9355`'s credential broker is not started, and this
+decision does not close it: a brokered short-lived credential is still what makes
+a stolen token bounded rather than long-lived. Section 12 below already says
+remote instances on Fargate remain single-owner; this boundary is that sentence
+made operational.
+
 ### What does not change
 
 Still one principal, still IAM, still the owner's own account, still credentials

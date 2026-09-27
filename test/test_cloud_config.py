@@ -232,6 +232,77 @@ class TestFargateConfig:
         expected = {f.name for f in fields(FargateConfig) if isinstance(f.default, str)}
         assert set(_STRING_FIELD_DEFAULTS) == expected
 
+    @pytest.mark.parametrize("bad", ["true", "false", "0", "1", 1, 0, None, [], {}])
+    def test_no_boolean_field_coerces_a_non_boolean(self, bad: object):
+        """Every boolean field, derived from the dataclass, not a branch someone maintains.
+
+        Coercion would read the string ``"false"`` as true, and these fields decide
+        network exposure and the trust boundary -- the two directions a value must never
+        be guessed in. Parametrized over the FIELDS for the reason the string version is:
+        ``assign_public_ip`` had a hand-written branch of its own, and ``internal_only``
+        would have arrived beside it as a second one free to disagree.
+
+        ``None`` is in the values because an explicit JSON ``null`` is a PRESENT value
+        and must drop the block rather than fall through to the default.
+        """
+        from kiro_crew.cloud.config import _BOOL_FIELD_DEFAULTS
+
+        assert _BOOL_FIELD_DEFAULTS, "the field derivation must not be empty"
+        for field_name in _BOOL_FIELD_DEFAULTS:
+            block = {**COMPLETE_FARGATE, field_name: bad}
+            assert FargateConfig.from_mapping(block) is None, f"{field_name}={bad!r}"
+
+    def test_the_boolean_field_list_matches_the_dataclass(self):
+        """Pins the derivation, so a boolean cannot silently drop out of the type check.
+
+        Named as well as derived, because "every boolean field" is only a useful claim if
+        the set is the one a reader expects. A boolean that stopped being read here would
+        be coerced again with nothing saying so.
+        """
+        from dataclasses import fields
+
+        from kiro_crew.cloud.config import _BOOL_FIELD_DEFAULTS
+
+        expected = {f.name for f in fields(FargateConfig) if isinstance(f.default, bool)}
+        assert set(_BOOL_FIELD_DEFAULTS) == expected
+        assert set(_BOOL_FIELD_DEFAULTS) == {"assign_public_ip", "internal_only"}
+
+    def test_every_boolean_field_defaults_to_the_safe_direction(self):
+        """Absent must mean the protective answer for each one, and both are ``False``.
+
+        Worth stating rather than reading off the dataclass: ``internal_only`` is the one
+        field in this block that LOOSENS a posture, so a default of ``True`` would hand
+        every lane an unsandboxed model subprocess for saying nothing at all.
+        """
+        from kiro_crew.cloud.config import _BOOL_FIELD_DEFAULTS
+
+        assert all(default is False for default in _BOOL_FIELD_DEFAULTS.values())
+
+    @pytest.mark.parametrize(("value", "expected"), [(True, True), (False, False)])
+    def test_a_boolean_internal_only_claim_is_read_as_written(self, value: bool, expected: bool):
+        config = FargateConfig.from_mapping({**COMPLETE_FARGATE, "internal_only": value})
+        assert config is not None
+        assert config.internal_only is expected
+
+    def test_an_absent_internal_only_claim_defaults_to_not_claimed(self):
+        assert "internal_only" not in COMPLETE_FARGATE
+        config = FargateConfig.from_mapping(COMPLETE_FARGATE)
+        assert config is not None
+        assert config.internal_only is False
+
+    def test_a_lane_that_does_not_claim_the_boundary_is_still_a_complete_lane(self):
+        """``internal_only`` is deliberately outside the completeness judgement.
+
+        A lane that does not claim it is usable -- it simply cannot run where there is no
+        user namespace, which is every lane's behaviour before the key existed. Folding it
+        into ``is_complete`` would leave the lane UNREGISTERED for declining to loosen a
+        posture, which inverts what the claim is for.
+        """
+        config = FargateConfig.from_mapping(COMPLETE_FARGATE)
+        assert config is not None and config.is_complete()
+        claimed = FargateConfig.from_mapping({**COMPLETE_FARGATE, "internal_only": True})
+        assert claimed is not None and claimed.is_complete()
+
     def test_an_omitted_bound_takes_the_engine_default(self):
         """The default lives in the ENGINE, and this asserts against it, not a copy.
 

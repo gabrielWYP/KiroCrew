@@ -12,6 +12,13 @@ ASSERTS that -- refusing on any verdict, because a value there is a broken invar
 rather than a property of the host. The route that stays open is the vault: the backend
 answers the engine's token request from it under a uid the worker shares, so no
 refusal here can be traded away for a clean environment.
+
+One thing DOES lift the refusal, and it is a trust boundary rather than a credential
+claim: ``settings.internal_only``, the deployment stating that this task serves the
+operator's own crews and takes no external prompts. The exposure is then accepted --
+there is no injected prompt content for an unsandboxed auto-approving worker to act on.
+The tests at the end of this file are mostly about the limits of that: it lifts a
+DENIED verdict and nothing else, and it never lifts the credential assertion.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ IDENTITY_JSON = json.dumps(
 )
 
 
-def make_settings(tmp_path: Path) -> Settings:
+def make_settings(tmp_path: Path, *, internal_only: bool = False) -> Settings:
     data_home = tmp_path / "data"
     data_home.mkdir(parents=True, exist_ok=True)
     return Settings(
@@ -49,6 +56,7 @@ def make_settings(tmp_path: Path) -> Settings:
         crew_name="test-crew",
         backup_bucket=None,
         backup_prefix="",
+        internal_only=internal_only,
     )
 
 
@@ -207,3 +215,153 @@ def test_bool_refuses_a_value_it_cannot_read(monkeypatch: pytest.MonkeyPatch, ra
     monkeypatch.setenv("SMC_PROBE_BOOL", raw)
     with pytest.raises(ConfigError, match="must be a boolean"):
         _bool("SMC_PROBE_BOOL", False)
+
+
+# ── The internal-only boundary ──
+#
+# The Fargate lane serves the operator's own crews and takes no external prompts. Under
+# that claim an unsandboxed model subprocess is ACCEPTED rather than fixed, which is what
+# lets the container start on a host with no user namespace -- every Fargate host, measured
+# on a real task. These pin what the claim does and, more importantly, what it does not.
+
+
+def test_a_denied_host_starts_when_the_deployment_claims_internal_only(tmp_path: Path) -> None:
+    """The one behaviour the claim buys: a start where the guard otherwise refuses.
+
+    Same host, same verdict, same clean environment as
+    ``test_the_guard_refuses_when_no_user_namespace_is_available`` one screen up -- the
+    claim is the only thing that differs, which is what makes this a test about the claim
+    rather than about the probe.
+    """
+    entry.verify_sandbox(
+        make_settings(tmp_path, internal_only=True),
+        env={},
+        probe=lambda: entry.SANDBOX_DENIED,
+    )
+
+
+def test_the_claim_does_not_lift_an_undetermined_verdict(tmp_path: Path) -> None:
+    """A boundary can accept a KNOWN exposure. It cannot accept an unknown one.
+
+    ``SANDBOX_DENIED`` is a definite answer about the host, so there is something for the
+    claim to accept: no user namespace here, and the consequence is written down. An
+    undetermined verdict carries no answer at all -- the probe could not run -- so there
+    is nothing to accept and the refusal stands whatever the deployment claims.
+
+    Stated as a test because the comfortable reading of "unsandboxed is accepted" is that
+    the sandbox verdict stops mattering, and that reading turns a broken probe into a
+    silent start.
+    """
+    verdict = f"{entry.SANDBOX_UNDETERMINED_PREFIX}the probe could not fork a child"
+    with pytest.raises(ConfigError, match="could not be determined"):
+        entry.verify_sandbox(
+            make_settings(tmp_path, internal_only=True), env={}, probe=lambda: verdict
+        )
+
+
+def test_the_claim_does_not_lift_an_unrecognised_verdict(tmp_path: Path) -> None:
+    """The guard still fails closed on a verdict it does not know, claim or no claim.
+
+    Only the two verdicts the guard recognises get a decision. A probe extended later, a
+    typo, or a stub returning something else must not reach the loosened posture by way of
+    the claim -- that is the direction a security guard fails in when someone adds a case
+    and forgets this call site.
+    """
+    for bogus in ("AVAILABLE", "yes", "", None, True):
+        with pytest.raises(ConfigError):
+            entry.verify_sandbox(
+                make_settings(tmp_path, internal_only=True),
+                env={},
+                probe=lambda value=bogus: value,
+            )
+
+
+@pytest.mark.parametrize("name", ["KIRO_IDENTITY", "KIRO_API_KEY"])
+def test_a_credential_in_the_environment_refuses_even_under_the_claim(
+    tmp_path: Path, name: str
+) -> None:
+    """The claim is about a HOST POSTURE. The credential check is about a broken invariant.
+
+    ``build_backend_env`` popping both names is something this container controls, so a
+    value in ``env`` means that withholding was removed or defeated. No trust boundary
+    makes that acceptable: the deployment vouched for who sends prompts, not for the
+    container's own code being intact.
+    """
+    with pytest.raises(ConfigError, match="build_backend_env"):
+        entry.verify_sandbox(
+            make_settings(tmp_path, internal_only=True),
+            env={name: "sk-live"},
+            probe=lambda: entry.SANDBOX_DENIED,
+        )
+
+
+def test_the_refusal_names_the_setting_and_what_accepting_it_means(tmp_path: Path) -> None:
+    """An operator refused on Fargate must be told the decision, not sent to another host.
+
+    "Run where unprivileged user namespaces are permitted" is advice with no action behind
+    it in this lane -- there is no such Fargate host. So the refusal names
+    ``SMC_INTERNAL_ONLY`` and states what claiming it accepts: an auto-approving worker
+    that can reach the model credential, acceptable only because no external party sends
+    prompts. Naming the setting without the consequence would be an invitation to set it.
+    """
+    with pytest.raises(ConfigError) as exc:
+        entry.verify_sandbox(make_settings(tmp_path), env={}, probe=lambda: entry.SANDBOX_DENIED)
+    message = str(exc.value)
+    assert "SMC_INTERNAL_ONLY" in message
+    lowered = message.lower()
+    assert "own crews" in lowered, "the refusal does not say what the boundary is"
+    assert "auto-approves" in lowered, "the refusal does not say what accepting it accepts"
+
+
+def test_the_undetermined_refusal_says_the_claim_is_not_the_fix_for_it(tmp_path: Path) -> None:
+    """The message has to close the door the previous one opens.
+
+    An operator who has just read "set SMC_INTERNAL_ONLY=1" on a denied host will try it
+    on an undetermined one. Saying only "could not be determined" leaves them setting the
+    flag and watching nothing change, with no hint that the probe itself is the problem.
+    """
+    verdict = f"{entry.SANDBOX_UNDETERMINED_PREFIX}the probe could not fork a child"
+    with pytest.raises(ConfigError) as exc:
+        entry.verify_sandbox(
+            make_settings(tmp_path, internal_only=True), env={}, probe=lambda: verdict
+        )
+    assert "SMC_INTERNAL_ONLY does not cover this" in str(exc.value)
+
+
+def test_the_claim_is_read_from_the_environment_under_its_own_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``load()`` must read ``SMC_INTERNAL_ONLY``, and absent must mean not claimed.
+
+    The chain is operator file -> derived task variable -> this setting -> the guard's
+    branch, and every link is asserted somewhere. This is the link between the variable
+    the launcher writes and the field the guard reads: without it the whole chain could be
+    wired and the container would still never see the claim.
+    """
+    from container.common.config import load
+
+    monkeypatch.delenv("SMC_INTERNAL_ONLY", raising=False)
+    assert load().internal_only is False, "absent must read as not claimed"
+    monkeypatch.setenv("SMC_INTERNAL_ONLY", "1")
+    assert load().internal_only is True
+    monkeypatch.setenv("SMC_INTERNAL_ONLY", "false")
+    assert load().internal_only is False
+
+
+def test_an_unreadable_claim_is_refused_and_names_what_it_decides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo must not read as "not claimed" silently, and the refusal must say which setting.
+
+    An unresolved template reference is the realistic case. Refusing in the safe direction
+    is still refusing: the deployment did not say what it meant about a boundary that
+    decides whether the model subprocess runs sandboxed, so the operator fixes the value.
+    The message names the sandbox consequence rather than the single-principal one, which
+    is what a shared sentence for both booleans would have got wrong.
+    """
+    from container.common.config import load
+
+    monkeypatch.setenv("SMC_INTERNAL_ONLY", "${InternalOnly}")
+    with pytest.raises(ConfigError, match="SMC_INTERNAL_ONLY must be a boolean") as exc:
+        load()
+    assert "unsandboxed" in str(exc.value)

@@ -188,6 +188,7 @@ operator writes it by hand.
 | `secrets` | list of `[canonical name, ARN]` pairs; one must be named for the model credential |
 | `cpu_architecture` | `X86_64` or `ARM64`; defaults to `X86_64` |
 | `assign_public_ip` | JSON boolean; defaults to `false` |
+| `internal_only` | JSON boolean; defaults to `false`. The operator's claim that this lane serves their OWN crews and takes no external prompts. With it the container starts the model subprocess **unsandboxed**, which is what lets it run on Fargate at all — see the security model for what claiming it accepts |
 | `task_ttl_seconds` | how long one task may run before the launcher stops it; JSON integer above zero; omitted takes the engine's own default |
 
 `task_ttl_seconds` is the operator-reachable half of `TaskBounds`. Before it the
@@ -263,9 +264,16 @@ block without it would register a lane that rejects every launch through it. The
 whole secret **set** is judged, by calling the engine's own `secret_destinations`
 and `sole_binding`: a valid credential reference sitting beside a malformed one, or
 beside one belonging to a different crew, voids the block rather than registering a
-lane whose every launch then fails. A present-but-non-boolean `assign_public_ip`
-voids the whole block rather than being coerced, because coercion would read the
-string `"false"` as true on the one field that decides network exposure. For the
+lane whose every launch then fails. A present-but-non-boolean value in ANY boolean
+field voids the whole block rather than being coerced, because coercion would read the
+string `"false"` as true — on `assign_public_ip`, which decides network exposure, and on
+`internal_only`, which decides the trust boundary. That rejection is written once over
+the dataclass's boolean fields for the same reason the string one is: a hand-written
+branch per field is exactly what let `cluster` keep coercing after `assign_public_ip`
+was fixed one field over. `internal_only` is deliberately NOT part of the completeness
+judgement — a lane that does not claim it is a complete, usable lane that simply cannot
+run where there is no user namespace, which is every lane's behaviour before the key
+existed. For the
 same reason **no** string-typed field is coerced: `str()` would turn JSON `false`
 into the non-empty string `"False"` and register a lane against a cluster that does
 not exist. The rejection is written once over the dataclass's string fields, so a
@@ -316,6 +324,30 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
 
 ## Security model
 
+- **The Fargate lane is internal-only, and that is a claim the operator makes.**
+  The crew container is sandboxed-only and Fargate cannot be sandboxed: kiro-cli
+  sandboxes the model subprocess in an unprivileged user namespace, Fargate's default
+  seccomp profile denies one, and no task-definition field supplies it (no
+  `privileged`, no `dockerSecurityOptions`, `linuxParameters` admits only
+  `CAP_SYS_PTRACE`). Measured on a real task, which exited 1 at the sandbox check with
+  every step before it succeeding. `cloud.json`'s `fargate.internal_only` is where the
+  operator states that this lane serves their OWN crews and takes no external prompts;
+  the launcher derives `SMC_INTERNAL_ONLY` from it, and with that set the container
+  starts with the model subprocess unsandboxed.
+  What claiming it ACCEPTS: that subprocess auto-approves every tool it calls and can
+  reach the model credential. Reachability, not residency, is the operative property —
+  the backend answers the engine's token request from the crew's vault so the backend's
+  uid must be able to decrypt it, and the worker is a child of the backend under that
+  same uid (measured: a uid-1000 process reads and decrypts it directly). So moving the
+  credential out of the worker's environment does not close it, and the claim is what
+  makes it acceptable: prompt injection needs a prompt from someone else, and the
+  boundary says there is nobody else.
+  The setting names the BOUNDARY and not the consequence, deliberately: an operator
+  cannot ask for "allow unsandboxed", only state what makes it acceptable. Absent means
+  not claimed, so a lane that says nothing keeps refusing, and no other lane and no
+  local host is affected. It is not the multi-tenant answer — a user namespace is the
+  real containment, and a Firecracker-based runtime is the answer for external or
+  shared callers.
 - **No stored credentials.** `cloud.json` holds profile name + region + tag, plus
   the `fargate` block's placement and its secret **names and ARNs** -- identifiers,
   never values. The task's execution role fetches each secret's value from Secrets
@@ -799,12 +831,22 @@ The refusals, each stated as a property rather than as the case that prompted it
   task is**, which the spec's secrets fix through the crew they name, it
   decides **who may reach it**, which is the credential set and the trust-domain
   declaration, or it decides **what it may cost**, which is the lifetime the
-  launcher also enforces. `SMC_CREW_NAME`, `SMC_SINGLE_PRINCIPAL` and
+  launcher also enforces. `SMC_CREW_NAME`, `SMC_SINGLE_PRINCIPAL`,
+  `SMC_INTERNAL_ONLY` and
   `SMC_TASK_TTL_SECONDS` are derived and written here; `SMC_CONTROL_SECRET`,
   `KIRO_IDENTITY`, `KIRO_API_KEY`, `SMC_BUNDLE_DIR` and
   `SMC_FRONT_PORT` are refused and never written. Everything else stays the
   caller's: a bucket cannot contradict the spec, because the spec says nothing
   about buckets.
+- `SMC_INTERNAL_ONLY` is the one derived name that LOOSENS a posture, so it is
+  derived for a sharper reason than the others. With it the container starts the model
+  subprocess unsandboxed, and it is the operator's `fargate.internal_only` claim that
+  says so — a caller who could supply the variable could grant that posture to a lane
+  whose operator never made the claim, which is the entire property the setting
+  carries. It sits on the "who may reach it" limb: the claim is precisely that nobody
+  outside the operator does. It is written as `"0"` or `"1"` and always present, for
+  the reason the lifetime is — so the container never has to tell a launcher that did
+  not claim the boundary apart from one that forgot the variable.
 - `SMC_TASK_TTL_SECONDS` is derived rather than accepted because a caller who could
   raise it could keep a task past the bound the sweep enforces, which is opting out
   of a cost cap rather than configuring it. `0` is written when no lifetime is asked
