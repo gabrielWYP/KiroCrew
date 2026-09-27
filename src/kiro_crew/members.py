@@ -19,6 +19,7 @@ frequency counts taken from it stay stable.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -31,7 +32,12 @@ from pathlib import Path
 
 from kiro_crew import platform_compat
 from kiro_crew.artifacts import slugify
-from kiro_crew.atomic_write import atomic_write, fsync_dir, read_bytes_with_retry
+from kiro_crew.atomic_write import (
+    atomic_write,
+    fsync_dir,
+    read_bytes_with_retry,
+    replace_with_retry,
+)
 from kiro_crew.config.paths import data_home
 from kiro_crew.external_text import external_text_requires_redaction
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
@@ -456,7 +462,92 @@ def is_configured_dispatchable_member(name: object, config=None) -> bool:
         from kiro_crew.config.loader import KiroCrewConfig
 
         config = KiroCrewConfig.load()
-    return name in config.agents and is_dispatchable_member_name(name)
+    resolved = resolve_member(name, config)
+    return resolved is not None and is_dispatchable_member_name(member_display_name(*resolved))
+
+
+def resolve_member(name_or_id: object, config=None):
+    """``(member_id, cfg)`` for a Crew Member named by id or display name, else ``None``.
+
+    ``config.agents`` is keyed by ``member_id``. Every user-facing handle -- an
+    API path segment, a chat ``crew=``, a cron ``member_id``, a spawn target, a
+    slot's pinned ``agent`` -- goes through here so no site guesses which of the
+    two it holds. Resolution order:
+
+    1. the key itself (the id -- always preferred, never ambiguous);
+    2. the unique member whose ``display_name`` equals the handle exactly;
+    3. the unique member whose ``legacy_keys`` (the keys the migration moved it
+       from -- its earlier names) contains the handle, so a handle a client or
+       an overlay saved before the re-key still names the member after it was
+       renamed away from that label.
+
+    A handle shared by two members, or matching nothing, is ``None``: a lookup
+    that cannot be answered uniquely is refused, never guessed. A legacy record
+    with no ``member_id`` keeps its name as the key, so it is found by rule 1
+    unchanged.
+    """
+    if not isinstance(name_or_id, str) or not name_or_id:
+        return None
+    if config is None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        config = KiroCrewConfig.load()
+    agents = getattr(config, "agents", None)
+    if not isinstance(agents, dict):
+        return None
+    hit = agents.get(name_or_id)
+    if hit is not None:
+        return name_or_id, hit
+    matches = [
+        (key, cfg) for key, cfg in agents.items() if getattr(cfg, "display_name", "") == name_or_id
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        return None
+    remembered = [
+        (key, cfg)
+        for key, cfg in agents.items()
+        if name_or_id in (getattr(cfg, "legacy_keys", None) or ())
+    ]
+    return remembered[0] if len(remembered) == 1 else None
+
+
+def resolve_member_id(name_or_id: object, config=None) -> str | None:
+    """The ``config.agents`` key for a member handle, or ``None``."""
+    resolved = resolve_member(name_or_id, config)
+    return None if resolved is None else resolved[0]
+
+
+def member_record(name_or_id: object, config=None):
+    """The ``KiroCrewAgentConfig`` a member handle names, or ``None``.
+
+    The drop-in for ``config.agents.get(handle)`` at every site whose handle
+    may be a display name (a slot's pinned agent, a cron or messaging crew, a
+    spawn target) rather than the key.
+    """
+    resolved = resolve_member(name_or_id, config)
+    return None if resolved is None else resolved[1]
+
+
+def member_display_name(member_id: str, cfg) -> str:
+    """What the roster shows for one record: its ``display_name``, else its key."""
+    label = getattr(cfg, "display_name", "")
+    return label if isinstance(label, str) and label else member_id
+
+
+def same_member(a: object, b: object, config=None) -> bool:
+    """Whether two handles (id or display name) name the same configured member."""
+    if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+        return False
+    if a == b:
+        return True
+    if config is None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        config = KiroCrewConfig.load()
+    left = resolve_member_id(a, config)
+    return left is not None and left == resolve_member_id(b, config)
 
 
 def member_pin_matches(mode: object, current_agent: object, requested_agent: object) -> bool:
@@ -467,6 +558,47 @@ def member_pin_matches(mode: object, current_agent: object, requested_agent: obj
         and isinstance(requested_agent, str)
         and requested_agent == current_agent
     )
+
+
+def avatars_root() -> Path:
+    """Directory of the crews' uploaded pictures (``run/avatars`` under the data home).
+
+    Shared by the dashboard's avatar routes and the config loader's member
+    re-key, which moves a picture with the label it is filed under.
+    """
+    return data_home() / "run" / "avatars"
+
+
+def avatar_stem(label: str) -> str:
+    """Path-safe filename stem for a crew's picture: a digest of its display name."""
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def relabel_avatar_files(old_label: str, new_label: str) -> int:
+    """Move every picture file stemmed by *old_label* onto *new_label*'s stem.
+
+    Best-effort and idempotent: files already under the new stem are left as
+    they are, a missing directory moves nothing, and a file that cannot be
+    moved is logged and skipped. Returns the number of files moved.
+    """
+    if not old_label or not new_label or old_label == new_label:
+        return 0
+    root = avatars_root()
+    if not root.is_dir():
+        return 0
+    old_stem, new_stem = avatar_stem(old_label), avatar_stem(new_label)
+    moved = 0
+    for path in sorted(root.glob(f"{old_stem}.*")):
+        if not path.is_file():
+            continue
+        target = root / f"{new_stem}{path.name[len(old_stem):]}"
+        try:
+            replace_with_retry(path, target)
+        except OSError:
+            logger.warning("could not move avatar file %s onto its member's label", path.name)
+            continue
+        moved += 1
+    return moved
 
 
 def members_root() -> Path:
@@ -531,22 +663,28 @@ def slug_for_name(name: str) -> str:
 
 
 def member_slug(name: str, config=None) -> str:
-    """Use persisted member identity; legacy members retain their existing slug."""
+    """Use persisted member identity; legacy members retain their existing slug.
+
+    *name* is any member handle (``member_id`` key or display name). A member
+    with a persisted ``member_id`` answers that id -- the ``config.agents`` key
+    -- whichever handle named it. An identity-less legacy record, and a handle
+    that names no member, derive the slug from the name as before.
+    """
     if config is None:
         from kiro_crew.config.loader import KiroCrewConfig
 
         config = KiroCrewConfig.load()
-    agent = config.agents.get(name)
+    resolved = resolve_member(name, config)
+    key, agent = resolved if resolved is not None else (name, None)
     member_id = getattr(agent, "member_id", "") if agent else ""
-    return validate_slug(member_id) if member_id else slug_for_name(name)
+    return validate_slug(member_id) if member_id else slug_for_name(key)
 
 
 def _stable_member_slug(slug: str, name: str) -> bool:
     from kiro_crew.config.loader import KiroCrewConfig
 
-    cfg = KiroCrewConfig.load()
-    agent = cfg.agents.get(name)
-    return bool(agent and getattr(agent, "member_id", "") == slug)
+    resolved = resolve_member(name, KiroCrewConfig.load())
+    return bool(resolved and getattr(resolved[1], "member_id", "") == slug)
 
 
 def member_dir(slug: str) -> Path:

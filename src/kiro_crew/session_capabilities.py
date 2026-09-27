@@ -17,6 +17,7 @@ from kiro_crew.agent_capabilities import (
 )
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import default_project_dir, resolve_crew_identity
+from kiro_crew.members import member_record
 from kiro_crew.platform.governance_profiles import governance_answer_generation
 
 
@@ -53,7 +54,7 @@ def prepare_runtime(
     member = resolve_crew_identity(cfg, agent, crew_agent)
     if not member:
         return CapabilityPreparation("")
-    binding = cfg.agents.get(member)
+    binding = member_record(member, cfg)
     if binding is None:
         raise CapabilityStartupError("capability_member_missing")
     try:
@@ -70,7 +71,7 @@ def prepare_runtime(
         reconcile_member_capabilities(member)
         if not cwd:
             cfg = KiroCrewConfig.load()
-            cwd = default_project_dir(cfg.agents[member].workspace)
+            cwd = default_project_dir(binding.workspace)
         prepared = prepare_member_capabilities(member, cwd)
     except CapabilityError as exc:
         # The chat error card links to THIS member's Capabilities pane, where

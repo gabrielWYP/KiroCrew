@@ -33,6 +33,7 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.config.paths import project_agents_dir
+from kiro_crew.members import resolve_member
 from kiro_crew.platform import redact_via_context
 from kiro_crew.platform.governance import sanitize_agent_config_governance
 from kiro_crew.platform.governance_profiles import governance_answer_generation
@@ -778,27 +779,32 @@ class CapabilityService:
     def _snapshot(
         self, member: str, document: dict | None = None, prepared: dict | None = None
     ) -> dict:
-        from kiro_crew.config.loader import _deep_merge, read_config_for_update
+        from kiro_crew.config.loader import merge_config_documents, read_config_for_update
         from kiro_crew.platform.governance_profiles import poll_profiles_fresh
 
         if prepared is None:
             cfg = KiroCrewConfig.load()
             poll_profiles_fresh()
-            binding = cfg.agents.get(member)
-            if binding is None:
-                raise CapabilityError("agent_not_found", 404)
+            # ``member`` arrives as any handle (the roster hands the route the
+            # display name); from here on, and in every snapshot, sidecar entry
+            # and document index derived from it, it is the ``config.agents``
+            # KEY, which is what the raw documents below are indexed by.
+            member, binding = _canonical_member(member, cfg)
             binding_data = vars(binding)
             project = default_project_dir(binding.workspace)
             project = str(Path(project).resolve()) if project else ""
             overlay = read_config_for_update(config_local_path())
-            raw = _deep_merge(read_config_for_update(), overlay)
+            raw = merge_config_documents(read_config_for_update(), overlay)
             catalog = self._catalog(project)
             connections = self._connections()
         else:
             overlay = read_config_for_update(config_local_path())
             raw = (
-                document if document is not None else _deep_merge(read_config_for_update(), overlay)
+                document
+                if document is not None
+                else merge_config_documents(read_config_for_update(), overlay)
             )
+            member = prepared["member"]
             if (
                 raw.get("agents", {}).get(member) != prepared["raw_binding"]
                 or raw.get("workspaces") != prepared["raw_workspaces"]
@@ -859,7 +865,11 @@ class CapabilityService:
             "binding": binding_data,
             "connections": connections,
             "raw_binding": raw.get("agents", {}).get(member),
-            "overlay_binding": overlay.get("agents", {}).get(member),
+            # The overlay is read through the same canonicalization the merge
+            # applies, so an entry filed under the member's legacy key or
+            # display name still reads as a local override and the binding
+            # write goes to config.local.json, where it is not shadowed.
+            "overlay_binding": _canonical_overlay_agents(raw, overlay).get(member),
             "raw_workspaces": raw.get("workspaces"),
             "raw_default_workspace": raw.get("default_workspace"),
         }
@@ -1136,8 +1146,9 @@ class CapabilityService:
         """One atomic binding delta, with base then overlay locks on every path."""
         from kiro_crew.config.loader import (
             _config_write_lock,
-            _deep_merge,
             config_path,
+            merge_config_documents,
+            raw_agent_key,
             read_config_for_update,
         )
 
@@ -1153,7 +1164,7 @@ class CapabilityService:
                     locks.enter_context(_config_write_lock(overlay_path.resolve()))
                 base = read_config_for_update(base_path) if local else document
                 overlay = document if local else read_config_for_update(overlay_path)
-                effective = _deep_merge(copy.deepcopy(base), overlay)
+                effective = merge_config_documents(copy.deepcopy(base), overlay)
                 previous = copy.deepcopy(effective.get("agents", {}))
                 result = mutate(effective)
                 if result is None:
@@ -1162,7 +1173,11 @@ class CapabilityService:
                 for member in prepared:
                     binding = effective["agents"][member]["kiro_agent"]
                     if binding != previous.get(member, {}).get("kiro_agent"):
-                        document.setdefault("agents", {}).setdefault(member, {})[
+                        # Filed where the member's record IS in the raw document
+                        # (its legacy key while the loader's write-back has not
+                        # landed), never beside it under the id.
+                        raw_key = raw_agent_key(document, member, base=base if local else None)
+                        document.setdefault("agents", {}).setdefault(raw_key, {})[
                             "kiro_agent"
                         ] = binding
                         changed = True
@@ -1182,7 +1197,12 @@ class CapabilityService:
         snap = self._snapshot(member, document, (prepared or {}).get(member))
         if body["revision"] != snap["revision"]:
             raise CapabilityError("stale_revision")
-        names = list(dict.fromkeys([member, *body["accept_members"]]))
+        # Every accepted handle canonicalized alongside ``member`` (which
+        # ``_snapshot`` returns as ``snap["member"]``), so one member named twice
+        # -- by id and by display name -- plans once.
+        member = snap["member"]
+        accepted = [_canonical_member(name)[0] for name in body["accept_members"]]
+        names = list(dict.fromkeys([member, *accepted]))
         plans = []
         for name in names:
             other = (
@@ -1242,6 +1262,7 @@ class CapabilityService:
     def reset(self, member: str, expected_template: str) -> dict:
         """Explicit owner reset accepts the verified current Parent as a whole."""
         snap = self._snapshot(member)
+        member = snap["member"]
         if snap["target"] != expected_template or not snap["intent"]:
             raise CapabilityError("stale_binding")
         if snap["error"]:
@@ -1334,6 +1355,7 @@ class CapabilityService:
         ):
             raise CapabilityError("invalid_template_name", 400)
         snap = self._snapshot(member)
+        member = snap["member"]
         receipt = agent_state.get_publish_info(name)
         if receipt is not None:
             if receipt["member"] != member or expected_template not in (receipt["source"], name):
@@ -1538,12 +1560,32 @@ def require_unmanaged_template(name: str) -> None:
         raise CapabilityError("capabilities_editor_required")
 
 
+def _canonical_overlay_agents(effective: dict, overlay: dict) -> dict:
+    """The overlay's ``agents`` map re-keyed onto the effective document's keys."""
+    from kiro_crew.config.loader import canonicalize_overlay_agents, rekey_agents_document
+
+    overlay_agents = overlay.get("agents")
+    if not isinstance(overlay_agents, dict):
+        return {}
+    base_agents = effective.get("agents")
+    if not isinstance(base_agents, dict):
+        return dict(overlay_agents)
+    _rekeyed, plan = rekey_agents_document(base_agents)
+    return canonicalize_overlay_agents(base_agents, plan, overlay_agents)
+
+
+def _canonical_member(member: str, cfg: KiroCrewConfig | None = None) -> tuple[str, Any]:
+    """``(config.agents key, record)`` for any member handle, else ``agent_not_found``."""
+    resolved = resolve_member(member, cfg if cfg is not None else KiroCrewConfig.load())
+    if resolved is None:
+        raise CapabilityError("agent_not_found", 404)
+    return resolved
+
+
 def prepare_member_capabilities(member: str, project_dir: str | Path | None = None) -> dict:
     """Read-only startup seam; success proves saved bytes, never runtime loading."""
     cfg = KiroCrewConfig.load()
-    binding = cfg.agents.get(member)
-    if binding is None:
-        raise CapabilityError("agent_not_found", 404)
+    member, binding = _canonical_member(member, cfg)
     intent = agent_state.get_capabilities(binding.kiro_agent)
     if intent is None:
         return {"template": binding.kiro_agent, "revision": "", "status": "unverified"}
@@ -1582,9 +1624,7 @@ def prepare_member_capabilities(member: str, project_dir: str | Path | None = No
 def reconcile_member_capabilities(member: str) -> None:
     """Publish changed effective bytes as a new generation; leave live specs intact."""
     cfg = KiroCrewConfig.load()
-    binding = cfg.agents.get(member)
-    if binding is None:
-        raise CapabilityError("agent_not_found", 404)
+    member, binding = _canonical_member(member, cfg)
     saved = agent_state.get_capabilities(binding.kiro_agent)
     if saved is None:
         return

@@ -11,7 +11,13 @@ import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 export interface KiroCrewAgent {
+  /** The crew's display name. Every `/api/agents/{name}` route resolves it, and
+   *  resolves `member_id` too, so addressing by `name` keeps working; `name` is
+   *  an alias of `display_name` kept for one release. */
   name: string
+  /** The `config.agents` key: the crew's immutable identity (empty for a
+   *  project-scope row). Optional: older payloads predate the field. */
+  member_id?: string
   kiro_agent: string
   workspace: string
   memory_store: string
@@ -21,10 +27,8 @@ export interface KiroCrewAgent {
   /** This agent's own default reasoning effort. '' means inherit the global
    *  default. Optional: older payloads predate the field. */
   reasoning_effort?: string
-  /** Optional label shown in place of `name`. Presentation only: `name` stays
-   *  the immutable identity every route, dispatch and binding is keyed on.
-   *  Empty or absent means the name itself is displayed. Optional: older
-   *  payloads predate the field. */
+  /** The crew's display name (free-form; renaming edits this field only, the
+   *  identity is `member_id`). Optional: older payloads predate the field. */
   display_name?: string
   description: string
   /** Free-text routing intent read by the orchestrator's select_crew. Optional:

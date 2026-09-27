@@ -3260,6 +3260,9 @@ async def test_running_private_thread_refuses_ownership_changed_during_read(
             elif fault == "store_version":
                 current.memory_stores[store].memory_version = 1
             elif fault == "store_owner":
+                # ``owner_member_id`` is the authoritative owner; the
+                # ``owner_member`` label is descriptive and may lag a rename.
+                current.memory_stores[store].owner_member_id = OTHER
                 current.memory_stores[store].owner_member = OTHER
             elif fault == "store_shared":
                 current.agents[OTHER] = KiroCrewAgentConfig(memory_store=store)

@@ -107,6 +107,10 @@ LOCK_TIMEOUT_SECS: float | None = None
 #: every reader tolerates (``prune_unknown``) and which :func:`release_name`
 #: clears the moment the name is registered again.
 KnownCrews = Callable[[], set[str]]
+#: Maps any handle a caller or the stored document names a crewmate by (its
+#: ``config.agents`` key or its display name) to the ONE identity the document
+#: stores, so one member cannot appear twice under two spellings.
+Canonical = Callable[[str], str]
 
 #: Hard cap on a team name. Enforced on write and refused loudly, never
 #: truncated: a name is what the roster header shows.
@@ -554,8 +558,12 @@ def prune_unknown(teams: list[Team], known: set[str]) -> list[Team]:
     return [Team(id=t.id, name=t.name, members=[m for m in t.members if m in known]) for t in teams]
 
 
-def _validate_names(members: object) -> list[str]:
-    """Shape and bounds only -- the list a write may RETAIN, registry aside."""
+def _validate_names(members: object, canonical: Canonical | None = None) -> list[str]:
+    """Shape and bounds only -- the list a write may RETAIN, registry aside.
+
+    With *canonical*, every handle is mapped to its stored identity BEFORE the
+    de-duplication, so an id and its display-name alias collapse to one entry.
+    """
     if not isinstance(members, list):
         raise TeamError("invalid_members", "members must be a list of crewmate names")
     if len(members) > TEAM_MEMBERS_MAX:
@@ -571,13 +579,31 @@ def _validate_names(members: object) -> list[str]:
         # would then refuse whole.
         if len(member) > MEMBER_NAME_MAX_CHARS or not _utf8_encodable(member):
             raise TeamError("invalid_members", "members must be a list of crewmate names")
+        if canonical is not None:
+            member = canonical(member)
         if member not in out:
             out.append(member)
     return out
 
 
-def _validate_members(members: object, known: set[str]) -> list[str]:
-    out = _validate_names(members)
+def canonicalize_teams(teams: list[Team], canonical: Canonical) -> list[Team]:
+    """*teams* with every stored member mapped through *canonical* and de-duplicated.
+
+    A document written when members were filed under their display names still
+    names them that way; mapping on read keeps the one-team invariant exact
+    across both spellings without rewriting the document.
+    """
+    out = []
+    for team in teams:
+        members = list(dict.fromkeys(canonical(m) for m in team.members))
+        out.append(Team(id=team.id, name=team.name, members=members))
+    return out
+
+
+def _validate_members(
+    members: object, known: set[str], canonical: Canonical | None = None
+) -> list[str]:
+    out = _validate_names(members, canonical)
     for member in out:
         if member not in known:
             raise TeamError("unknown_member", f"no crewmate named {member!r}")
@@ -599,16 +625,21 @@ def _find(teams: list[Team], team_id: str) -> Team:
     raise TeamError("team_not_found", f"no team with id {team_id!r}")
 
 
-def create_team(name: object, members: object, *, known: KnownCrews) -> Team:
+def create_team(
+    name: object, members: object, *, known: KnownCrews, canonical: Canonical | None = None
+) -> Team:
     """Append a team; moves the listed crewmates out of their current team.
 
-    *known* returns the registered crew names every listed member must be in;
-    it is called inside the document lock (see :data:`KnownCrews`).
+    *known* returns the registered crew identities every listed member must be
+    in; it is called inside the document lock (see :data:`KnownCrews`).
+    *canonical* maps submitted and stored handles to those identities first.
     """
     clean_name = validate_team_name(name)
     with document_lock():
-        clean_members = _validate_members(members, known())
+        clean_members = _validate_members(members, known(), canonical)
         teams = read_teams()
+        if canonical is not None:
+            teams = canonicalize_teams(teams, canonical)
         if len(teams) >= TEAMS_MAX:
             raise TeamError("too_many_teams", f"at most {TEAMS_MAX} teams")
         team_id = _new_team_id()
@@ -629,6 +660,7 @@ def update_team(
     add: object | None = None,
     remove: object | None = None,
     known: KnownCrews,
+    canonical: Canonical | None = None,
 ) -> Team:
     """Rename and/or re-member one team. Omitted fields are left unchanged.
 
@@ -647,10 +679,14 @@ def update_team(
     clean_name = validate_team_name(name) if name is not None else None
     with document_lock():
         registry = known() if members is not None or add is not None else set()
-        clean_members = _validate_members(members, registry) if members is not None else None
-        clean_add = _validate_members(add, registry) if add is not None else []
-        clean_remove = _validate_names(remove) if remove is not None else []
+        clean_members = (
+            _validate_members(members, registry, canonical) if members is not None else None
+        )
+        clean_add = _validate_members(add, registry, canonical) if add is not None else []
+        clean_remove = _validate_names(remove, canonical) if remove is not None else []
         teams = read_teams()
+        if canonical is not None:
+            teams = canonicalize_teams(teams, canonical)
         team = _find(teams, team_id)
         if clean_name is not None:
             team.name = clean_name

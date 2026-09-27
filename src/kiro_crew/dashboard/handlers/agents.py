@@ -23,6 +23,7 @@ from aiohttp import BodyPartReader, web
 
 from kiro_crew import agent_state
 from kiro_crew import crew_teams as teams_mod
+from kiro_crew import members as members_mod
 from kiro_crew import model_registry, model_scope
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp_backends import (
@@ -93,7 +94,6 @@ from kiro_crew.config.loader import (
     update_config_locked,
     write_config_atomically,
 )
-from kiro_crew.config.paths import data_home
 from kiro_crew.config.schema import SCHEMA_REGISTRY, config_entry_to_dict
 from kiro_crew.config.sections import (
     _AVATAR_FILE_PIN_RE,
@@ -138,11 +138,18 @@ from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
 from kiro_crew.external_text import redact_external_text as _redact_external
 from kiro_crew.loop_lock import LoopBoundLock
-from kiro_crew.members import MemberNameError, validate_member_name
+from kiro_crew.members import (
+    MemberNameError,
+    member_display_name,
+    resolve_member,
+    resolve_member_id,
+    validate_member_name,
+)
 from kiro_crew.memory_stores import (
     DEFAULT_MEMORY_STORE,
     MemberAlreadyExists,
     UnknownMemoryStore,
+    _allocate_member_id,
     memory_store_binding_defect,
     memory_store_namespace_lock,
     persist_member_config,
@@ -1371,10 +1378,16 @@ async def api_default_agent(request: web.Request) -> web.Response:
         # action — project-scope rows carry scope="project" in /api/agents
         # precisely so UIs can disable this, but the config file is the last
         # line of defense.
+        loaded_cfg: KiroCrewConfig | None = None
         try:
             # Config load is stat/read/validation filesystem work; off-loop so
             # slow storage cannot freeze chat and the liveness heartbeat.
-            known = set((await asyncio.to_thread(KiroCrewConfig.load)).agents.keys())
+            loaded_cfg = await asyncio.to_thread(KiroCrewConfig.load)
+            known = set(loaded_cfg.agents.keys())
+            # The roster hands clients the display name as ``name``; the stored
+            # default is the ``config.agents`` KEY, so either handle is accepted
+            # and the key is what is written.
+            name = resolve_member_id(name, loaded_cfg) or name
         except Exception:
             known = set()
         # Fail CLOSED: an unreadable config yields an empty `known`, and that is
@@ -1430,9 +1443,34 @@ async def api_default_agent(request: web.Request) -> web.Response:
                 {"error": "failed to read config file", "code": "config_unreadable"},
                 status=500,
             )
-        return web.json_response({"ok": True, "default_agent": name})
+        return web.json_response(
+            {
+                "ok": True,
+                "default_agent": name,
+                "name": _default_agent_handle(loaded_cfg, name) if loaded_cfg else name,
+            }
+        )
     cfg = KiroCrewConfig.load()
-    return web.json_response({"default_agent": cfg.default_agent})
+    return web.json_response(
+        {
+            "default_agent": cfg.default_agent,
+            "name": _default_agent_handle(cfg, cfg.default_agent),
+        }
+    )
+
+
+def _default_agent_handle(cfg: KiroCrewConfig, key: str) -> str:
+    """The roster ``name`` of the default member: what a client compares rows against.
+
+    ``default_agent`` is the ``config.agents`` key; roster rows carry the
+    display name as ``name`` (with ``member_id`` beside it), so the marker a
+    picker draws next to "the default" has to be spelled the way the rows are.
+    A key that names no member (an agent template) is returned as it is.
+    """
+    from kiro_crew.dashboard.handlers.members import member_roster_handle
+
+    record = cfg.agents.get(key)
+    return member_roster_handle(key, record) if record is not None else key
 
 
 # ── Config Schema ──
@@ -2743,6 +2781,9 @@ def _rebind_crew_locked(
 ) -> None:
     """Apply ONLY the binding delta to config.json, under the advisory lock.
 
+    *crew* is the ``config.agents`` key (the member_id), which is also what a
+    fork sidecar records as a copy's ``private_to``.
+
     A full ``cfg.save()`` snapshot races every other config writer (CLI,
     settings PUTs): it re-writes fields from a load taken before this
     handler's awaits, silently reverting concurrent changes. The stale-binding
@@ -2793,7 +2834,15 @@ class _UnverifiableLineage(Exception):
 
 
 def _foreign_private_copy_owner(crew: str, target: str) -> str | None:
-    """The owning crew's name when *target* is ANOTHER crew's private copy.
+    """The owner's key when *target* is ANOTHER crew's private copy.
+
+    Ownership is decided on the ``config.agents`` KEY alone. A display name is
+    never accepted as an owner spelling: labels are reusable (a member is
+    renamed, a new member takes the old label), so an owner recorded by label
+    would hand the copy to whichever member currently wears it. The config
+    loader rewrites legacy label owners to keys when it re-keys the agents map,
+    and the rename route repairs the renamed member's own copy; anything still
+    recorded by label reads as foreign (fail closed).
 
     Lineage means one crew's edits land on that file: binding a second crew to
     it has publish/reset cleanup delete the second crew's live template out
@@ -2820,7 +2869,9 @@ def _foreign_private_copy_owner(crew: str, target: str) -> str | None:
     except Exception as exc:
         raise _UnverifiableLineage(target) from exc
     owner = (info or {}).get("private_to")
-    return owner if isinstance(owner, str) and owner and owner != crew else None
+    if not isinstance(owner, str) or not owner:
+        return None
+    return None if owner == crew else owner
 
 
 def _reserved_binding_names(cfg_data: dict) -> set[str]:
@@ -2975,11 +3026,16 @@ async def api_agent_fork(request: web.Request) -> web.Response:
             )
 
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        if crew not in cfg.agents:
+        # ``crew`` arrives as the roster's handle (id or display name); from
+        # here on it is the ``config.agents`` key, and ``crew_label`` the name
+        # a fork sidecar may record as the owner.
+        resolved_crew = resolve_member(crew, cfg)
+        if resolved_crew is None:
             return web.json_response(
                 {"error": f"Agent '{crew}' not found", "code": "agent_not_found"}, status=404
             )
-        agent = cfg.agents[crew]
+        crew, agent = resolved_crew
+        crew_label = member_display_name(crew, agent)
         # A stale or racing request must not clobber a newer binding: the fork
         # was issued against the crew's current template, so require it still is.
         if agent.kiro_agent not in (name, source_name):
@@ -3005,7 +3061,7 @@ async def api_agent_fork(request: web.Request) -> web.Response:
         # package-filename guess from misreading a dashed copy name.
         # Bounded to keep the filename (plus a collision suffix) inside the
         # 63-char template-name rule and every filesystem's component limit.
-        base = re.sub(r"[^A-Za-z0-9_.-]+", "-", crew)[:48].strip("-.") or "agent"
+        base = re.sub(r"[^A-Za-z0-9_.-]+", "-", crew_label)[:48].strip("-.") or "agent"
         # The specs Kiro Crew itself generates (kirocrew.json, kirocrew-lite.json,
         # ...) are rebuilt on boot; a copy landing on one of those stems while
         # the managed file is absent would be overwritten by that rebuild, so
@@ -3270,10 +3326,12 @@ async def api_agent_publish(request: web.Request) -> web.Response:
             )
 
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        if crew not in cfg.agents:
+        resolved_crew = resolve_member(crew, cfg)
+        if resolved_crew is None:
             return web.json_response(
                 {"error": f"Agent '{crew}' not found", "code": "agent_not_found"}, status=404
             )
+        crew = resolved_crew[0]
         # Only a private copy can be published: publishing a template that is
         # already shared would silently duplicate it, and publishing another
         # crew's copy would leak their customization.
@@ -4207,6 +4265,10 @@ def _agent_roster_row(
 ) -> dict[str, object]:
     """Serialize ONE ``GET /api/agents`` roster row.
 
+    *name* is the ``config.agents`` key (the member_id) for a global row and
+    the scanned file stem for a project row. The row ships ``member_id`` (the
+    key), ``display_name`` (the label) and ``name`` as an alias of the label.
+
     **Key half.** Explicit allowlist -- never a ``dataclasses.asdict`` spread,
     mirroring the rule ``handlers/members.py`` already documents for
     ``GET /api/members``. The response is a network-boundary contract, and a
@@ -4257,6 +4319,14 @@ def _agent_roster_row(
     field naming an external messaging binding). Adding any of them back is a
     one-line change plus the pinned key set.
     """
+    member_id = name if scope == "global" else ""
+    label = member_display_name(name, agent_cfg)
+    # ``name`` is the display name's alias, but it stays an ADDRESSING handle:
+    # a label the redactors would alter (a stored credential-shaped display
+    # name predating the create/rename refusal) falls back to the key, which
+    # every ``/api/agents/{name}`` route also resolves, so the owner keeps a
+    # handle and the label itself leaves only as the mask in ``display_name``.
+    handle = label if _roster_mask(label) == label else name
     return {
         # ``name`` is masked for an app token (which can address nothing) and for
         # every PROJECT row (which nothing can address either: both
@@ -4277,7 +4347,11 @@ def _agent_roster_row(
         # this value (``AgentSelector.tsx:127`` ``onChange(a.name)``). That is
         # confined to names the redactors would alter; an ordinary project agent
         # name is byte-identical.
-        "name": _roster_mask(name) if (redact or scope == "project") else name,
+        "name": _roster_mask(handle) if (redact or scope == "project") else handle,
+        # The ``config.agents`` KEY: the crew's immutable identity. Empty
+        # for a project row, which has no config record. Never masked -- it is a
+        # slug the allocator minted, not user-authored text.
+        "member_id": member_id,
         # The project-scope tag: "project" rows dispatch only from the
         # slot whose project they were scanned from. Handler-added, not a
         # record field.
@@ -4287,10 +4361,11 @@ def _agent_roster_row(
         "memory_store": _roster_mask(agent_cfg.memory_store),
         "model": _roster_mask(agent_cfg.model),
         "reasoning_effort": _roster_mask(agent_cfg.reasoning_effort),
-        # Presentation label only — masked like every other user-authored string.
-        # The picker and roster render it in place of ``name`` when non-empty;
-        # ``name`` above stays the row's identity and dispatch handle.
-        "display_name": _roster_mask(agent_cfg.display_name),
+        # The crew's display name: the free-form label the user typed.
+        # ``name`` above carries the same string for one release, so a client
+        # that addresses ``/api/agents/{name}`` with it keeps working -- the
+        # server resolves either the id or the display name.
+        "display_name": _roster_mask(label),
         "description": _roster_mask(agent_cfg.description),
         "triggers": _roster_mask(agent_cfg.triggers),
         "source": _roster_mask(agent_cfg.source),
@@ -4396,7 +4471,11 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "agents": agents,
-            "default_agent": cfg.default_agent,
+            # Spelled as the rows' ``name`` (the display name), so
+            # ``row.name === default_agent`` marks the default row; the key
+            # rides beside it for clients that bind to identity.
+            "default_agent": _default_agent_handle(cfg, cfg.default_agent),
+            "default_member_id": cfg.default_agent,
         }
     )
 
@@ -4603,8 +4682,16 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
                             store_name = snap_entry.get("memory_store", "")
                             record = stores.get(store_name)
                             if isinstance(record, dict) and record.get("memory_version") == 2:
-                                owner = record.get("owner_member")
-                                if owner != aname:
+                                # ``owner_member_id`` is authoritative; the
+                                # ``owner_member`` label may spell an old handle.
+                                snap_id = snap_entry.get("member_id") or aname
+                                owned = (
+                                    record.get("owner_member_id") == snap_id
+                                    if record.get("owner_member_id")
+                                    else record.get("owner_member")
+                                    in (aname, snap_entry.get("display_name"))
+                                )
+                                if not owned:
                                     raise UnknownMemoryStore(
                                         f"memory store {store_name!r} ownership changed concurrently"
                                     )
@@ -5005,7 +5092,32 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             {"error": "display_name must be a string", "code": "invalid_display_name"},
             status=400,
         )
-    display_name = _raw_display.strip()
+    # ``name`` IS the display name. An explicit ``display_name`` in the
+    # body (an older client's separate label) wins as the label; ``name`` still
+    # seeds the member_id, so ``members/<slug-of-name>/`` lands where it did.
+    display_name = _raw_display.strip() or name
+    if display_name != name:
+        # The same two rules the ``name`` handle passed above: the label is what
+        # every roster and chat surface shows and dispatches, so a
+        # credential-shaped one would be stored only to be masked and refused.
+        if _name_would_be_masked(display_name):
+            return web.json_response(
+                {
+                    "error": (
+                        "Agent name looks like a credential or a URL carrying one. "
+                        "Pick a name that identifies the crew instead."
+                    ),
+                    "code": "credential_shaped_name",
+                },
+                status=400,
+            )
+        try:
+            validate_member_name(display_name)
+        except MemberNameError as exc:
+            return web.json_response(
+                {"error": f"Invalid Crew Member name: {exc}", "code": "invalid_member_name"},
+                status=400,
+            )
     # Same convention as session_color: a non-empty raw value that the coercer
     # collapses to "no override" is a caller mistake worth a 400, not a silent
     # fallback to the name-derived face. The one exception is a well-formed
@@ -5051,7 +5163,10 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
-        if name in cfg.agents:
+        # Refused when either handle already names a member -- as a key or as
+        # another crew's display name -- because ``resolve_member`` must answer
+        # every handle uniquely.
+        if resolve_member(name, cfg) is not None or resolve_member(display_name, cfg) is not None:
             return web.json_response(
                 {"error": f"Agent '{name}' already exists", "code": "agent_exists"}, status=409
             )
@@ -5102,25 +5217,38 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             session_color=session_color,
             avatar=avatar,
         )
+        # The record is keyed by its member_id from the first write:
+        # allocate the id for ``name`` now (the slug, suffixed only on
+        # collision with another id or key), insert under it, and let
+        # provisioning mint the same id -- the allocator exempts the entry's own
+        # key -- so key and ``member_id`` agree without a re-key on reload.
+        try:
+            member_key = _allocate_member_id(cfg, name)
+        except UnknownMemoryStore as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "member_memory_unavailable"}, status=409
+            )
         # Provision against this snapshot; publish the agent and owned store
         # together through persist_member_config's flocked delta and create guard.
         # A fresh allocation that never reached config.json is removed on the way
         # out (retire_unpublished_allocation re-reads the disk under the config
         # lock first, so a publication that did land is kept).
-        cfg.agents[name] = new_agent
+        cfg.agents[member_key] = new_agent
         previous_store = new_agent.memory_store
         previous_member_id = new_agent.member_id
         try:
             try:
-                await _drained_to_thread(provision_member_memory, cfg, name)
-                await _drained_to_thread(lambda: persist_member_config(cfg, name, create=True))
+                await _drained_to_thread(provision_member_memory, cfg, member_key)
+                await _drained_to_thread(
+                    lambda: persist_member_config(cfg, member_key, create=True)
+                )
             except BaseException:
-                allocated = cfg.agents[name].memory_store
+                allocated = cfg.agents[member_key].memory_store
                 if allocated != previous_store:
                     await _drained_to_thread(
                         lambda: retire_unpublished_allocation(
                             cfg,
-                            name,
+                            member_key,
                             allocated,
                             previous_store=previous_store,
                             previous_member_id=previous_member_id,
@@ -5150,25 +5278,26 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
     # read the binding the role default keys on, and a scheduled or messaging
     # session naming that crew would take the chat default instead. Creation is
     # therefore always a change by `_effort_inputs` (None -> a tuple).
-    await _refresh_session_defaults(request, name)
+    await _refresh_session_defaults(request, member_key)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.create",
         outcome="success",
         source="dashboard",
-        resources=name,
+        resources=member_key,
     )
-    # `member_id` is the crew's IMMUTABLE identity (allocated with its member
-    # memory; `member_config_for_id` resolves it and never a name or slug), so a
-    # client that must bind something to the crew it just made -- the Meet
-    # CrewMates flow's schedule -- can do so without going back through the
-    # mutable display name.
+    # `member_id` is the crew's IMMUTABLE identity (the ``config.agents`` key,
+    # allocated with its member memory; `member_config_for_id` resolves it and
+    # never a name or slug), so a client that must bind something to the crew it
+    # just made -- the Meet CrewMates flow's schedule -- can do so without going
+    # back through the mutable display name. ``name`` echoes the display name.
     return web.json_response(
         {
             "ok": True,
-            "name": name,
-            "memory_store": cfg.agents[name].memory_store,
-            "member_id": cfg.agents[name].member_id,
+            "name": display_name,
+            "display_name": display_name,
+            "memory_store": cfg.agents[member_key].memory_store,
+            "member_id": cfg.agents[member_key].member_id,
         }
     )
 
@@ -5226,11 +5355,13 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 status=400,
             )
         current = await asyncio.to_thread(KiroCrewConfig.load)
-        if name not in current.agents:
+        resolved_current = resolve_member(name, current)
+        if resolved_current is None:
             return web.json_response(
                 {"error": f"Agent '{name}' not found", "code": "agent_not_found"}, status=404
             )
-        stored_target = current.agents[name].kiro_agent
+        name = resolved_current[0]
+        stored_target = resolved_current[1].kiro_agent
         if new_target != stored_target and (
             not isinstance(new_target, str) or not TEMPLATE_NAME_RE.fullmatch(new_target)
         ):
@@ -5329,8 +5460,13 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
-        if name not in cfg.agents:
+        resolved_agent = resolve_member(name, cfg)
+        if resolved_agent is None:
             return web.json_response({"error": f"Agent '{name}' not found"}, status=404)
+        # From here ``name`` is the ``config.agents`` key (member_id) and
+        # ``prior_label`` the display name the request may be about to change.
+        name = resolved_agent[0]
+        prior_label = member_display_name(*resolved_agent)
         if "model" in body:
             # Validated before the write, reusing the config loaded just above so
             # this costs no extra read.
@@ -5423,15 +5559,48 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             agent.description = body["description"]
             changed.append("description")
         if "display_name" in body:
-            # Presentation only, but strictly a string: a non-string here would
-            # be stored verbatim and then rendered by every roster surface.
-            # "" is a real value — it clears the label back to the name.
+            # A RENAME: the display name is the crew's user-facing
+            # name, so it takes the same validator the create route applies
+            # and must stay unique across every handle -- another crew's key
+            # or display name -- or ``resolve_member`` could not answer it.
+            # Identity never moves: the key, ``member_id``, ``members/<id>/``,
+            # the DM slot key and the memory store are untouched. "" clears
+            # the label back to the key.
             if not isinstance(body["display_name"], str):
                 return web.json_response(
                     {"error": "display_name must be a string", "code": "invalid_display_name"},
                     status=400,
                 )
-            agent.display_name = body["display_name"].strip()
+            new_label = body["display_name"].strip()
+            if new_label and new_label != agent.display_name:
+                if _name_would_be_masked(new_label):
+                    return web.json_response(
+                        {
+                            "error": (
+                                "Agent name looks like a credential or a URL carrying one. "
+                                "Pick a name that identifies the crew instead."
+                            ),
+                            "code": "credential_shaped_name",
+                        },
+                        status=400,
+                    )
+                try:
+                    validate_member_name(new_label)
+                except MemberNameError as exc:
+                    return web.json_response(
+                        {
+                            "error": f"Invalid Crew Member name: {exc}",
+                            "code": "invalid_member_name",
+                        },
+                        status=400,
+                    )
+                taken = resolve_member(new_label, cfg)
+                if taken is not None and taken[0] != name:
+                    return web.json_response(
+                        {"error": f"Agent '{new_label}' already exists", "code": "agent_exists"},
+                        status=409,
+                    )
+            agent.display_name = new_label
             changed.append("display_name")
         if "triggers" in body:
             agent.triggers = body["triggers"]
@@ -5495,7 +5664,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                         status=400,
                     )
                 if _wants_promote and isinstance(_tok, str):
-                    _promoted = await _drained_to_thread(_promote_pending_avatar, name, _tok)
+                    _promoted = await _drained_to_thread(_promote_pending_avatar, prior_label, _tok)
                     _avatar_promoted = _promoted is not None
                     if _promoted is None:
                         # The bytes THIS save staged are gone (a newer save
@@ -5513,13 +5682,13 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                         )
                     stamp, _avatar_pin = _promoted
                 else:
-                    await _drained_to_thread(_discard_pending_avatar, name)
+                    await _drained_to_thread(_discard_pending_avatar, prior_label)
                     # A picture-keeping edit (no fresh upload): stamp from the
                     # file the config's pin already selects.
-                    _live = await asyncio.to_thread(_live_avatar_file, name, _prior_pin)
+                    _live = await asyncio.to_thread(_live_avatar_file, prior_label, _prior_pin)
                     stamp = None
                     if _live is not None:
-                        _avatar_pin = _live.name[len(_avatar_stem(name)) + 1 :]
+                        _avatar_pin = _live.name[len(_avatar_stem(prior_label)) + 1 :]
                         try:
                             stamp = int((await asyncio.to_thread(_live.stat)).st_mtime_ns)
                         except OSError:
@@ -5559,24 +5728,68 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             agent.starred = body["starred"]
             changed.append("starred")
         effort_inputs_after = _effort_inputs(agent)
+        new_label_after = member_display_name(name, agent)
+        renaming = new_label_after != prior_label
+        # A RENAME is one transaction with the files it relabels. The stored
+        # picture is filed under the crew's LABEL (``_avatar_stem``), so the
+        # files move FIRST; a move that fails leaves every file and the config
+        # untouched and answers 5xx, and a config write that then fails moves
+        # them back. Persisting the label without the files would leave a
+        # committed pin that the new label's path does not serve.
+        _moved_avatar_files: list[tuple[Path, Path]] = []
+        if renaming:
+            try:
+                _moved_avatar_files = await _drained_to_thread(
+                    _rename_avatar_files, prior_label, new_label_after
+                )
+            except OSError:
+                logger.warning("avatar files could not follow the rename", exc_info=True)
+                if _avatar_promoted:
+                    await _drained_to_thread(
+                        _rollback_promoted_avatar, prior_label, _avatar_pin, _prior_pin
+                    )
+                return web.json_response(
+                    {
+                        "error": "the crew's picture could not be moved; nothing was renamed",
+                        "code": "avatar_move_failed",
+                    },
+                    status=503,
+                )
         # Avatar rollback applies only to ordinary failure: cancellation may
         # arrive after the drained worker published the new avatar pin. Store
         # cleanup independently checks the current locked config, so a landed
         # memory binding survives even when the request was cancelled.
         try:
+            if renaming:
+                # The private template copy this member owns records its owner
+                # by the member's key. One written under the member's display
+                # name (a load whose sidecar rewrite did not land) is repaired
+                # here, while the label it names still means this member.
+                # Inside the same scope as the config write: a sidecar that
+                # cannot be read or written aborts the rename with the files
+                # moved back, so the label and the picture never disagree.
+                await _drained_to_thread(
+                    agent_state.claim_private_owner, agent.kiro_agent, prior_label, name
+                )
             await _drained_to_thread(
                 lambda: persist_member_config(
                     cfg, name, expected_store=prior_memory_store, changed_fields=set(changed)
                 )
             )
         except BaseException as exc:
-            if isinstance(exc, Exception) and _avatar_promoted:
-                await _drained_to_thread(_rollback_promoted_avatar, name, _avatar_pin, _prior_pin)
+            if isinstance(exc, Exception):
+                if _moved_avatar_files:
+                    await _drained_to_thread(_unrename_avatar_files, _moved_avatar_files)
+                if _avatar_promoted:
+                    await _drained_to_thread(
+                        _rollback_promoted_avatar, prior_label, _avatar_pin, _prior_pin
+                    )
             raise
+        # Files now live under the label the config records.
         if _avatar_promoted:
-            await _drained_to_thread(_commit_promoted_avatar, name, _avatar_pin)
+            await _drained_to_thread(_commit_promoted_avatar, new_label_after, _avatar_pin)
         if _remove_files_after_save:
-            await _drained_to_thread(_remove_avatar_files, name)
+            await _drained_to_thread(_remove_avatar_files, new_label_after)
         # Best-effort per-member event log: the save succeeded, so emit a
         # config snapshot with the list of fields that actually changed.
         try:
@@ -5620,6 +5833,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     # config this handler already loaded, so the resolve costs no
                     # I/O on the loop -- member_slug would otherwise load it here.
                     member_slug(name, cfg),
+                    # The KEY, not the label: a fresh log takes its write-once
+                    # header from this name, and the roster proves ownership by
+                    # the key first (``_log_owner_handles``).
                     name,
                     MEMBER_CONFIG,
                     {**_ev_after, "changed": _ev_changed},
@@ -5641,11 +5857,17 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         source="dashboard",
         resources=f"{name} ({','.join(changed)})",
     )
-    result = {"ok": True, "name": name, "memory_store": agent.memory_store}
+    result = {
+        "ok": True,
+        "name": new_label_after,
+        "display_name": new_label_after,
+        "member_id": name,
+        "memory_store": agent.memory_store,
+    }
     return web.json_response(result)
 
 
-def _prune_private_copy_of_deleted_crew(crew: str, bound_template: str) -> bool:
+def _prune_private_copy_of_deleted_crew(crew: str, bound_template: str, *, label: str = "") -> bool:
     """Remove the private template copy that existed only for a now-deleted crew.
 
     Corroborated on both sides before anything is touched: the agent_state
@@ -5682,7 +5904,11 @@ def _prune_private_copy_of_deleted_crew(crew: str, bound_template: str) -> bool:
     lineage_key = ""
     for key in lineage_keys:
         fork = agent_state.get_fork_info(key)
-        if fork and fork["private_to"] == crew:
+        # Cleanup, not authorization: the copy is ALSO corroborated by the
+        # crew's persisted binding (*bound_template* above), so an owner the
+        # sidecar still records by the deleted crew's label -- a load whose
+        # sidecar rewrite did not land -- is reaped with the crew as well.
+        if fork and fork["private_to"] in (crew, label or crew):
             lineage_key = key
             break
     if not lineage_key:
@@ -5723,8 +5949,14 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
     name = request.match_info["name"]
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
-        if name not in cfg.agents:
+        resolved_agent = resolve_member(name, cfg)
+        if resolved_agent is None:
             return web.json_response({"error": f"Agent '{name}' not found"}, status=404)
+        # ``name`` is the key (member_id) from here; ``label`` is the display
+        # name the crew's avatar files and team membership are filed under.
+        name = resolved_agent[0]
+        label = member_display_name(*resolved_agent)
+        deleted_member_id = resolved_agent[1].member_id
         if name == cfg.default_agent:
             return web.json_response(
                 {"error": f"Cannot delete default agent '{name}'. Change default_agent first."},
@@ -5752,7 +5984,15 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
                 store_name = entry.get("memory_store", "") if isinstance(entry, dict) else ""
                 record = stores.get(store_name)
                 if isinstance(record, dict) and record.get("memory_version") == 2:
-                    if record.get("owner_member") != name:
+                    # ``owner_member_id`` is authoritative; ``owner_member`` is
+                    # the display label and may predate a rename or the
+                    # member-id re-key.
+                    owned = (
+                        record.get("owner_member_id") == deleted_member_id
+                        if deleted_member_id
+                        else record.get("owner_member") in (name, label)
+                    )
+                    if not owned:
                         raise UnknownMemoryStore(
                             f"memory store {store_name!r} ownership changed concurrently"
                         )
@@ -5776,6 +6016,8 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
             # hidden by every reader and purged by the next same-name create.
             def _drop_from_team() -> None:
                 teams_mod.drop_member(name)
+                if label != name:
+                    teams_mod.drop_member(label)
 
             update_config_locked(mutate=mutate, after_write=_drop_from_team)
             return retired_store
@@ -5793,7 +6035,7 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
         # the same lock so the cleanup cannot run AFTER a concurrent
         # same-name recreation has already uploaded and committed a new
         # picture under the same digest stem.
-        await _drained_to_thread(_remove_avatar_files, name)
+        await _drained_to_thread(_remove_avatar_files, label)
         # Likewise the crew's private template copy: a copy the sidecar marks
         # private to THIS crew, and that the crew was bound to, has no reader
         # left once the record is gone — kept, it lists in the Agent Templates
@@ -5801,7 +6043,11 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
         # avatar: a same-name recreation must not fork a fresh copy only to
         # have this cleanup remove it. Best-effort: a locked or unreadable
         # file never blocks the crew's removal.
-        if await _drained_to_thread(_prune_private_copy_of_deleted_crew, name, bound_template):
+        if await _drained_to_thread(
+            functools.partial(
+                _prune_private_copy_of_deleted_crew, name, bound_template, label=label
+            )
+        ):
             clear_list_agents_cache()
             if (state := request.app.get("state")) is not None:
                 state.push_refresh("agents")
@@ -5961,7 +6207,7 @@ def _avatars_dir() -> Path:
     freezes the data home and defeats pod isolation and test isolation
     (dashboard/handlers/files.py is the precedent).
     """
-    return data_home() / "run" / "avatars"
+    return members_mod.avatars_root()
 
 
 def _avatar_stem(name: str) -> str:
@@ -5972,7 +6218,43 @@ def _avatar_stem(name: str) -> str:
     answering them one by one. Full digest: truncating buys nothing and a
     shorter stem is the only thing a collision would need.
     """
-    return hashlib.sha256(name.encode("utf-8")).hexdigest()
+    return members_mod.avatar_stem(name)
+
+
+def _rename_avatar_files(old_label: str, new_label: str) -> list[tuple[Path, Path]]:
+    """Move every stored variant of a crew's picture from one label's stem to another.
+
+    The stem digests the crew's DISPLAY name (``_avatar_stem``), which a rename
+    changes; the config pins only the ``<token>.<ext>`` tail, so moving the
+    files keeps that pin serving. All or nothing: a move that fails puts the
+    files already moved back under the old stem and re-raises, so the caller
+    can refuse the rename with every file where it was. Returns the
+    ``(old, new)`` pairs moved, for :func:`_unrename_avatar_files` when the
+    config write that follows fails.
+    """
+    if old_label == new_label:
+        return []
+    old_stem, new_stem = _avatar_stem(old_label), _avatar_stem(new_label)
+    d = _avatars_dir()
+    moved: list[tuple[Path, Path]] = []
+    for p in _avatar_variant_paths(old_label):
+        target = d / f"{new_stem}{p.name[len(old_stem) :]}"
+        try:
+            replace_with_retry(p, target)
+        except OSError:
+            _unrename_avatar_files(moved)
+            raise
+        moved.append((p, target))
+    return moved
+
+
+def _unrename_avatar_files(moved: list[tuple[Path, Path]]) -> None:
+    """Undo :func:`_rename_avatar_files`: put each moved file back, best-effort."""
+    for old, new in reversed(moved):
+        try:
+            replace_with_retry(new, old)
+        except OSError:
+            logger.warning("could not move avatar file %s back after a failed rename", new.name)
 
 
 def _avatar_variant_paths(name: str) -> list[Path]:
@@ -6217,11 +6499,15 @@ async def api_kirocrew_agent_avatar_get(request: web.Request) -> web.Response:
     # only the exact committed file is served, so an uncommitted install left
     # by a mid-save crash cannot impersonate the saved picture.
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    agent = cfg.agents.get(name)
+    resolved_agent = resolve_member(name, cfg)
+    agent = None if resolved_agent is None else resolved_agent[1]
     if agent is None or agent.avatar.get("kind") != "image":
         return web.json_response(
             {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
         )
+    # Files are filed under the crew's label (``_avatar_stem``), whichever
+    # handle the URL carried.
+    name = member_display_name(*resolved_agent)
     path = await asyncio.to_thread(_live_avatar_file, name, agent.avatar.get("file"))
     if path is None:
         return web.json_response(
@@ -6319,6 +6605,14 @@ async def api_kirocrew_agent_avatar_upload(request: web.Request) -> web.Response
             status=400,
         )
 
+    # Staged under the crew's LABEL (``_avatar_stem``) whichever handle the URL
+    # carried, so the promoting save -- which addresses files by the label --
+    # finds it. An unknown handle stages under the handle itself, as before.
+    resolved_agent = await asyncio.to_thread(resolve_member, name)
+    member_key = resolved_agent[0] if resolved_agent is not None else name
+    if resolved_agent is not None:
+        name = member_display_name(*resolved_agent)
+
     def _stage() -> None:
         d = _avatars_dir()
         d.mkdir(parents=True, exist_ok=True)
@@ -6350,7 +6644,7 @@ async def api_kirocrew_agent_avatar_upload(request: web.Request) -> web.Response
     # filesystem commit.
     async with _get_config_lock():
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        if name not in cfg.agents:
+        if member_key not in cfg.agents:
             return web.json_response(
                 {"error": f"Agent '{name}' not found", "code": "agent_not_found"},
                 status=404,
@@ -6397,6 +6691,13 @@ async def api_agent_reset(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     async with _get_config_lock():
         agents_dir = kiro_agents_dir_path()
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        resolved_crew = resolve_member(crew, cfg)
+        if resolved_crew is None:
+            return web.json_response(
+                {"error": f"Agent '{crew}' not found", "code": "agent_not_found"}, status=404
+            )
+        crew = resolved_crew[0]
         fork = agent_state.get_fork_info(name)
         if not fork or fork["private_to"] != crew:
             return web.json_response(
@@ -6423,11 +6724,6 @@ async def api_agent_reset(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": f"Origin template '{origin}' no longer exists", "code": "origin_missing"},
                 status=409,
-            )
-        cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        if crew not in cfg.agents:
-            return web.json_response(
-                {"error": f"Agent '{crew}' not found", "code": "agent_not_found"}, status=404
             )
         if cfg.agents[crew].kiro_agent != name:
             return web.json_response(

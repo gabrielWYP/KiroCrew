@@ -502,6 +502,55 @@ def set_fork_info(name: str, forked_from: str, private_to: str) -> None:
         _write(data)
 
 
+def rekey_private_owners(plan: MutableMapping[str, str] | dict[str, str]) -> int:
+    """Rewrite every ``private_to`` found as a key of *plan* to that key's value.
+
+    ``private_to`` is the owning crew's ``config.agents`` KEY -- the member_id.
+    A sidecar written when the map was keyed by display name holds the display
+    name here; the config loader passes the same ``old key -> member_id`` plan it
+    applies to the agents map, so ownership follows the record it belongs to.
+    Idempotent: a value already equal to a plan target is not a plan key and is
+    left alone. Returns the number of entries rewritten; a sidecar that cannot
+    be read is left as it is and reported by the caller, never guessed at.
+    """
+    if not plan:
+        return 0
+    with _locked():
+        data = _read(strict=True)
+        changed = 0
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            owner = entry.get(_PRIVATE_TO)
+            if isinstance(owner, str) and owner in plan and plan[owner] != owner:
+                entry[_PRIVATE_TO] = plan[owner]
+                changed += 1
+        if changed:
+            _write(data)
+    return changed
+
+
+def claim_private_owner(name: str, old_owner: str, new_owner: str) -> bool:
+    """Rewrite template *name*'s ``private_to`` from *old_owner* to *new_owner*.
+
+    The rename path's self-heal for ONE template: the copy bound to the member
+    being renamed may still record the member's display name as its owner when
+    the load-time rewrite could not land (a degraded load). Only an exact match
+    on *old_owner* is rewritten, and only on *name*, so no other entry -- a
+    retired member's copy that happened to share the label -- changes hands.
+    """
+    if not name or not old_owner or old_owner == new_owner:
+        return False
+    with _locked():
+        data = _read(strict=True)
+        entry = data.get(name)
+        if not isinstance(entry, dict) or entry.get(_PRIVATE_TO) != old_owner:
+            return False
+        entry[_PRIVATE_TO] = str(new_owner)
+        _write(data)
+    return True
+
+
 def clear_fork_info(name: str) -> None:
     """Drop *name*'s lineage so it lists as a shared template again.
 

@@ -215,14 +215,58 @@ def _member_name_is_addressable(value: object) -> bool:
     return members_mod.is_dispatchable_member_name(value)
 
 
-def _member_names_for_slug(cfg: KiroCrewConfig, slug: str) -> list[str]:
-    """Addressable crew names for *slug*, in deterministic config order.
+def _member_row_is_addressable(key: str, agent_cfg: object) -> bool:
+    """Whether the record under *key* has a handle a roster can show and dispatch.
 
-    Malformed hand-edited names remain unaddressable.
+    The display name is the handle the roster shows; when it cannot be shown
+    (a stored credential-shaped or malformed label) the key -- an allocator-
+    minted slug -- still is, so the row stays reachable for repair.
+    """
+    return _member_name_is_addressable(
+        members_mod.member_display_name(key, agent_cfg)
+    ) or _member_name_is_addressable(key)
+
+
+def member_roster_handle(key: str, agent_cfg: object) -> str:
+    """The ``name`` a roster row ships for the record under *key*.
+
+    The display name when it can be shown verbatim and dispatched; else the key
+    (an allocator-minted slug), so a crew whose stored label is credential-shaped
+    or malformed stays addressable. Shared by ``GET /api/members`` and the team
+    responses, so a team lists its members by exactly the handle the roster shows.
+    """
+    from kiro_crew.dashboard.handlers.agents import _roster_mask
+
+    label = members_mod.member_display_name(key, agent_cfg)
+    if _roster_mask(label) == label and _member_name_is_addressable(label):
+        return label
+    return key
+
+
+def _log_owner_handles(key: str, agent_cfg) -> set[str]:
+    """Every header name that proves *key* owns its member event log.
+
+    The header is written once, by whichever writer reached the fresh log
+    first, and it holds whatever handle that writer held: the key, or -- for a
+    log written while ``config.agents`` was keyed by the display name -- the
+    member's name at the time, which is its current label or a retired key the
+    migration recorded on the record (``legacy_keys``). Comparing the header against
+    the mutable label alone would blank a renamed member's projection for the
+    life of its log. Any other name is another member's; the slug itself is the
+    nameless-writer placeholder the callers judge separately.
+    """
+    remembered = set(getattr(agent_cfg, "legacy_keys", None) or ())
+    return {key, members_mod.member_display_name(key, agent_cfg)} | remembered
+
+
+def _member_names_for_slug(cfg: KiroCrewConfig, slug: str) -> list[str]:
+    """Addressable crew KEYS (member ids) for *slug*, in deterministic config order.
+
+    Malformed hand-edited display names remain unaddressable.
     """
     out: list[str] = []
-    for name in cfg.agents:
-        if not _member_name_is_addressable(name):
+    for name, agent_cfg in cfg.agents.items():
+        if not _member_row_is_addressable(name, agent_cfg):
             continue
         try:
             if members_mod.member_slug(name, cfg) == slug:
@@ -246,13 +290,16 @@ def _slug_is_claimed_by_any_member(cfg: KiroCrewConfig, slug: str, owner_key: st
     """
     from kiro_crew import agent_panel as agent_panel_mod
 
-    for name in cfg.agents:
+    for name, agent_cfg in cfg.agents.items():
         try:
             if members_mod.member_slug(name, cfg) != slug:
                 continue
         except MemberSlugError:
             continue
-        if agent_panel_mod.crew_key(name) == owner_key:
+        # A panel owner may be recorded as a digest of the display name or of
+        # the key. Either spelling is this member.
+        label = members_mod.member_display_name(name, agent_cfg)
+        if owner_key in {agent_panel_mod.crew_key(name), agent_panel_mod.crew_key(label)}:
             return True
     return False
 
@@ -349,7 +396,14 @@ async def api_members(request: web.Request) -> web.Response:
 
     rows: list[dict] = []
     for name, agent_cfg in cfg.agents.items():
-        if not _member_name_is_addressable(name):
+        # ``name`` is the ``config.agents`` key -- the member_id;
+        # ``label`` is the display name the row shows and is addressed by.
+        label = members_mod.member_display_name(name, agent_cfg)
+        # ``name`` (the alias) is the row's ADDRESSING handle: the label when it
+        # can be shown verbatim, else the key, so a crew whose stored label is
+        # credential-shaped or malformed stays listed and repairable.
+        handle = member_roster_handle(name, agent_cfg)
+        if not _member_name_is_addressable(handle):
             continue
         try:
             slug = members_mod.member_slug(name, cfg)
@@ -360,7 +414,7 @@ async def api_members(request: web.Request) -> web.Response:
         version = getattr(record, "memory_version", 1 if store == "default" else None)
         owner = getattr(record, "owner_member", "")
         if name != "default" and version == 1 and not owner:
-            if any(item.owner_member == name for item in cfg.memory_stores.values()):
+            if any(item.owner_member in (name, label) for item in cfg.memory_stores.values()):
                 version = None
         rows.append(
             {
@@ -376,7 +430,11 @@ async def api_members(request: web.Request) -> web.Response:
                 # record value is agent-writable free text, so it goes through
                 # `_roster_mask` and is replaced WHOLESALE when the redactors
                 # would alter it.
-                "name": name,
+                # ``name`` is the display name (an alias of ``display_name``
+                # for one release); ``member_id`` is the key every binding and
+                # every ``/api/agents/{name}`` lookup resolves to.
+                "name": handle,
+                "member_id": name,
                 "slug": slug,
                 "kiro_agent": _roster_mask(agent_cfg.kiro_agent),
                 "workspace": _roster_mask(agent_cfg.workspace),
@@ -406,10 +464,10 @@ async def api_members(request: web.Request) -> web.Response:
                 # operator's opt-out from being routed to at all.
                 "description": _roster_mask(agent_cfg.description),
                 "triggers": _roster_mask(agent_cfg.triggers),
-                # Presentation label only, masked like the other free text. The
-                # page shows it in place of `name` when non-empty; `name` stays
-                # the identity every per-member route and binding is keyed on.
-                "display_name": _roster_mask(agent_cfg.display_name),
+                # The display name, masked like the other free text: a stored
+                # label predating the create/rename refusal may be credential-
+                # shaped, and then ``name`` above falls back to the key.
+                "display_name": _roster_mask(label),
             }
         )
 
@@ -428,7 +486,9 @@ async def api_members(request: web.Request) -> web.Response:
         # dm.json belongs to exactly one crew name, so only the exact-name
         # match reads as bound. `bound` itself is not exposed: the page never
         # trusts it (every open POSTs the thread endpoint regardless).
-        bound = binding is not None and binding.get("member") == row["name"]
+        # The binding's ``member`` is the config.agents key (``read_dm_binding``
+        # resolves it); rows carry the display name as ``name``, so compare keys.
+        bound = binding is not None and binding.get("member") == row["member_id"]
         slot_key = binding["slot_key"] if bound and binding else ""
         row["slot_key"] = slot_key
         slot = state._slots.get(slot_key) if (state and slot_key) else None
@@ -578,7 +638,7 @@ async def api_members(request: web.Request) -> web.Response:
     # pushed `member_projection` frame has to be able to move a row. Keeping the two
     # in step is the reconcile's job, which runs for every member whose log exists
     # and returns before writing when the two already agree.
-    agent_cfgs = {row["name"]: cfg.agents.get(row["name"]) for row in rows}
+    agent_cfgs = {row["member_id"]: cfg.agents.get(row["member_id"]) for row in rows}
 
     def _project_rows() -> dict[str, dict]:
         from kiro_crew import eventlog_hooks
@@ -655,7 +715,10 @@ async def api_members(request: web.Request) -> web.Response:
                 # differs from almost every real name -- reading it as a second member
                 # would blank a member's own state over a value that never was a name.
                 logged_name = svc.logged_name(slug)
-                if logged_name is not None and logged_name not in (row["name"], slug):
+                owner_handles = _log_owner_handles(
+                    row["member_id"], agent_cfgs.get(row["member_id"])
+                )
+                if logged_name is not None and logged_name not in owner_handles | {slug}:
                     logger.warning(
                         "member slug %r logs %r, so %r gets no projection; "
                         "rename one member so their slugs differ",
@@ -666,7 +729,7 @@ async def api_members(request: web.Request) -> web.Response:
                     out[slug] = {"asOfSeq": _SEQ_UNATTRIBUTABLE, "values": {}}
                     continue
                 snap = svc.snapshot(slug)
-                agent_cfg = agent_cfgs.get(row["name"])
+                agent_cfg = agent_cfgs.get(row["member_id"])
                 appended = False
                 # Every read, for every member whose log exists. The reconcile
                 # compares the folded roster against the live config and returns
@@ -681,12 +744,14 @@ async def api_members(request: web.Request) -> web.Response:
                 # (the startup sweep in ``eventlog_hooks`` refuses for the same
                 # reason), so the write-through runs only for a log with no header
                 # yet or one the exact name owns.
-                owned = logged_name is None or logged_name == row["name"]
+                owned = logged_name is None or logged_name in owner_handles
                 if agent_cfg is not None and owned:
                     values = snap.get("values", {}) if isinstance(snap, dict) else {}
+                    # Written under the KEY, so the header a fresh log takes from
+                    # this name survives every later rename.
                     appended = (
                         eventlog_hooks.reconcile_member_config(
-                            slug, row["name"], agent_cfg, values.get("roster", {})
+                            slug, row["member_id"], agent_cfg, values.get("roster", {})
                         )
                         is not None
                     )
@@ -929,7 +994,9 @@ async def api_member_thread(request: web.Request) -> web.Response:
         # metadata that lost it). Nothing has run as anyone on it, so adopting
         # the resolved member is a pure repair with no session semantics.
         slot.agent = member_name
-    elif slot.agent != member_name:
+    elif not members_mod.same_member(slot.agent, member_name, cfg):
+        # (A slot pinned under the crew's display name names the same member
+        # and is not a mismatch.)
         # The registry moved under the binding (crew renamed/deleted with a
         # same-slug successor). Re-pinning here would be an agent switch that
         # skips every invariant the real switch endpoint holds (slot lock,
@@ -1002,7 +1069,7 @@ async def api_member_thread(request: web.Request) -> web.Response:
                 if (
                     state._slots.get(slot_key) is not slot
                     or effective_session_key(slot) != canonical_key
-                    or slot.agent != member_name
+                    or not members_mod.same_member(slot.agent, member_name, cfg)
                     or slot.mode != members_mod.DM_SLOT_MODE
                     or slot.memory_store != member_store
                     or assigned_store != member_store
@@ -1209,10 +1276,15 @@ async def api_member_projections(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "member does not match slug", "code": "member_slug_mismatch"}, status=400
         )
-    if member not in cfg.agents:
+    # ``?member=`` carries a handle (member_id or display name); from here on
+    # ``member`` is the ``config.agents`` key, which the slug checks compare.
+    resolved_member = members_mod.resolve_member(member, cfg)
+    if resolved_member is None:
         return web.json_response(
             {"error": "no crew member for this slug", "code": "member_not_found"}, status=404
         )
+    member = resolved_member[0]
+    owner_handles = _log_owner_handles(member, resolved_member[1])
     # Two rows folding to one slug is the case the roster blanks for BOTH of them,
     # and it has to blank here too: neither member can be told apart in a slug-keyed
     # log, so serving either one's views under this slug is a guess.
@@ -1243,7 +1315,7 @@ async def api_member_projections(request: web.Request) -> web.Response:
             # The store proves it now -- a log created since the first listing --
             # so it reads like any other.
         logged_name = svc.logged_name(slug)
-        if logged_name is not None and logged_name not in (member, slug):
+        if logged_name is not None and logged_name not in owner_handles | {slug}:
             return None
         snap = svc.snapshot(slug)
         # A PURE read, and deliberately no config reconcile. The reconcile compares a
@@ -1506,10 +1578,14 @@ async def api_member_briefing(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "member does not match slug", "code": "member_slug_mismatch"}, status=400
         )
-    if member not in cfg.agents:
+    # ``?member=`` carries a handle (member_id or display name); from here on
+    # ``member`` is the ``config.agents`` key, which the slug checks compare.
+    resolved_member = members_mod.resolve_member(member, cfg)
+    if resolved_member is None:
         return web.json_response(
             {"error": "no crew member for this slug", "code": "member_not_found"}, status=404
         )
+    member = resolved_member[0]
     if _member_names_for_slug(cfg, slug) != [member]:
         return web.json_response(
             {
@@ -1731,10 +1807,14 @@ async def api_member_rules_put(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "member does not match slug", "code": "member_slug_mismatch"}, status=400
         )
-    if member not in cfg.agents:
+    # ``?member=`` carries a handle (member_id or display name); from here on
+    # ``member`` is the ``config.agents`` key, which the slug checks compare.
+    resolved_member = members_mod.resolve_member(member, cfg)
+    if resolved_member is None:
         return web.json_response(
             {"error": "no crew member for this slug", "code": "member_not_found"}, status=404
         )
+    member = resolved_member[0]
     colliding = _member_names_for_slug(cfg, slug)
     if colliding != [member]:
         return web.json_response(

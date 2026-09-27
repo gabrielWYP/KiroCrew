@@ -214,8 +214,10 @@ class TestRosterSurfaces:
         app.router.add_get("/api/agents", api_kirocrew_agents)
         async with TestClient(TestServer(app)) as client:
             body = await (await client.get("/api/agents")).json()
-        row = next(a for a in body["agents"] if a["name"] == "labelled")
+        row = next(a for a in body["agents"] if a["member_id"] == "labelled")
         assert row["display_name"] == "Release Writer"
+        # ``name`` is the display name's alias for one release.
+        assert row["name"] == "Release Writer"
 
     @pytest.mark.asyncio
     async def test_credential_shaped_label_leaves_as_the_mask(self, tmp_path):
@@ -235,8 +237,10 @@ class TestRosterSurfaces:
         app.router.add_get("/api/agents", api_kirocrew_agents)
         async with TestClient(TestServer(app)) as client:
             body = await (await client.get("/api/agents")).json()
-        row = next(a for a in body["agents"] if a["name"] == "leaky")
+        row = next(a for a in body["agents"] if a["member_id"] == "leaky")
         assert row["display_name"] == _SENSITIVE_MASK
+        # The ``name`` alias falls back to the key rather than shipping the label.
+        assert row["name"] == "leaky"
         assert cred not in json.dumps(body)
 
 

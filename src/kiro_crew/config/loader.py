@@ -709,7 +709,9 @@ def _write_migration_backup(path: Path) -> None:
 
 #: The write-back migrations a load can find pending, as recorded by
 #: :meth:`KiroCrewConfig._load_resolved` and re-checked against the on-disk
-#: document by :func:`_apply_document_migrations`.
+#: document by :func:`_apply_document_migrations`. Member identity (the
+#: ``agents`` keys) is deliberately NOT one of them: :func:`migrate_member_identity`
+#: moves it once, off the load path.
 MIGRATE_WORKSPACES = "workspaces"
 MIGRATE_AGENTS = "agents"
 MIGRATE_DEFAULT_AGENT = "default_agent"
@@ -730,6 +732,385 @@ MIGRATE_SUPERSEDED_DEFAULTS = "superseded_defaults"
 #: than inside it for the same reason as the superseded-defaults ack file — a
 #: full ``to_dict()`` rewrite carries only schema fields and would drop it.
 CONNECTIONS_UI_MIGRATION_MARKER = "connections_ui_migrated.json"
+
+
+def plan_member_rekeys(entries: Iterable[tuple[str, object, object]]) -> dict[str, str]:
+    """``old key -> member_id`` for every ``agents`` entry stored under the wrong key.
+
+    *entries* yields ``(key, member_id, display_name)`` triples, so the same plan
+    serves the parsed dataclasses (in memory) and the raw document (on disk).
+    ``config.agents`` is keyed by ``member_id``: an entry whose string
+    ``member_id`` differs from its key is a legacy record whose map was keyed by
+    the display name. Such an entry moves to its id and keeps
+    the old key as ``display_name`` (when it has none yet), so nothing the user
+    sees changes and nothing the id binds -- ``members/<id>/``, the DM slot key,
+    cron ``member_id``, ``owner_member_id`` -- moves at all.
+
+    Refused, never guessed: an id held by two entries, or already the key of an
+    entry that STAYS under it, is left where it is and reported once. A key
+    another moving entry vacates counts as free, so a member renamed away from
+    its own id and a successor filed under that id both land on their ids. An
+    entry with no ``member_id`` (a legacy or global record) keeps its key -- it
+    has no id to move to, and inventing one would bind it to a V2 memory
+    identity it does not have.
+
+    Only a move that SURVIVES vacates its key. A refused entry stays where it
+    is, so its key is still occupied, and a mover targeting that key is refused
+    in turn -- otherwise two entries would be written under one key and one of
+    them lost. Refusals cascade (a refused move re-occupies a key, which can
+    refuse another move), so the plan is settled by iterating to a fixed point:
+    every key in the returned plan is vacated by a survivor or was never a key,
+    and no two survivors land on one id.
+    """
+    items = [
+        (key, member_id, display_name)
+        for key, member_id, display_name in entries
+        if isinstance(key, str)
+    ]
+    wanted: dict[str, list[str]] = {}
+    for key, member_id, _ in items:
+        if isinstance(member_id, str) and member_id and member_id != key:
+            wanted.setdefault(member_id, []).append(key)
+    every_key = {key for key, _, _ in items}
+    # Pass 1: an id claimed twice can never be a key; both claimants stay.
+    survivors = {
+        member_id: old_keys[0] for member_id, old_keys in wanted.items() if len(old_keys) == 1
+    }
+    refused: dict[str, tuple[str, list[str]]] = {
+        member_id: ("claimed by several entries", old_keys)
+        for member_id, old_keys in wanted.items()
+        if len(old_keys) != 1
+    }
+    # Pass 2 (to a fixed point): an id that is the key of an entry that does
+    # not move away -- one that never moves, or one whose own move was refused
+    # -- is occupied, and its claimant stays too.
+    while True:
+        vacated = set(survivors.values())
+        occupied = every_key - vacated
+        blocked = [member_id for member_id in survivors if member_id in occupied]
+        if not blocked:
+            break
+        for member_id in blocked:
+            refused[member_id] = ("already a key that stays", [survivors.pop(member_id)])
+    for member_id, (reason, old_keys) in refused.items():
+        logger.warning(
+            "config: agents entries %s carry member_id %r, which cannot become "
+            "their key (%s); left as stored",
+            old_keys,
+            member_id,
+            reason,
+        )
+    return {old_key: member_id for member_id, old_key in survivors.items()}
+
+
+def _relabel_member_avatars(agents: Mapping[str, object], rekeys: Mapping[str, str]) -> int:
+    """Move each member's picture from the key it was stored under onto its label.
+
+    *agents* is the id-keyed map (parsed records or raw entries); *rekeys* is
+    ``old key -> member_id`` for the entries the migration moved, and an entry
+    absent from it was stored under its current key. Returns the number of
+    files moved.
+    """
+    from kiro_crew.members import relabel_avatar_files  # circular import: members -> config
+
+    stored_key = {new: old for old, new in rekeys.items()}
+    moved = 0
+    for key, agent_cfg in agents.items():
+        label = (
+            agent_cfg.get("display_name")
+            if isinstance(agent_cfg, dict)
+            else getattr(agent_cfg, "display_name", "")
+        )
+        old_key = stored_key.get(key, key)
+        if not isinstance(label, str) or not label or label == old_key:
+            continue
+        try:
+            moved += relabel_avatar_files(old_key, label)
+        except OSError:
+            logger.warning("config: could not move %r's picture onto its label", key)
+    if moved:
+        logger.info("config: moved %d Crew Member picture file(s) onto their labels", moved)
+    return moved
+
+
+def rekey_agents_document(agents: dict) -> tuple[dict, dict[str, str]]:
+    """A raw ``agents`` map keyed by ``member_id``, plus the ``old key -> id`` plan.
+
+    The document-level twin of the in-memory re-key: an entry that moves keeps
+    its old key as ``display_name`` when it has none. Returns the input map and
+    an empty plan when nothing moves, so callers can tell a rewrite from a no-op.
+    """
+    plan = plan_member_rekeys(
+        (key, entry.get("member_id"), entry.get("display_name"))
+        for key, entry in agents.items()
+        if isinstance(entry, dict)
+    )
+    if not plan:
+        return agents, {}
+    rekeyed: dict = {}
+    for key, entry in agents.items():
+        new_key = plan.get(key, key)
+        if new_key != key and isinstance(entry, dict):
+            entry = {**entry, "legacy_keys": _with_legacy_key(entry.get("legacy_keys"), key)}
+            if not entry.get("display_name"):
+                entry["display_name"] = key
+        rekeyed[new_key] = entry
+    return rekeyed, plan
+
+
+def _legacy_keys_field(recorded: object) -> list[str]:
+    """A record's stored ``legacy_keys`` as a clean list: strings only, order kept, once each."""
+    if not isinstance(recorded, list):
+        return []
+    out: list[str] = []
+    for key in recorded:
+        if isinstance(key, str) and key and key not in out:
+            out.append(key)
+    return out
+
+
+def _with_legacy_key(recorded: object, key: str) -> list[str]:
+    """*recorded* (a record's ``legacy_keys``) plus *key*, once."""
+    keys = _legacy_keys_field(recorded)
+    if key not in keys:
+        keys.append(key)
+    return keys
+
+
+def legacy_key_aliases(agents: Mapping[str, object]) -> dict[str, str]:
+    """``legacy key -> current key`` for every retired key a record in *agents* remembers.
+
+    The record carries its own history (``legacy_keys``, written once by the
+    migration), so the alias travels with ``config.json`` and needs no second
+    file. The live namespace wins: a legacy key that is now some member's key
+    or display name aliases nothing (that member owns the spelling), and one
+    two records both remember aliases nothing either -- refused, never guessed.
+    """
+    labels = {
+        entry.get("display_name")
+        for entry in agents.values()
+        if isinstance(entry, dict) and isinstance(entry.get("display_name"), str)
+    }
+    claims: dict[str, list[str]] = {}
+    for key, entry in agents.items():
+        recorded = entry.get("legacy_keys") if isinstance(entry, dict) else None
+        if not isinstance(recorded, list):
+            continue
+        for old in recorded:
+            if isinstance(old, str) and old and old not in agents and old not in labels:
+                claims.setdefault(old, []).append(key)
+    return {old: keys[0] for old, keys in claims.items() if len(keys) == 1}
+
+
+def canonicalize_overlay_agents(
+    base_agents: Mapping[str, object], base_plan: Mapping[str, str], overlay_agents: dict
+) -> dict:
+    """Re-key an overlay's ``agents`` onto the base document's canonical keys.
+
+    The overlay (``config.local.json``) is user-owned and never written back, so
+    a member it patches can stay filed under the member's legacy key -- the
+    display name -- for good. Merged as-is onto an id-keyed base, that patch
+    would surface as a SECOND, partial member holding the display-name handle.
+    Each overlay entry therefore moves onto the base entry it belongs to: the
+    entry whose legacy key it names (*base_plan*), else the unique base entry
+    whose ``display_name`` it names; an overlay carrying its own legacy shape
+    (``member_id`` inside) moves by that id first. Two overlay entries landing
+    on one key are deep-merged (later wins). An entry naming no base member
+    keeps its key, exactly like an overlay-only member.
+    """
+    labels: dict[str, list[str]] = {}
+    for key, entry in base_agents.items():
+        label = entry.get("display_name") if isinstance(entry, dict) else None
+        if isinstance(label, str) and label and label not in base_agents:
+            labels.setdefault(label, []).append(key)
+    rekeyed, _plan = rekey_agents_document(overlay_agents)
+    aliases = legacy_key_aliases(base_agents)
+    out: dict = {}
+    for key, entry in rekeyed.items():
+        new_key = key
+        if key not in base_agents:
+            if key in base_plan:
+                new_key = base_plan[key]
+            elif len(labels.get(key, ())) == 1:
+                new_key = labels[key][0]
+            elif key in aliases:
+                new_key = aliases[key]
+        if new_key in out and isinstance(out[new_key], dict) and isinstance(entry, dict):
+            entry = _deep_merge(out[new_key], entry)
+        out[new_key] = entry
+    return out
+
+
+def canonical_agent_key(
+    handle: object, agents: Mapping[str, object], plan: Mapping[str, str]
+) -> object:
+    """The ``agents`` key a top-level member handle (``default_agent``) names.
+
+    The key itself first; then the legacy key the re-key *plan* moved; then the
+    unique entry whose ``display_name`` is the handle. A handle naming none of
+    those is returned unchanged, so the existence checks downstream still see it.
+    """
+    if not isinstance(handle, str) or not handle or handle in agents:
+        return handle
+    if handle in plan:
+        return plan[handle]
+    labelled = [
+        key
+        for key, entry in agents.items()
+        if isinstance(entry, dict) and entry.get("display_name") == handle
+    ]
+    if len(labelled) == 1:
+        return labelled[0]
+    return legacy_key_aliases(agents).get(handle, handle)
+
+
+def raw_agent_key(
+    document: Mapping[str, object], member: str, *, base: Mapping[str, object] | None = None
+) -> str:
+    """The key the canonical *member* id is stored under in the raw *document*.
+
+    A writer that patches one member's record into a document it read from disk
+    (``read_config_for_update``) must file the patch where that member's entry
+    IS, not where the loader's in-memory re-key puts it: the document is moved
+    only by ``migrate_member_identity``, and a patch filed under the id beside
+    a record still under its legacy key is a second, partial member that the
+    re-key then refuses to fold. For a base document that is the entry whose
+    planned re-key lands on *member*; for an overlay (*base* given) it is the
+    entry ``canonicalize_overlay_agents`` folds onto *member*. A document
+    holding no such entry stores it under the id itself.
+    """
+    agents = document.get("agents")
+    if not isinstance(agents, dict) or member in agents:
+        return member
+    if base is None:
+        _rekeyed, plan = rekey_agents_document(dict(agents))
+        return next((old for old, new in plan.items() if new == member), member)
+    raw_base = base.get("agents")
+    rekeyed, plan = rekey_agents_document(dict(raw_base) if isinstance(raw_base, dict) else {})
+    for key, entry in agents.items():
+        probe = {key: entry if isinstance(entry, dict) else {}}
+        if member in canonicalize_overlay_agents(rekeyed, plan, probe):
+            return key
+    return member
+
+
+def migrate_member_identity() -> dict[str, int]:
+    """Move every member's stored identity onto its ``member_id``, once, under the config lock.
+
+    The one writer of the member-identity migration. ``KiroCrewConfig.load``
+    serves the id-keyed view in memory on every load and writes nothing for it;
+    this function is what makes the disk agree, and it runs where a one-shot
+    repair belongs -- the gateway's post-readiness memory worker (before any
+    consumer resolves a member) and the CLI prologue -- never on a request path.
+    Three things move, in lock order (config write lock, then the sidecar lock):
+
+    1. ``config.json`` -- entries re-keyed by ``rekey_agents_document`` (the old
+       key kept in ``legacy_keys`` and as ``display_name`` when the record had
+       none), ``default_agent`` following. Refused moves stay as stored.
+    2. the fork sidecar's ``private_to`` owners, moved with their records.
+    3. every member's picture, from the key it was stored under onto its label
+       (movers and non-movers alike).
+
+    Idempotent: a document already in shape is not rewritten and moves nothing.
+    Never raises -- a failure is logged and the next boot tries again. Returns
+    counts (``rekeyed``, ``private_owners``, ``avatars``) for the log and the CLI.
+    """
+    from kiro_crew import agent_state  # circular import: agent_state -> config.paths
+
+    summary = {"rekeyed": 0, "private_owners": 0, "avatars": 0}
+    plan: dict[str, str] = {}
+    final_agents: dict = {}
+
+    def mutate(document: dict) -> dict | None:
+        nonlocal plan, final_agents
+        stored = document.get("agents")
+        if not isinstance(stored, dict):
+            return None
+        rekeyed, plan = rekey_agents_document(stored)
+        final_agents = rekeyed
+        if not plan:
+            return None
+        document["agents"] = rekeyed
+        stored_default = document.get("default_agent")
+        if isinstance(stored_default, str) and stored_default in plan:
+            document["default_agent"] = plan[stored_default]
+        return document
+
+    def after_write() -> None:
+        try:
+            summary["private_owners"] = agent_state.rekey_private_owners(plan)
+        except (OSError, ValueError):
+            logger.warning(
+                "config: agents re-keyed but the template sidecar could not be updated; "
+                "private copies recorded under a display name stay unowned until it is repaired",
+                exc_info=True,
+            )
+
+    if not config_path().is_file():
+        return summary
+    try:
+        update_config_locked(mutate=mutate, after_write=after_write)
+    except Exception:
+        logger.warning("config: member identity migration did not complete", exc_info=True)
+        return summary
+    summary["rekeyed"] = len(plan)
+    if plan:
+        logger.info(
+            "config: keyed %d Crew Member record(s) by member_id: %s",
+            len(plan),
+            ", ".join(f"{old!r} -> {new!r}" for old, new in plan.items()),
+        )
+        _invalidate_config_cache()
+    try:
+        summary["avatars"] = _relabel_member_avatars(final_agents, plan)
+    except Exception:
+        logger.warning("config: member pictures could not be relabelled", exc_info=True)
+    return summary
+
+
+def merge_config_documents(
+    base: dict, overlay: dict, *, base_plan: Mapping[str, str] | None = None
+) -> dict:
+    """Deep-merge two raw config documents with member handles canonical on BOTH sides.
+
+    The one merge every reader of the base+overlay pair must use in place of a
+    bare ``_deep_merge``: the loader, and the capability service's raw
+    snapshots and binding writes. Pass *base_plan* when the base's agents were
+    re-keyed already (the loader does it before parsing); otherwise the base is
+    re-keyed here, in the returned copy only -- the on-disk migration is the
+    loader's write-back, never a side effect of a merge.
+
+    ``agents`` entries move onto the base member's key (see
+    :func:`canonicalize_overlay_agents`) and each side's ``default_agent`` is
+    mapped the same way, so an overlay that names the default by the member's
+    legacy key or display name keeps selecting that member after the base has
+    been re-keyed -- the overlay is user-owned and is never rewritten to say so.
+    """
+    base_agents = base.get("agents")
+    if base_plan is None:
+        if isinstance(base_agents, dict):
+            base_agents, base_plan = rekey_agents_document(base_agents)
+            base = {**base, "agents": base_agents}
+        else:
+            base_plan = {}
+    agents_view: Mapping[str, object] = base_agents if isinstance(base_agents, dict) else {}
+    if "default_agent" in base:
+        base = {
+            **base,
+            "default_agent": canonical_agent_key(base["default_agent"], agents_view, base_plan),
+        }
+    overlay_agents = overlay.get("agents")
+    if isinstance(overlay_agents, dict):
+        overlay = {
+            **overlay,
+            "agents": canonicalize_overlay_agents(agents_view, base_plan, overlay_agents),
+        }
+    if "default_agent" in overlay:
+        overlay = {
+            **overlay,
+            "default_agent": canonical_agent_key(overlay["default_agent"], agents_view, base_plan),
+        }
+    return _deep_merge(base, overlay)
 
 
 def _apply_document_migrations(
@@ -822,6 +1203,11 @@ def _apply_document_migrations(
         stored_agents = data.get("agents")
         known = stored_agents if isinstance(stored_agents, dict) else {}
         stored_default = data.get("default_agent")
+        # A default recorded by the member's display name names a key.
+        canonical_default = canonical_agent_key(stored_default, known, {})
+        if canonical_default != stored_default:
+            data["default_agent"] = stored_default = canonical_default
+            changed = True
         if not isinstance(stored_default, str) or not stored_default or stored_default not in known:
             if "default" in known:
                 data["default_agent"] = "default"
@@ -4373,6 +4759,16 @@ class KiroCrewConfig:
         # therefore the correct answer on the hot path, not a missing one -- the load
         # that populated the cache already adopted.
         adoptable: list[SupersededDefault] = []
+        # Same placement as ``adoptable``: the member-key plan is a fact about the
+        # base DOCUMENT read this load. A cache hit read none, and the load that
+        # populated the cache already wrote the re-key back, so empty is correct.
+        base_member_rekeys: dict[str, str] = {}
+        # The base document's own ``default_agent`` and whether the overlay
+        # names one: decides whether a label the load mapped to a key is
+        # echoed back to the base document. Unknown on a cache hit (None /
+        # supplied), which writes nothing -- the populating load already did.
+        raw_base_default: object = None
+        overlay_supplies_default = True
         if cached is not None:
             data, sidecar = cached
             base_shadow = sidecar.get(_SIDECAR_BASE_SHADOW, {})
@@ -4450,11 +4846,21 @@ class KiroCrewConfig:
                     logger.warning("Failed to load config.local.json: %s", e)
                     _mark_file_degraded(local_path)
 
+            # Key the base document's agents by member_id BEFORE the overlay
+            # merges in. Decided on the base alone and remembered: this plan is
+            # what the write-back persists (the overlay is never written), and
+            # what the overlay's own entries are folded onto so a member patched
+            # under its display name in config.local.json stays ONE member.
+            raw_base_agents = data.get("agents")
+            if isinstance(raw_base_agents, dict):
+                data["agents"], base_member_rekeys = rekey_agents_document(raw_base_agents)
+            raw_base_default = data.get("default_agent")
+            overlay_supplies_default = "default_agent" in local_data
             if local_data:
                 # Remember the base copy of what the overlay is about to shadow —
                 # the last moment both documents exist. See _shadowed_base_sections.
                 base_shadow = _shadowed_base_sections(data, local_data)
-                data = _deep_merge(data, local_data)
+                data = merge_config_documents(data, local_data, base_plan=base_member_rekeys)
 
             # A present source that cannot be read or parsed may contain the
             # operator's hard-off switch. Preserve that unknown as disabled
@@ -4716,6 +5122,7 @@ class KiroCrewConfig:
                         # provider, where kiro-cli rejects the whole overlay.
                         reasoning_effort=coerce_effort(entry.get("reasoning_effort", "")),
                         display_name=raw_display_name if isinstance(raw_display_name, str) else "",
+                        legacy_keys=_legacy_keys_field(entry.get("legacy_keys")),
                         description=entry.get("description", ""),
                         triggers=raw_triggers if isinstance(raw_triggers, str) else "",
                         source=entry.get("source", "kirocrew"),
@@ -4743,6 +5150,38 @@ class KiroCrewConfig:
                         # re-exported from here.
                         avatar=_sections._safe_avatar(entry.get("avatar")),
                     )
+        # Key the map by member_id. The in-memory half runs on every
+        # load so a legacy document is served in the keyed shape even before
+        # the write-back below lands (or when it cannot -- a degraded load, an
+        # unwritable file). ``display_name`` keeps the old key so the roster
+        # shows the same label the user typed.
+        member_rekeys = plan_member_rekeys(
+            (key, agent_cfg.member_id, agent_cfg.display_name) for key, agent_cfg in agents.items()
+        )
+        if member_rekeys or base_member_rekeys:
+            logged = {**base_member_rekeys, **member_rekeys}
+            logger.info(
+                "config: keyed %d Crew Member record(s) by member_id: %s",
+                len(logged),
+                ", ".join(f"{old!r} -> {new!r}" for old, new in logged.items()),
+            )
+        if member_rekeys:
+            rekeyed_agents: dict[str, KiroCrewAgentConfig] = {}
+            for key, agent_cfg in agents.items():
+                new_key = member_rekeys.get(key, key)
+                if new_key != key:
+                    agent_cfg.legacy_keys = _with_legacy_key(agent_cfg.legacy_keys, key)
+                    if not agent_cfg.display_name:
+                        agent_cfg.display_name = key
+                rekeyed_agents[new_key] = agent_cfg
+            agents = rekeyed_agents
+        # The document plan (base keys) and the parsed-map plan (a merged entry
+        # whose overlay changed its member_id) together name every key that moved.
+        # This in-memory view is the whole of what a LOAD does about member
+        # identity: the document, the fork sidecar and the picture files are
+        # moved once by ``migrate_member_identity`` (gateway boot, CLI prologue),
+        # never here -- a load runs on request paths and writes nothing for it.
+        member_rekeys = {**base_member_rekeys, **member_rekeys}
 
         # Migrate workspaces from flat or structured format
         raw_workspaces = data.get("workspaces", {})
@@ -4805,6 +5244,16 @@ class KiroCrewConfig:
         default_agent_val = data.get("default_agent", "")
         if not isinstance(default_agent_val, str):
             default_agent_val = ""
+        # The default may name a record by its legacy key or display name;
+        # follow the re-key so the existence check below does not reassign it
+        # to another crew. (The overlay's own default is mapped in
+        # ``merge_config_documents``; the base document's label is echoed to
+        # disk through ``MIGRATE_DEFAULT_AGENT`` below.)
+        default_agent_val = member_rekeys.get(default_agent_val, default_agent_val)
+        if default_agent_val not in agents:
+            labelled = [k for k, a in agents.items() if a.display_name == default_agent_val]
+            if len(labelled) == 1:
+                default_agent_val = labelled[0]
         default_memory_store_val = data.get("default_memory_store", DEFAULT_MEMORY_STORE)
         if not isinstance(default_memory_store_val, str):
             default_memory_store_val = DEFAULT_MEMORY_STORE
@@ -4992,6 +5441,16 @@ class KiroCrewConfig:
                 )
                 pending.add(MIGRATE_AGENTS)
             if not cfg.default_agent or cfg.default_agent not in cfg.agents:
+                if cfg.default_agent:
+                    # Loud, not silent: the stored default names no member by
+                    # key, legacy key or display name (an overlay naming a
+                    # re-keyed member whose label was already something else
+                    # lands here), and the remedy is the operator's.
+                    logger.warning(
+                        "config: default_agent %r names no Crew Member; using another "
+                        "default. Set it by member id: kirocrew config set default_agent <id>",
+                        cfg.default_agent,
+                    )
                 # Prefer "default" if it exists, otherwise use first available agent
                 if "default" in cfg.agents:
                     cfg.default_agent = "default"
@@ -4999,6 +5458,14 @@ class KiroCrewConfig:
                     cfg.default_agent = next(iter(cfg.agents))
                 else:
                     cfg.default_agent = "default"
+                pending.add(MIGRATE_DEFAULT_AGENT)
+            elif (
+                raw_base_default is not None
+                and cfg.default_agent != raw_base_default
+                and not overlay_supplies_default
+            ):
+                # The base document names the default by a label the load
+                # mapped to a key; write the key back once.
                 pending.add(MIGRATE_DEFAULT_AGENT)
 
             # One-shot launch migration for ``connections_ui`` (see the marker
@@ -6614,21 +7081,46 @@ def resolve_crew_identity(
     makes it canonical — a membership check on names the surface owns, not a
     cross-namespace match.
     """
+    # Function-local for the same ``config.loader -> members -> config`` cycle
+    # ``_resolve_agent_selection`` documents.
+    from kiro_crew.members import resolve_member_id
+
     if crew_agent is not None:
-        return crew_agent
-    if agent and agent in config.agents:
-        # DEBUG, not INFO: every Slack/cron session resolves here routinely.
-        # The line exists so a kiro-template name that collides with a crew
-        # key (which would silently inherit that crew's watchdog windows) is
-        # diagnosable from logs.
-        logger.debug("crew_agent %r resolved by crew-namespace fallback", agent)
-        return agent
+        # Canonicalized to the key: a slot pinned by display name carries that
+        # name here, and every consumer indexes config.agents by the key.
+        return resolve_member_id(crew_agent, config) or crew_agent
+    if agent:
+        key = resolve_member_id(agent, config)
+        if key is not None:
+            # DEBUG, not INFO: every Slack/cron session resolves here routinely.
+            # The line exists so a kiro-template name that collides with a crew
+            # key (which would silently inherit that crew's watchdog windows) is
+            # diagnosable from logs.
+            logger.debug("crew_agent %r resolved by crew-namespace fallback", agent)
+            return key
     return ""
 
 
 def _resolve_agent_selection(config, agent_name=None, project_dir=None, *, selection_kind=""):
-    """Select a config record/template without accessing any memory files."""
-    alias_hit = selection_kind != "template" and bool(agent_name) and agent_name in config.agents
+    """Select a config record/template without accessing any memory files.
+
+    A member handle is its ``member_id`` (the ``config.agents`` key) or its
+    display name -- a slot pinned by display name carries that name -- and both
+    select the same record through ``members.resolve_member``. A handle that
+    names no member falls through to the template lookup.
+    """
+    alias_hit = False
+    if selection_kind != "template" and agent_name:
+        # Function-local: ``kiro_crew.members`` imports ``data_home`` from
+        # ``config.paths`` and this module imports ``select_provider_backend``
+        # from ``members`` at call time, so a module-scope import here would
+        # close the cycle ``config.loader -> members -> config``.
+        from kiro_crew.members import resolve_member_id
+
+        resolved_key = resolve_member_id(agent_name, config)
+        if resolved_key is not None:
+            alias_hit = True
+            agent_name = resolved_key
     passthrough = (
         ""
         if alias_hit or selection_kind == "member"

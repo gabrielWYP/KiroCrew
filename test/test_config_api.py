@@ -334,7 +334,10 @@ class TestAgentCrudProperties:
                     assert created["workspace"] == workspace
                     assert created["memory_store"] == private_store
                     persisted = json.loads(tmp.read_text())
-                    assert persisted["agents"][name]["memory_store"] == private_store
+                    # Keyed by the immutable id; ``name`` is the display name.
+                    record = persisted["agents"][create_data["member_id"]]
+                    assert record["memory_store"] == private_store
+                    assert record.get("display_name", create_data["member_id"]) == name
                     store = persisted["memory_stores"][private_store]
                     assert store["owner_member"] == name
                     assert store["memory_version"] == 2
@@ -873,7 +876,7 @@ async def test_binding_only_update_serializes_against_generic_snapshot_save(tmp_
         async with TestClient(TestServer(_make_crud_app())) as client:
             loop = asyncio.get_running_loop()
 
-            def _owner_then_race(crew: str, target: str):
+            def _owner_then_race(crew: str, target: str, **kwargs):
                 # Runs in the generic path's worker thread while that
                 # path holds the config lock with a pre-rebind snapshot.
                 # Fire the fast-path switch for the OTHER crew here and
@@ -889,7 +892,7 @@ async def test_binding_only_update_serializes_against_generic_snapshot_save(tmp_
                         fired["task"].result(timeout=0.5)
                     except concurrent.futures.TimeoutError:
                         pass
-                return real_owner(crew, target)
+                return real_owner(crew, target, **kwargs)
 
             with unittest.mock.patch.object(
                 handlers, "_foreign_private_copy_owner", side_effect=_owner_then_race

@@ -110,7 +110,7 @@ from kiro_crew.mcp_cleanup import ALWAYS_ON_BIN_MCP_SERVERS as _ALWAYS_ON_MCPS
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS as _MANAGED_MCPS
 from kiro_crew.mcp_cleanup import OPT_IN_BIN_MCP_SERVERS as _OPT_IN_MCPS
 from kiro_crew.mcp_discovery import McpServerInfo, probe_server
-from kiro_crew.members import is_dispatchable_member_name
+from kiro_crew.members import is_dispatchable_member_name, member_display_name
 from kiro_crew.model_registry import acp_id_correction
 from kiro_crew.platform import (
     PlatformCompositionError,
@@ -199,7 +199,10 @@ def _member_dispatchability(cfg: KiroCrewConfig) -> dict[str, bool] | None:
     failed. The two member sections fail closed on disclosure by skipping.
     """
     try:
-        return {name: is_dispatchable_member_name(name) for name in cfg.agents}
+        return {
+            name: is_dispatchable_member_name(member_display_name(name, member))
+            for name, member in cfg.agents.items()
+        }
     except PlatformCompositionError:
         return None
     except Exception:  # noqa: BLE001 -- doctor must survive a broken setup
