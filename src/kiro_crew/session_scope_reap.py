@@ -60,6 +60,7 @@ from typing import Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV
+from kiro_crew.runtime_ownership import authorize_runtime_kill, outstanding_leases
 from kiro_crew.session_pid import (
     _is_agent_runtime_anchor,
     _is_marked_sandbox_credential_helper,
@@ -550,18 +551,54 @@ def _reclaim_scope(
     stop_unit: Callable[[str], bool],
     signal_owned: Callable[[int, int, list[int], Path, Path], tuple[bool, str]],
     sleep: Callable[[float], None],
+    on_refusal: Callable[[str], None] | None = None,
 ) -> bool:
     """Stop *unit_name*, then SIGTERM -> grace -> SIGKILL survivors.
 
     Every signal is preceded by a fresh ``cgroup.procs`` read, a pidfd pin, and
     ownership re-verification. ``pid <= 1`` and the gateway's own PID are never
     signalled.
+
+    Ownership is asked of every current member BEFORE the unit is stopped, and a
+    single leased member aborts the whole reclaim. Stopping the unit IS the kill
+    here -- systemd terminates the entire cgroup -- so a gate consulted only on
+    the processes that survived the stop is consulted after the thing it exists to
+    prevent. That pre-stop pass QUERIES ownership (:func:`outstanding_leases`)
+    rather than calling the gate: the gate's allow path writes a kill attribution,
+    so a survey that may end in an abort would otherwise record a kill of every
+    unleased member that was never signalled. The gate is still called per pid in
+    the signal loop below, where a signal is actually issued.
+
+    ``on_refusal`` is called with the reason when the reclaim is abandoned, so the
+    caller can record a refusal distinctly from a stop that was attempted and left
+    members behind; the return is ``False`` either way, because the scope was not
+    cleared.
     """
+    my_pid = os.getpid()
+    leased = [
+        pid
+        for pid in _read_cgroup_procs(scope_dir)
+        if pid > 1 and pid != my_pid and outstanding_leases(pid) > 0
+    ]
+    if leased:
+        # A scope with a live tenant is not abandoned, whatever the scope-level
+        # verdict concluded before that tenant joined: reclaimability is decided
+        # from pid sets snapshotted before the sweep, and a session joining a
+        # runtime already inside this scope takes its lease afterwards. Leave the
+        # whole scope for the next pass rather than stopping a unit that would
+        # take the tenant's process with it.
+        logger.warning(
+            "agent_scope_reap refused unit=%s: %d member(s) still leased; not stopping the unit",
+            unit_name,
+            len(leased),
+        )
+        if on_refusal is not None:
+            on_refusal("still leased")
+        return False
     stop_unit(unit_name)
     if not _read_cgroup_procs(scope_dir):
         return True
 
-    my_pid = os.getpid()
     refusal_reasons: set[str] = set()
 
     def warn_refusals() -> None:
@@ -580,6 +617,24 @@ def _reclaim_scope(
         sent_any = False
         for pid in remaining:
             if pid <= 1 or pid == my_pid:
+                continue
+            # The ownership question, asked per pid and per signal, because both
+            # can change between them: this reclaim spans a 3 s grace, and a scope
+            # judged abandoned can gain a tenant inside it -- a session joining a
+            # runtime that was already in this scope takes its lease here, and the
+            # scope-level verdict above was reached before that.
+            #
+            # A refusal is not a near miss the reaper handled. Scope
+            # reclaimability already excludes every scope holding a tracked or
+            # live-provider pid, so a leased pid reaching this loop means the two
+            # records disagree, and the lease is the one that says a session is
+            # still using the process.
+            if not authorize_runtime_kill(
+                pid,
+                reason=f"abandoned agent scope {unit_name}",
+                caller="session_scope_reap._reclaim_scope",
+            ):
+                refusal_reasons.add("still leased")
                 continue
             sent, reason = signal_owned(pid, sig, remaining, scope_dir, proc_root)
             sent_any = sent_any or sent
@@ -692,6 +747,7 @@ def reap_scopes(
             )
             continue
         members = len(_read_cgroup_procs(scope_dir))
+        refused: list[str] = []
         cleared = _reclaim_scope(
             scope_dir,
             unit_name,
@@ -699,17 +755,63 @@ def reap_scopes(
             stop_unit=stop_unit,
             signal_owned=signal_owned,
             sleep=sleep,
+            on_refusal=refused.append,
         )
-        _sel_scope_reap(unit_name, members, reason, "completed" if cleared else "failed")
+        # A refusal and a failure are different events for an operator: one says a
+        # tenant is still using the scope and the next pass should try again, the
+        # other says the stop was attempted and did not finish.
+        _sel_scope_reap(
+            unit_name,
+            members,
+            reason,
+            "completed" if cleared else ("refused" if refused else "failed"),
+        )
         if cleared:
             summary.reclaimed += 1
         else:
             summary.skipped += 1
-            logger.warning("agent_scope_reap could not fully clear unit=%s", unit_name)
+            if refused:
+                logger.warning(
+                    "agent_scope_reap left unit=%s for the next pass: %s",
+                    unit_name,
+                    ",".join(refused),
+                )
+            else:
+                logger.warning("agent_scope_reap could not fully clear unit=%s", unit_name)
     if has_old_skipped_scope:
         counts = " ".join(f"{name}={count}" for name, count in sorted(skipped_reasons.items()))
         logger.info("agent_scope_reap: skipped old scope(s): %s", counts)
     return summary
+
+
+def instance_slice_pids() -> set[int]:
+    """Every pid the kernel currently places inside THIS install's agent slice.
+
+    Kernel truth for :mod:`kiro_crew.runtime_reconcile`: the population of
+    processes that exist, read from ``cgroup.procs`` rather than from any record
+    this gateway keeps, which is what lets the two be compared at all.
+
+    Scoped to the per-instance child slice for the same reason
+    :func:`_instance_scope_dir` is -- the bare shared parent can hold a
+    co-resident gateway's scopes, and a pid of theirs would read here as one of
+    ours with no record, which is precisely the shape that gets something killed.
+    An unresolvable slice returns the EMPTY set, and the reconciler treats an
+    empty kernel reading as nothing to compare rather than as an empty install.
+    """
+    slice_dir, _why = _instance_scope_dir()
+    if slice_dir is None:
+        return set()
+    pids: set[int] = set()
+    # The slice's own cgroup.procs carries anything attached directly to it;
+    # each transient scope beneath it carries one spawn's tree.
+    pids.update(_read_cgroup_procs(slice_dir))
+    try:
+        children = [p for p in slice_dir.iterdir() if p.suffix == ".scope" and p.is_dir()]
+    except OSError:
+        return pids
+    for scope_dir in children:
+        pids.update(_read_cgroup_procs(scope_dir))
+    return pids
 
 
 def reap_abandoned_agent_scopes(active_pids: set[int] | None = None) -> ReapSummary:

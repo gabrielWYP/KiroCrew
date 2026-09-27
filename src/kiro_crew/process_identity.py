@@ -757,6 +757,101 @@ async def _sweep_children(
     )
 
 
+async def release_teardown_lease(
+    sessions: object, session_key: str, handle: ProcessHandle, *, who: str
+) -> None:
+    """Release the lease held by the session a teardown is destroying.
+
+    A teardown's subject must not be able to refuse the teardown. The lease is
+    normally released inside ``provider.shutdown()``, the last step of a reset, so
+    a reset that hung or raised before it still holds one -- and the last-resort
+    kill paths that call this exist precisely for that case. Asking the ownership
+    gate first would let the session being destroyed refuse its own kill: the
+    wedged process would survive and its pid would go on being refused by every
+    sweep for the gateway's life.
+
+    ``sessions.tearing_down(session_key)`` is what makes the subject reachable
+    after its pop: the live map stops naming a session at the pop, before the
+    teardown's awaits, and that table holds the popped session for exactly the life
+    of each teardown. The entry is matched on *handle*'s pid AND start identity, so
+    a key with several teardowns in flight releases the one whose process is about
+    to be signalled and leaves a sibling's lease alone.
+
+    What survives is a lease held by a DIFFERENT owning session, which is the only
+    thing that may withhold a signal. At ``cap=1`` a runtime carries at most one
+    lease and a session-sharing sub-agent takes none, so this does not -- and
+    cannot -- speak for an in-flight shared sub-agent on the same process.
+
+    Best effort by design: every failure here is a reason to go on and ask the gate,
+    never a reason to abandon the kill. A release that did not happen costs a
+    refusal the caller reports honestly; an exception raised out of here would cost
+    the wedged process its only remaining kill. Shared by the cron run reaper and
+    the sub-agent reset ladder so the two cannot drift.
+    """
+    try:
+        from kiro_crew.runtime_ownership import release_session_lease
+
+        if sessions is None:
+            return
+        pid = getattr(handle, "pid", None)
+        start_id = getattr(handle, "start_id", None)
+        for entry in sessions.tearing_down(session_key):  # type: ignore[attr-defined]
+            entry_handle = getattr(entry, "handle", None)
+            if getattr(entry_handle, "pid", None) != pid:
+                continue
+            if getattr(entry_handle, "start_id", None) != start_id:
+                continue
+            provider = getattr(getattr(entry, "session", None), "provider", None)
+            if provider is None:
+                continue
+            await release_session_lease(provider)
+            logger.debug(
+                "%s: released the teardown's own lease on pid %s for %s", who, pid, session_key
+            )
+    except Exception:
+        logger.debug(
+            "%s: could not release the teardown's own lease for %s; asking the gate anyway",
+            who,
+            session_key,
+            exc_info=True,
+        )
+
+
+def audit_kill_decision(pid: int, outcome: str, reason: str, *, tool_name: str) -> None:
+    """Emit one SEL audit event for a kill DECISION, whatever it decided.
+
+    The ownership gate writes a log line and nothing else, so on its own an
+    allow or a refusal leaves no audit record -- and a process signalled with no
+    record of who decided it is the one thing every other reap path in this
+    gateway does not do. Emitted for the refusal as well as the signal, because
+    "we decided not to" is what an operator needs when a leak reading stays
+    non-zero.
+
+    Written at the DECISION point rather than inside a kill primitive: the
+    primitives are shared by callers that audit through their own attribution, and
+    what matters here is which caller decided and why. ``tool_name`` names that
+    caller.
+
+    Never raises. An audit that cannot be written must not stop a sweep.
+    """
+    try:
+        # Lazy: sel pulls in heavy modules and this file is imported early.
+        from kiro_crew.sel import sel
+
+        sel().log_tool_invocation(
+            session_key="gateway",
+            agent="kirocrew",
+            source="background",
+            tool_name=tool_name,
+            tool_kind="process_kill",
+            outcome=outcome,
+            resources=f"pid={pid}",
+            metadata={"reason": reason[:200]},
+        )
+    except Exception:
+        logger.debug("SEL kill-decision audit failed for %s", tool_name, exc_info=True)
+
+
 async def kill_verified_process(
     handle: ProcessHandle, *, who: str, key: str, child_helpers: ChildHelpers
 ) -> str | None:

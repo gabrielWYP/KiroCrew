@@ -1186,8 +1186,50 @@ class TerminalCoordinator(ManagerComponent):
         if handle is None:
             logger.warning("Reaper: no session found for %s", session_key)
             return None
+        # Imported HERE, not at the top of the module: every ``*_impl`` is
+        # rebound onto ``subagent``'s globals, so a module-level import in this
+        # file is inert for it.
+        from kiro_crew.process_identity import release_teardown_lease
+        from kiro_crew.runtime_ownership import authorize_runtime_kill
+
+        # Ownership, asked once before the verified kill. The recycle check
+        # inside it answers a different question -- whether this pid is still
+        # the process we recorded -- and a yes to that is not a yes to this:
+        # with session sharing on, the process this sub-agent ran on also
+        # carries its parent and its siblings, and the graceful reset this
+        # ladder is the fallback for hung for ONE of them.
+        #
+        # The run's OWN lease goes first, through the helper the cron reaper
+        # shares, so the two teardown paths cannot drift: a gate asked while the
+        # subject still holds its lease lets the session being destroyed refuse
+        # its own last-resort kill. What the release leaves is another owning
+        # session's lease. At cap=1 a session-sharing sub-agent holds none, so
+        # this gate cannot speak for one that is still working on this process.
+        await release_teardown_lease(self._manager._sessions, session_key, handle, who="Reaper")
+
+        # A refusal withholds the tree signal AND the escaped-children sweep. The
+        # recorded child set is the SHARED root's whole descendant tree, not this
+        # run's alone -- with session sharing on it holds the co-tenant's MCP and
+        # node children -- so sweeping it after sparing the root would spare the
+        # process and kill the processes it depends on, which is worse than either
+        # ending it or leaving it alone. The refusal is RETURNED so the caller's
+        # record cannot say the run was reaped, and the surviving tree stays the
+        # reconciler's to count.
+        helpers = child_process_helpers()
+        if handle.pid and not authorize_runtime_kill(
+            handle.pid,
+            reason=f"graceful reset hung for {session_key}",
+            caller="subagent_manager.terminal._sigkill_session_impl",
+        ):
+            logger.warning(
+                "Reaper: another session holds a lease on PID %d; leaving its tree to the "
+                "reconciler for %s",
+                handle.pid,
+                session_key,
+            )
+            return "RuntimeOwnership: a session still holds a lease on the runtime"
         return await kill_verified_process(
-            handle, who="Reaper", key=session_key, child_helpers=child_process_helpers()
+            handle, who="Reaper", key=session_key, child_helpers=helpers
         )
 
     def notify_injection_failed_impl(
