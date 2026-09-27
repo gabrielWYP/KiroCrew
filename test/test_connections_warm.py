@@ -229,28 +229,45 @@ def _provider(slug: str, url: str = "") -> Provider:
 _WARM_FS_NAMES = _FS_NAMES | {"list_servers", "grant_present", "oauth_url_contains_credential"}
 
 
+def _warm_engine_trees() -> list[tuple[str, ast.Module]]:
+    """The facade plus every module of its private ``warm_runtime`` package.
+
+    One call graph, because a helper the facade re-exports is still called from the facade's
+    coroutines, and a coroutine that moved into an owner still owes the same invariant. Reading
+    the facade alone would silently drop both.
+    """
+    from kiro_crew.connections import warm_runtime
+
+    owners = sorted(Path(warm_runtime.__file__).parent.glob("*.py"))
+    assert len(owners) > 1, "warm_runtime moved; this guard is reading the wrong tree"
+    return [
+        (path.name, ast.parse(path.read_text(encoding="utf-8")))
+        for path in [Path(warm.__file__), *owners]
+    ]
+
+
 def test_no_coroutine_in_the_warm_module_touches_the_filesystem_directly():
-    tree = ast.parse(inspect.getsource(warm))
-    sync: dict[str, Any] = {}
-    coros: dict[str, Any] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            sync[node.name] = node
-        elif isinstance(node, ast.AsyncFunctionDef):
-            coros[node.name] = node
+    sync: dict[str, list[Any]] = {}
+    coros: list[tuple[str, Any]] = []
+    for label, tree in _warm_engine_trees():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                sync.setdefault(node.name, []).append(node)
+            elif isinstance(node, ast.AsyncFunctionDef):
+                coros.append((f"{label}:{node.name}", node))
     assert sync and coros, "module shape changed; this guard is reading the wrong tree"
 
     touches = {
-        name: bool(_called_names(node) & (_FS_ATTRS | _WARM_FS_NAMES))
-        for name, node in sync.items()
+        name: any(_called_names(node) & (_FS_ATTRS | _WARM_FS_NAMES) for node in nodes)
+        for name, nodes in sync.items()
     }
     changed = True
     while changed:
         changed = False
-        for name, node in sync.items():
+        for name, nodes in sync.items():
             if touches[name]:
                 continue
-            if any(touches.get(callee) for callee in _called_names(node)):
+            if any(touches.get(callee) for node in nodes for callee in _called_names(node)):
                 touches[name] = changed = True
     fs_helpers = {name for name, hit in touches.items() if hit}
     # The known set, so a helper silently losing its filesystem work -- and with it
@@ -290,7 +307,7 @@ def test_no_coroutine_in_the_warm_module_touches_the_filesystem_directly():
 
     offenders = {
         f"{coro} -> {callee}"
-        for coro, node in coros.items()
+        for coro, node in coros
         for callee in _called_names(node) & (fs_helpers | _FS_ATTRS | _WARM_FS_NAMES)
     }
     assert not offenders, (

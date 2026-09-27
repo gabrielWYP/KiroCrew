@@ -284,6 +284,8 @@ The gateway imports the dashboard handlers package at boot, and the mint engine
 drags in the ACP client, the credential predicate and the PID registry;
 `test_the_handlers_package_does_not_import_the_mint_engine` enforces that in a
 subprocess, so hoisting either import to module scope turns the suite red.
+`test_no_boot_path_module_loads_any_warm_or_mint_module` probes the same boot imports by
+module prefix, so a `warm_runtime` owner reached without its facade is caught too.
 
 ## Minting and the warm table
 
@@ -291,13 +293,31 @@ Cold mint (`kiro_crew.connections.mint`) spawns one kiro-cli process per provide
 approval URL: ~7.5s per card. `kiro_crew.connections.warm` serves the whole gallery from one
 process, and every rule below answers an observed failure.
 
-**Placement.** Warm engine code remains in `src/kiro_crew/connections/warm.py`; the dashboard
-handler adds only endpoint wiring -- `expire_dead_mints` on the status path,
-`mintable_providers` plus `warm_mint_all` on the premint path, and `adopt_shared_mint` on the
-mint path. The dashboard server registers two lifecycle hooks in both full and headless modes:
-a tracked startup task that scavenges dead private generations off-loop without delaying the
-listener bind, and a cleanup hook that retires the live runtime. Those hooks import the warm
-module lazily, so importing the server alone still does not construct or spawn the engine.
+**Placement.** `src/kiro_crew/connections/warm.py` is the warm engine's one import and patch
+surface, and it composes three private owners under `kiro_crew.connections.warm_runtime`; the
+dashboard handler adds only endpoint wiring -- `expire_dead_mints` on the status path,
+`_audited_mintable_providers` plus `warm_mint_all` on the premint path, and `adopt_shared_mint`
+on the mint path. The dashboard server registers two lifecycle hooks in both full and headless
+modes: a tracked startup task that scavenges dead private generations off-loop without delaying
+the listener bind, and a cleanup hook that retires the live runtime. Those hooks import the warm
+module lazily, so importing the server alone still does not construct or spawn the engine, and
+no boot-path module loads a `warm_runtime` owner either.
+
+| Owner | Holds | Why there |
+|---|---|---|
+| `src/kiro_crew/connections/warm_runtime/spec_plan.py` | `_WarmSpecPlan`; the reuse rules `_plan_is_servable` and `_resident_roster_is_asked_for`; per-provider entry derivation (`_registry_server_entry`, `_operator_oauth_client`, `_auth_shape`, `_warm_mintable_entry`); `_wanted_aliases` | pure rules over registry and configured entries |
+| `src/kiro_crew/connections/warm_runtime/start_identity.py` | `_process_identity_live` and the start-identity helpers it compares with | the tri-state PID-reuse verdict both generation readers act on |
+| `src/kiro_crew/connections/warm_runtime/shared_rows.py` | the two-axis predicates (`_warm_table_row`, the counts built on it, `_mint_is_cold_held`, `_mint_is_adopted`); the atomic `_claim_shared_mints`, `_dispose_displaced_rows` and `_release_shared_claims` | one claim transaction over the cold engine's table, bound from `mint` exactly as the facade binds it |
+| `src/kiro_crew/connections/warm.py` | the public API; every patch seam; the provider scan; `_warm_spec_plan`; spec ownership (sentinel, judge, gated writer); the generation-directory lifecycle and its owner marker; `_WarmMintRuntime`; adoption, absorb, expiry, drain, reaper and re-arms | pinned to the file by the link-screen baseline, the agent-spec call-site ratchet, the session-registry gate and the security spec's citation of `warm._credential_bearing_slugs`, or a caller of a seam patched on this module |
+
+`warm.py` re-exports every owner name as the same object, and no owner imports the facade,
+`kiro_crew.acp` or `kiro_crew.providers` at module scope. One facade name is reached at call
+time: `shared_rows` disposes a row through `warm._dispose_mint`, the binding the warm engine's
+callers substitute. `test/test_connections_warm_mint_composition_contract.py` pins all four
+properties. The cold engine stays whole in `mint.py`: every rule there either reads the
+module-level table and seams its callers substitute on `mint`, or is held in the file by the
+agent-spec call-site ratchet and the agent-SDK boundary baseline, so an owner split out of it
+would only forward.
 
 ### The handoff: how a premint reaches the click it was minted for
 
@@ -430,7 +450,9 @@ Every flow reads the user's config, a private generation tree, the old global ag
 or kiro-cli's OAuth cache, any of which can sit on a network mount where a stat is unbounded, so
 all of that work lives in SYNCHRONOUS helpers and a coroutine reaches them through
 `asyncio.to_thread` -- enforced by a fixed-point drift guard in `test/test_connections_warm.py`
-that reuses the mint engine's own primitive sets so the two cannot drift apart. What the guard
+that reuses the mint engine's own primitive sets so the two cannot drift apart. It reads
+`warm.py` and every `warm_runtime` owner as one call graph, so a coroutine that moves into an
+owner still owes the invariant and a helper the facade re-exports still counts. What the guard
 pins today is the exact set of helpers doing filesystem work, so the lifecycle slice can neither
 call one from a coroutine nor quietly drop the filesystem work the guard's coverage rests on
 without failing it.
@@ -532,8 +554,8 @@ that mutation's settlement, guarded only by `except Exception`, is the recurring
 class here: a `CancelledError` inherits from `BaseException` and walks straight past
 such a guard, leaving rows nothing withdraws, parked processes with no sweeper, forked
 children, orphan specs, registered sessions with live loopback callback servers, or
-generations with no reference left anywhere. Every mutation window in `warm.py` is
-written to that rule.
+generations with no reference left anywhere. Every mutation window in `warm.py` and its
+`warm_runtime` owners is written to that rule.
 
 
 ## Disconnect
