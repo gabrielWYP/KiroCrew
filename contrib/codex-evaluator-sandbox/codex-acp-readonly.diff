@@ -1,0 +1,37 @@
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -32983,19 +32983,16 @@
+   }
+   static ReadOnly = new _AgentMode(
+     "read-only",
+-    "Ask for approval",
+-    "Always ask to edit external files and use the internet",
++    "Read only",
++    "Read-only sandbox; never asks, never escalates (fail-closed)",
+     "standard",
+-    "on-request",
++    "never",
+     "user",
+     {
+-      type: "workspaceWrite",
+-      writableRoots: [],
+-      networkAccess: false,
+-      excludeTmpdirEnvVar: false,
+-      excludeSlashTmp: false
++      type: "readOnly",
++      networkAccess: false
+     },
+-    "workspace-write"
++    "read-only"
+   );
+   static Agent = new _AgentMode(
+     "agent",
+@@ -33982,7 +33979,7 @@
+     const mergedConfig = {
+       ...forceGitRootTurnDiffPaths(mergeGatewayConfig(this.config, this.gatewayConfig)),
+       projects: Object.fromEntries(sessionRoots.map((root) => [root, {
+-        trust_level: "trusted"
++        trust_level: process.env["CODEX_ACP_UNTRUSTED_PROJECTS"] === "1" ? "untrusted" : "trusted"
+       }]))
+     };
+     const configWithWorkspaceRoots = mergeSandboxWorkspaceWriteRoots(mergedConfig, additionalDirectories);

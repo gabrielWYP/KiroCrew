@@ -30,6 +30,7 @@ from kiro_crew.acp.liveness import (
     boottime_now,
     consult_offloaded,
 )
+from kiro_crew.acp import evaluator_lock
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE, PROVIDER_LABEL_DEFAULT
 from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401 - STOP_* resolved by run.py via bind_component_globals
@@ -2783,6 +2784,23 @@ class SubagentManager:
         metadata: dict | None = None,
         info: "SubagentInfo | None" = None,
     ) -> None:
+        # codex-sandbox A3: every approval rung of the subagent loop (hook
+        # auto-approve, parent_policy_auto, identity grant, interactive) lands
+        # here. A locked read-only evaluator is rejected instead, decided by the
+        # subagent's own agent and the per-request identity of the session that
+        # will answer (not the runtime's), and logged as a denial.
+        _lock = evaluator_lock.subagent_lock_reason(client, request_id, getattr(info, "agent", None))
+        if _lock:
+            evaluator_lock.log_lock("subagent._approve_and_log", request_id, _lock)
+            await SubagentManager._reject_and_log(
+                client,
+                request_id,
+                session_key,
+                event,
+                error=evaluator_lock.LOCK_ERROR,
+                metadata={**(metadata or {}), "lock_reason": _lock},
+            )
+            return
         await client.approve_tool(request_id)
         # An APPROVED child-origin escalation is side-effect activity: count
         # it in tool_count so the transient-retry / cancel-respawn replay
