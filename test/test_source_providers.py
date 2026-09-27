@@ -9354,7 +9354,7 @@ class TestAdfToMarkdown:
         conventional unless something checks it, so the node types and attribute
         names are read back OUT of the module and every combination is tried:
         a type added later is covered without anyone remembering this test."""
-        src = inspect.getsource(source)
+        src = inspect.getsource(inspect.getmodule(source._adf_to_markdown))
         body = src[src.index("def _adf_block_to_markdown") : src.index("def _adf_plain_text")]
         attr_names = set(re.findall(r'attrs\.get\("([a-zA-Z]+)"\)', body))
         node_types = set(source._ADF_BLOCK_TYPES) | set(

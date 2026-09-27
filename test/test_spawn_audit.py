@@ -2189,7 +2189,7 @@ def test_agent_influenced_sites_are_routed():
         "task_executor.py::run_tests",
         "git_coord.py::_git",
         "git_coord.py::_is_git_repo",
-        "dashboard/handlers/source_providers.py::_run_json",
+        "dashboard/source_providers/runner.py::_run_provider",
     ):
         assert key not in unrouted, (
             f"{key} must route its spawn through sandboxed_spawn_argv "

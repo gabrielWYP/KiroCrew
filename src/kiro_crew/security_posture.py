@@ -1918,6 +1918,16 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/notification_coordinator.py",
         "dashboard/slot_projection.py",
         "dashboard/websocket_hub.py",
+        # Owners extracted from dashboard/handlers/source_providers.py, which keeps
+        # the HTTP handlers. They redact provider data before it is cached or
+        # returned through those handlers, but they add no logical egress path:
+        # the same source-provider boundaries the handler entry covered, split by
+        # responsibility, so the decomposition leaves the posture items unchanged.
+        "dashboard/source_providers/adf.py",
+        "dashboard/source_providers/cache.py",
+        "dashboard/source_providers/chip_refresh.py",
+        "dashboard/source_providers/review.py",
+        "dashboard/source_providers/sanitize.py",
         # Pre-redacts follow-up items before handing to state.py's WS egress
         # (the registered sink); its own return string is re-redacted by
         # chat_runner before broadcast. Not itself an egress boundary.
@@ -1944,7 +1954,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/handlers/memory.py",
         "dashboard/handlers/optimizer.py",
         "dashboard/handlers/prompts.py",
-        "dashboard/handlers/source_providers.py",
         "dashboard/handlers/taskrunner.py",
         "dashboard/handlers/terminal.py",
         "dashboard/handlers/themes.py",
