@@ -2892,7 +2892,88 @@ class RunEventCoordinator(ManagerComponent):
             return False
         if not info.parent_session_key:
             return False
-        return self._manager._sessions.is_session_sharing_eligible(info.parent_session_key)
+        if not self._manager._sessions.is_session_sharing_eligible(info.parent_session_key):
+            return False
+        # Per-agent backend (VARIANT B): a child whose own agent JSON selects a
+        # DIFFERENT backend than the parent's live process must NOT share that
+        # process — session sharing runs the child ON the parent's runtime, so a
+        # shared child inherits the parent's harness no matter what its JSON
+        # says. Force the dedicated path so the provider factory constructs a
+        # process on the child's own backend. A child that names the SAME
+        # backend, or names nothing, still shares (the common, fast path is
+        # untouched). Fail-open: any error resolving the comparison leaves the
+        # existing sharing decision (True) intact.
+        try:
+            child_backend = self._resolve_child_backend(info)
+            if child_backend is not None:
+                parent_backend = self._resolve_parent_backend(info.parent_session_key)
+                # ``_resolve_parent_backend`` returns ``None`` ONLY when the
+                # parent provider cannot be resolved (fail-open: leave sharing
+                # on). A resolvable kiro parent returns ``""`` (kiro's backend
+                # string), which is a real value that DIFFERS from any non-kiro
+                # child override — so the compare must run whenever the parent
+                # is not ``None``, empty string included.
+                if parent_backend is not None and child_backend != parent_backend:
+                    logger.info(
+                        "Subagent %s: agent backend %r differs from parent backend "
+                        "%r — forcing a dedicated process (no session sharing)",
+                        info.id,
+                        child_backend,
+                        parent_backend or "kiro",
+                    )
+                    return False
+        except Exception:
+            logger.debug(
+                "Subagent %s: per-agent backend sharing check failed; "
+                "keeping the default sharing decision",
+                info.id,
+                exc_info=True,
+            )
+        return True
+
+    def _resolve_child_backend(self, info: SubagentInfo) -> str | None:
+        """The backend this subagent's own agent JSON selects, or ``None``.
+
+        ``None`` means "no per-agent override" (absent / kiro / denied), which
+        is exactly the case where sharing must not be blocked. Keyed on the
+        agent name this spawn resolves to — ``info.agent`` for a named/template
+        spawn, which is also the skill-view alias when the spawn is a native
+        skill view (its projected JSON keeps ``acp_backend``).
+        """
+        from kiro_crew.agent_backend_resolver import resolve_agent_backend_override
+
+        agent_name = info.agent or None
+        if agent_name is None and info.execution_context is not None:
+            agent_name = getattr(info.execution_context, "template_id", None)
+        return resolve_agent_backend_override(agent_name)
+
+    def _resolve_parent_backend(self, parent_session_key: str) -> str | None:
+        """Backend STRING of the parent session's live provider, or ``None``.
+
+        Extracted the same way ``providers.acp.provider_label`` reads it: from
+        the ``AcpSessionProvider`` a shared runtime hands out, or from the
+        ``client`` an ``AcpProvider`` swaps in once startup completes.
+
+        ``None`` means ONLY "no resolvable provider" — the fail-open case the
+        gate treats as unknown and leaves sharing on. A resolvable KIRO parent
+        returns ``""`` (kiro's own backend string), NOT ``None``: kiro is a real
+        backend that a non-kiro child differs from, so the empty string must
+        survive to the comparison rather than collapse into the missing-provider
+        case. The ``backend`` attribute is read with a distinct sentinel so an
+        attribute that is PRESENT-but-empty (kiro) is kept, while a genuinely
+        absent one falls through to the inner client.
+        """
+        _MISSING = object()
+        provider = self._manager._sessions.get_provider(parent_session_key)
+        if provider is None:
+            return None
+        backend = getattr(provider, "backend", _MISSING)
+        if backend is _MISSING:
+            inner = getattr(provider, "client", None) or getattr(provider, "_client", None)
+            backend = getattr(inner, "backend", _MISSING)
+        if backend is _MISSING or not isinstance(backend, str):
+            return None
+        return backend
 
     async def _create_shared_session_impl(
         self,

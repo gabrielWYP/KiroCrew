@@ -139,13 +139,25 @@ def select_provider_backend(
     session_key: str | None,
     member_backend: str,
     configured_default: str,
+    agent_backend_override: str | None = None,
 ) -> str:
     """The per-session half of the ONE backend-selection gate (H3/H13).
 
-    Precedence: the member-DM auto-route, then the configured default. The
-    member arm goes through :func:`resolve_selected_backend` — the same
+    Precedence: the member-DM auto-route, then the PER-AGENT override (the
+    agent JSON's own top-level ``acp_backend``), then the configured default.
+    The member arm goes through :func:`resolve_selected_backend` — the same
     governance/selectability gate the persisted field crosses, so a denied or
     unknown value degrades to kiro and the member thread runs as plain chat.
+
+    ``agent_backend_override`` is resolved by
+    :func:`kiro_crew.agent_backend_resolver.resolve_agent_backend_override`,
+    which has ALREADY crossed that same gate: it is either a selectable backend
+    string or ``None`` (absent / kiro / denied all collapse to ``None``). So it
+    is threaded in as an already-validated value and needs no second gate here,
+    keeping this function a single selection point (H3/H13). It ranks BELOW the
+    member-DM arm on purpose: a member thread's auto-route is a live routing
+    decision about THIS session, whereas the per-agent field is a static
+    property of the template — the session-scoped decision wins.
 
     Lives here rather than inline in ``create_provider_factory`` so the
     factory body stays a single selection CALL with no branching of its own:
@@ -163,6 +175,14 @@ def select_provider_backend(
             member_backend,
         )
         return backend
+    if agent_backend_override:
+        logger.info(
+            "session %s: per-agent acp_backend=%r overrides configured default %r",
+            session_key,
+            agent_backend_override,
+            configured_default,
+        )
+        return agent_backend_override
     return configured_default
 
 

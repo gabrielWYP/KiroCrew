@@ -5549,10 +5549,34 @@ class KiroCrewConfig:
             # circular import: members sits above config in the layering.
             from kiro_crew.members import select_provider_backend
 
+            # Per-agent backend override (VARIANT B): the agent JSON's own
+            # top-level ``acp_backend`` field, read from
+            # ``~/.kiro/agents/<name>.json`` keyed on the agent this session
+            # resolves to. An explicit ``acp_backend_override`` kwarg (a caller
+            # that already resolved it — e.g. the spawn path) wins over the
+            # file read so the file is not stat'd twice. The resolver crosses
+            # the SAME selectability gate the persisted field does and returns
+            # ``None`` for absent/kiro/denied, so this stays a pre-validated
+            # input to the one selection gate rather than a second gate. The
+            # ``agent`` name can be a native skill-view alias
+            # (``kirocrew-skill-view-<hash>``); its projected JSON keeps the
+            # field, so the same read resolves it.
+            _agent_backend_override = _kwargs.get("acp_backend_override")
+            if _agent_backend_override is None:
+                # circular-free: agent_backend_resolver reads only leaf modules
+                # (config.paths, acp_backends) and is safe to import here, well
+                # after config load.
+                from kiro_crew.agent_backend_resolver import (
+                    resolve_agent_backend_override,
+                )
+
+                _agent_backend_override = resolve_agent_backend_override(agent)
+
             _backend = select_provider_backend(
                 session_key,
                 self.agent.member_acp_backend,
                 self.agent.acp_backend,
+                agent_backend_override=_agent_backend_override,
             )
             # Resolved BEFORE the model, and threaded into the resolution: the
             # model's namespace translation and its pin-scope check both have to
