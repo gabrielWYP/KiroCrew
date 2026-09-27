@@ -5940,7 +5940,7 @@
       "let_the_agent_read_one_of_your_files": "エージェントにファイルを読み込ませる",
       "message_input": "メッセージ入力",
       "message_placeholder": "{{bot}} にメッセージ… (/command · @file · $skill)",
-      "message_placeholder_terminal": "ターミナル: ! command（! の後にスペース）· {{bot}} にメッセージ… (/command · @file · $skill)",
+      "message_placeholder_terminal": "{{bot}} にメッセージ… (/command · @file · $skill · ! command)",
       "model": "モデル",
       "model_2": "モデル：{{name}}",
       "open_preview_of": "{{name}} のプレビューを開く",

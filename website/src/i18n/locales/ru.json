@@ -6231,7 +6231,7 @@
       "let_the_agent_read_one_of_your_files": "Разрешить агенту прочитать один из ваших файлов",
       "message_input": "Поле ввода сообщения",
       "message_placeholder": "Написать {{bot}}… (/command · @file · $skill)",
-      "message_placeholder_terminal": "Терминал: ! command (пробел после !) · Написать {{bot}}… (/command · @file · $skill)",
+      "message_placeholder_terminal": "Написать {{bot}}… (/command · @file · $skill · ! command)",
       "model": "Модель",
       "model_2": "Модель: {{name}}",
       "open_preview_of": "Открыть предпросмотр {{name}}",

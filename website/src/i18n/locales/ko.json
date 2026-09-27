@@ -5940,7 +5940,7 @@
       "let_the_agent_read_one_of_your_files": "에이전트가 내 파일을 읽도록 허용",
       "message_input": "메시지 입력",
       "message_placeholder": "{{bot}}에게 메시지… (/command · @file · $skill)",
-      "message_placeholder_terminal": "터미널: ! command (! 뒤에 공백) · {{bot}}에게 메시지… (/command · @file · $skill)",
+      "message_placeholder_terminal": "{{bot}}에게 메시지… (/command · @file · $skill · ! command)",
       "model": "모델",
       "model_2": "모델: {{name}}",
       "open_preview_of": "{{name}} 미리보기 열기",

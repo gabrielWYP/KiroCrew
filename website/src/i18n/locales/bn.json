@@ -6037,7 +6037,7 @@
       "let_the_agent_read_one_of_your_files": "এজেন্টকে আপনার একটি ফাইল পড়তে দিন",
       "message_input": "বার্তা ইনপুট",
       "message_placeholder": "{{bot}}-কে মেসেজ করুন… (/command · @file · $skill)",
-      "message_placeholder_terminal": "টার্মিনাল: ! command (!-এর পরে স্পেস) · {{bot}}-কে মেসেজ পাঠাও… (/command · @file · $skill)",
+      "message_placeholder_terminal": "{{bot}}-কে মেসেজ করুন… (/command · @file · $skill · ! command)",
       "model": "মডেল",
       "model_2": "মডেল: {{name}}",
       "open_preview_of": "{{name}}-এর প্রিভিউ খোলো",

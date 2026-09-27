@@ -5940,7 +5940,7 @@
       "let_the_agent_read_one_of_your_files": "让代理读取你的某个文件",
       "message_input": "消息输入",
       "message_placeholder": "给 {{bot}} 发消息… (/command · @file · $skill)",
-      "message_placeholder_terminal": "终端：! command（! 后加空格）· 给 {{bot}} 发消息… (/command · @file · $skill)",
+      "message_placeholder_terminal": "给 {{bot}} 发消息… (/command · @file · $skill · ! command)",
       "model": "模型",
       "model_2": "模型：{{name}}",
       "open_preview_of": "打开 {{name}} 的预览",

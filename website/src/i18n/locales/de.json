@@ -6037,7 +6037,7 @@
       "let_the_agent_read_one_of_your_files": "Dem Agenten erlauben, eine Ihrer Dateien zu lesen",
       "message_input": "Nachrichteneingabe",
       "message_placeholder": "Nachricht an {{bot}}… (/command · @file · $skill)",
-      "message_placeholder_terminal": "Terminal: ! command (Leerzeichen nach !) · Nachricht an {{bot}}… (/command · @file · $skill)",
+      "message_placeholder_terminal": "Nachricht an {{bot}}… (/command · @file · $skill · ! command)",
       "model": "Modell",
       "model_2": "Modell: {{name}}",
       "open_preview_of": "Vorschau von {{name}} öffnen",

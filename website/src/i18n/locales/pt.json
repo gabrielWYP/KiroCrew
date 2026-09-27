@@ -6134,7 +6134,7 @@
       "let_the_agent_read_one_of_your_files": "Permite que o agente leia um dos seus arquivos",
       "message_input": "Entrada de mensagem",
       "message_placeholder": "Enviar mensagem para {{bot}}… (/command · @file · $skill)",
-      "message_placeholder_terminal": "Terminal: ! command (espaço após !) · Mensagem para {{bot}}… (/command · @file · $skill)",
+      "message_placeholder_terminal": "Enviar mensagem para {{bot}}… (/command · @file · $skill · ! command)",
       "model": "Modelo",
       "model_2": "Modelo: {{name}}",
       "open_preview_of": "Abrir a pré-visualização de {{name}}",

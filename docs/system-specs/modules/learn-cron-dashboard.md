@@ -1336,9 +1336,11 @@ and context into narrow columns; helper text wraps beside its stop button.
 Chat slash, file, skill, and path completion menus stay closed so their keyboard
 handlers cannot rewrite a command or consume its send shortcut.
 
-The default placeholder advertises `! command` and the required space only for
-local sessions with an enabled, docked terminal. Caller-supplied placeholders and
-the existing connection, stop, voice, and recovery hints retain their priority.
+The default placeholder lists `! command` alongside `/command`, `@file`, and
+`$skill` in the message invitation's parentheses, only for local sessions with an
+enabled, docked terminal. The syntax shows the required space after `!`.
+Caller-supplied placeholders and the existing connection, stop, voice, and
+recovery hints retain their priority.
 
 Every eligible terminal submission opens the existing `RunInTerminalConfirm`
 dialog with the exact expanded command and the warning from

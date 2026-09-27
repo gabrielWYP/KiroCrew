@@ -90,10 +90,10 @@ function confirmRun() {
 }
 
 describe('direct terminal commands', () => {
-  it('advertises the syntax only while a local terminal is enabled and docked', () => {
+  it('lists the syntax with the other shortcuts only while a local terminal is enabled and docked', () => {
     const { props, rerender } = setup({ value: '' })
     const input = screen.getByLabelText('Message input')
-    const advertised = /^Terminal: ! command \(space after !\)/
+    const advertised = /^Message .+… \(\/command · @file · \$skill · ! command\)$/
     expect(input).toHaveAttribute('placeholder', expect.stringMatching(advertised))
 
     for (const target of ['remote', 'pending', undefined] as const) {
