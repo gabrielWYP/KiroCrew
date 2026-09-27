@@ -11,14 +11,47 @@ type-validated before they are written, and the CLI converts typed values before
 writing.
 
 The config package loads runtime configuration from `~/.kiro/crew/config.json`
-using stdlib dataclasses with sensible defaults. Responsibilities are split in
-one direction: `config/sections.py` owns section DTOs, field defaults, and their
-coercion/normalization rules; `config/resolution.py` owns raw overlay merging,
-top-level section classification, and degraded-input tracking; and
-`config/loader.py` owns the compatibility facade plus persistence, validation
-orchestration, cache fingerprinting, migration, and runtime binding resolution.
-`loader.py` re-exports the historical DTO, helper, and constant names so existing
-callers keep the same import surface.
+using stdlib dataclasses with sensible defaults. `config/sections.py` and
+`config/loader.py` are the two facades callers import. Each composes the owner
+modules below and re-exports their names as the same objects, so an existing
+`config.loader.X` or `config.sections.X` import keeps resolving, and a test that
+patches a name on the loader still reaches the code that reads it.
+
+| Owner | Owns |
+|---|---|
+| `config/fields.py` | `_meta` field metadata and the `_safe_*` value coercers every section shares. A leaf: it imports nothing from `kiro_crew`. |
+| `config/sections.py` | The DTOs other specs and tests anchor here: agent, crew record, workspace, session, dashboard (with `TailscaleConfig` and its parser), the messaging channels, speech-to-text and its degradation rules, telemetry, decisions, resource limits, and the bounds constants. It is also the facade for the three section owners below. |
+| `config/memory_sections.py` | `memory`, `knowledge`, `skills`, `session_summary` and the named `memory_stores` records. |
+| `config/integration_sections.py` | `mcp`, `mcp_gateway` (with the MCP stub roster readers the gateway seed shares), `instances`, `tunnel`, `publish`, `computer_use` and the external app `registries`. |
+| `config/service_sections.py` | `taskrunner`, `orchestrator`, `messaging`, `cron_history`, `monitoring`, `heartbeat` and `watchdog`. |
+| `config/section_builders.py` | The raw-section-to-DTO builder of every section except agent, session, telemetry and dashboard, grouped by the module that owns each section's DTO. |
+| `config/migration.py` | The write-back migration ids, the document transform `apply_document_migrations`, the one-shot `connections_ui` marker name, superseded-default reporting, and the in-memory half of an adoption. |
+| `config/resolution.py` | Raw overlay merging, top-level section classification, and degraded-input tracking. |
+| `config/validation.py`, `config/schema.py` | Schema validation with the validated-data cache, and the JSON schema and restart registry built from the DTOs. |
+| `config/paths.py`, `config/live.py`, `config/superseded_defaults.py` | Pure path primitives, the one live-config watcher and applier registry, and the superseded-default registry with its acknowledgment ledger. |
+| `config/loader.py` | `KiroCrewConfig` (load, serialize, save, model and provider resolution) and the residual core below. |
+
+Imports run one way: `fields`, then the three section owners, then `sections`,
+then `section_builders` and `migration`, then `loader`. Each module imports only
+modules earlier in that order, and none of the owners imports `loader`, `schema`
+or `validation`; `test_config_module_boundaries.py` pins the graph. Every module
+split out of the loader logs as `kiro_crew.config.loader`, so a relocated warning
+keeps the record name operators filter on.
+
+`loader.py` groups each residual responsibility into one bannered section. Each
+stays in that file because something outside this package names the file:
+
+| Kept in `loader.py` | Held there by |
+|---|---|
+| Credential keys, the `.env` reader, the dashboard port | [code-style](../common/code-style.md) names `config/loader.py` for `CRED_*` and `_DEFAULT_PORT`. |
+| Data-home and workspace path helpers | Tests and callers patch `config_path`, `config_dir`, `env_path`, `workspace_root` and `_default_workspace_base` on this module. The instance-pairing and redactor-registry scans key `read_local_secret` and `credential_redaction_path` to this file. |
+| Document I/O: `_raw_config`, `read_config_for_update`, `write_config_atomically`, `update_config_locked`, the meta stamp | The config-writer scans in `test_config_rmw_preserves_settings.py` exempt only `loader.py`, and the writers read this module's patched path and `atomic_write` names. |
+| Write-back persistence (`_persist_config_migration`, the backup) and the `_apply_document_migrations` seam | It rewrites `config.json` under the same writer exemption, and passes this module's `record_adoptions` to the transform as the adoption-ledger writer. |
+| The security clamp and its SEL event | [security](security.md), [sel](sel.md) and [resource-protection](../../architecture/resource-protection.md) name the loader. |
+| The agent, session, telemetry and dashboard builders | The harness-parity review scope and a source check on the `session_control` read; the patchable `DEFAULT_POOL_SIZE` fallback; [metrics](metrics.md) naming the loader as the telemetry parser; the feature map naming the loader's `folder_sort` read. |
+| Published snapshots: materialized agents, the alias table, the compaction threshold, the timezone | Tests rebind this module's snapshot state, and the second-boot witness in `test/integration/test_boot_smoke.py` keys the counters to `kiro_crew.config.loader`. |
+| Agent resolution and the provider factory | [crew-mode](crew-mode.md) and [context-management](../../architecture/context-management.md) name the loader for `resolve_agent_bindings` and `resolve_effective_model`. The agent-spec read inventory keys its call sites to this file, the ACP import is a baselined agent-SDK edge, and the blocking harness-parity and memory-store review rules cover `config/loader.py`. |
+
 New section constants, including local speech's automatic-language default, are
 read from `config.sections` directly; they do not expand that historical facade.
 
@@ -999,7 +1032,9 @@ eagerly via `_invalidate_config_cache()`. The defaults-only path (neither file
 present) is not cached.
 
 **Section construction.** Compound section constructors run in small private
-helpers in the loader namespace. This bounds each construction frame instead of
+helpers: `config/section_builders.py` holds every builder except the agent,
+session, telemetry and dashboard ones, which stay in `config/loader.py` (see the
+Overview), and the loader re-exports all of them. This bounds each construction frame instead of
 putting every field expression in one large traced resolver frame. The helpers
 preserve field evaluation order, coercion, defaults, and section-local assignment
 expressions. Each call creates fresh dataclasses and mutable defaults; no resolved
@@ -2095,7 +2130,7 @@ class TelegramConfig:
     allow_forum: bool = False          # serve supergroup forum Topics as per-Topic sessions (Slack-thread style). Fail-closed: also requires the supergroup's chat_id in allowed_forum_chat_ids, and only real Topics (message_thread_id present) are served — ordinary groups and the supergroup General chat are denied
     allowed_forum_chat_ids: list[int] = []  # numeric supergroup chat_ids permitted to run forum-topic sessions; empty = deny all groups (fail closed)
 
-# Additional top-level DTOs (not fully expanded here — see sections.py):
+# Additional top-level DTOs (not fully expanded here — see the owner modules in the Overview):
 # OrchestratorConfig, CronHistoryConfig, TunnelConfig, InstancesConfig, HeartbeatConfig,
 # WorkspaceConfig, MemoryStoreConfig, ExternalRegistryConfig,
 # KiroCrewAgentConfig, SlackConfig.

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from kiro_crew.config import loader, resolution, sections
+from kiro_crew.config import fields, loader, resolution, sections
 
 _PRE_SPLIT_REEXPORT_NAMES = {
     "kiro_crew.config.sections": tuple("""
@@ -257,6 +258,8 @@ def test_extracted_modules_do_not_import_the_loader() -> None:
         "import sys\n"
         "import kiro_crew.config.sections\n"
         "import kiro_crew.config.resolution\n"
+        "import kiro_crew.config.section_builders\n"
+        "import kiro_crew.config.migration\n"
         "forbidden = (\n"
         "    'kiro_crew.config.loader',\n"
         "    'kiro_crew.config.schema',\n"
@@ -276,3 +279,58 @@ def test_extracted_modules_do_not_import_the_loader() -> None:
         env=env,
     )
     assert result.stdout.strip() == ""
+
+
+# Each owner module and the config modules it may import at module scope. The
+# section owners sit under the ``config.sections`` facade and never import it;
+# the builders and migration rules sit under the loader and never import it.
+_OWNER_CONFIG_IMPORTS = {
+    "kiro_crew.config.fields": set(),
+    "kiro_crew.config.service_sections": {"kiro_crew.config.fields"},
+    "kiro_crew.config.memory_sections": {"kiro_crew.config.fields"},
+    "kiro_crew.config.integration_sections": {"kiro_crew.config.fields"},
+    "kiro_crew.config.section_builders": {
+        "kiro_crew.config",
+        "kiro_crew.config.fields",
+        "kiro_crew.config.integration_sections",
+        "kiro_crew.config.memory_sections",
+        "kiro_crew.config.sections",
+        "kiro_crew.config.service_sections",
+    },
+    "kiro_crew.config.migration": {
+        "kiro_crew.config.sections",
+        "kiro_crew.config.superseded_defaults",
+    },
+}
+
+
+def _module_scope_imports(module_name: str) -> set[str]:
+    """``kiro_crew.config*`` modules *module_name* imports outside ``TYPE_CHECKING``."""
+    module = importlib.import_module(module_name)
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    found: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            found.add(node.module)
+        elif isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+    return {name for name in found if name.startswith("kiro_crew.config")}
+
+
+def test_owner_modules_import_only_downward() -> None:
+    """The owner DAG is acyclic: fields <- section owners <- sections <- builders/migration."""
+    assert {name: _module_scope_imports(name) for name in _OWNER_CONFIG_IMPORTS} == (
+        _OWNER_CONFIG_IMPORTS
+    )
+
+
+def test_field_primitives_import_nothing_from_the_package() -> None:
+    """``config.fields`` is a leaf every section owner can import without a cycle."""
+    tree = ast.parse(Path(fields.__file__).read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+    assert sorted(name for name in imported if name.startswith("kiro_crew")) == []
