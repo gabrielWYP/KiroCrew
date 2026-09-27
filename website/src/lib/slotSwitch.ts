@@ -130,6 +130,15 @@ export function stageSlotSwitchTarget(field: SlotSwitchField, slot: string, targ
   staged.set(keyOf(field, slot), target)
 }
 
+/** A target STAGED and not yet on the wire, or null. Distinct from
+ *  `pendingSlotSwitchTarget`: a consumer about to write a DIFFERENT field of
+ *  the same slot (a model pick on a slot whose effort was just picked) must
+ *  carry a staged effort onto the wire itself, but must not re-send one that
+ *  is already in flight. */
+export function stagedSlotSwitchTarget(field: SlotSwitchField, slot: string): string | null {
+  return staged.get(keyOf(field, slot)) ?? null
+}
+
 /** Register a new in-flight switch and return its ticket for the settle calls. */
 function beginSlotSwitch(field: SlotSwitchField, slot: string, target: string): number {
   const key = keyOf(field, slot)

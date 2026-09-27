@@ -7588,11 +7588,11 @@
       "effort": "강도",
       "effort_help": "추론 강도는 모델이 답변하기 전에 생각하는 시간을 정합니다. 높을수록 어려운 문제를 더 오래 추론하므로 느리지만 답변 품질이 좋아지고, 낮을수록 빠릅니다. 세션별 재정의를 끄면 설정 → 채팅의 기본값으로 돌아가며, 기본값이 없으면 모델 자체의 선택을 사용합니다(Fable/Opus/Sonnet만 해당).",
       "faster": "빠르게",
-      "configured_default_marker": "설정된 기본값",
+      "configured_default_marker": "기본 추론 강도",
       "reasoning_effort": "추론 강도",
       "smarter": "똑똑하게",
-      "use_configured_default": "설정된 기본값 사용",
-      "use_model_default": "모델 기본값 사용"
+      "use_configured_default": "기본 추론 강도 사용 ({{level}})",
+      "use_default_effort": "기본 추론 강도 사용"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "조직 레지스트리를 추가하여 팀 전용 앱을 찾아보세요",

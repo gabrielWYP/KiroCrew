@@ -17,6 +17,7 @@ import {
   pendingSlotSwitchTarget,
   performSlotSwitch,
   stageSlotSwitchTarget,
+  stagedSlotSwitchTarget,
   SWITCH_CONFIRM_TIMEOUT_MS,
 } from './slotSwitch'
 import type { AgentSwitchValue } from './slotSwitch'
@@ -270,6 +271,20 @@ describe('performSlotSwitch — agent/effort field growth (#5120)', () => {
     expect(pendingSlotSwitchTarget('reasoning_effort', 'slot-eff-stage')).toBe('max')
     await p
     expect(pendingSlotSwitchTarget('reasoning_effort', 'slot-eff-stage')).toBeNull()
+  })
+
+  it('stagedSlotSwitchTarget sees only a stage, never an in-flight request', async () => {
+    // A model pick on the same slot carries a STAGED effort onto the wire
+    // itself (effortToCarry) but must not re-send one already in flight, so
+    // it needs the stage alone; pendingSlotSwitchTarget merges the two.
+    expect(stagedSlotSwitchTarget('reasoning_effort', 'slot-eff-staged-only')).toBeNull()
+    stageSlotSwitchTarget('reasoning_effort', 'slot-eff-staged-only', '')
+    expect(stagedSlotSwitchTarget('reasoning_effort', 'slot-eff-staged-only')).toBe('')
+    const p = performSlotSwitch('reasoning_effort', 'slot-eff-staged-only', 'high',
+      async () => 'high', () => {})
+    expect(stagedSlotSwitchTarget('reasoning_effort', 'slot-eff-staged-only')).toBeNull()
+    expect(pendingSlotSwitchTarget('reasoning_effort', 'slot-eff-staged-only')).toBe('high')
+    await p
   })
 
   it("newest failure adopts a held '' success — the falsy value the boxed recovery exists for", async () => {

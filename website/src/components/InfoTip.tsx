@@ -3,8 +3,14 @@ import { createPortal } from 'react-dom'
 
 import { i18nT } from '../i18n/t'
 
-/** Tiny ? button that shows a tooltip on click. Portal-rendered to escape overflow clipping. */
-export default function InfoTip({ text, placement = 'auto' }: { text: string; placement?: 'auto' | 'top' }) {
+/** Tiny ? button that shows a tooltip on click. Portal-rendered to escape overflow clipping.
+ *  `modelPickerStop` marks the button as a Tab stop for the model picker's
+ *  keyboard routing (`data-model-picker-stop`, see routeModelPickerKeys). */
+export default function InfoTip({ text, placement = 'auto', modelPickerStop = false }: {
+  text: string
+  placement?: 'auto' | 'top'
+  modelPickerStop?: boolean
+}) {
   const [open, setOpen] = useState(false)
   const btnRef = useRef<HTMLButtonElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
@@ -46,6 +52,7 @@ export default function InfoTip({ text, placement = 'auto' }: { text: string; pl
   return (
     <>
       <button
+        {...(modelPickerStop ? { 'data-model-picker-stop': '' } : {})}
         ref={btnRef}
         /* A <button> defaults to type="submit": inside a <form> (the New crewmate
            dialog wraps its fields in one) a bare toggle would submit the owner form

@@ -7705,11 +7705,11 @@
       "effort": "Aufwand",
       "effort_help": "Der Denkaufwand legt fest, wie lange das Modell vor der Antwort nachdenkt. Höher bedeutet mehr Zeit zum Durchdenken schwieriger Probleme (langsamer, bessere Antworten); niedriger ist schneller. Wird die Übersteuerung pro Sitzung deaktiviert, fällt der Denkaufwand auf den Standard unter Einstellungen → Chat zurück oder, wenn kein Standard gesetzt ist, auf die Wahl des Modells selbst (nur Fable/Opus/Sonnet).",
       "faster": "Schneller",
-      "configured_default_marker": "Konfigurierter Standard",
+      "configured_default_marker": "Standardaufwand",
       "reasoning_effort": "Denkaufwand",
       "smarter": "Intelligenter",
-      "use_configured_default": "Konfigurierten Standard verwenden",
-      "use_model_default": "Modellstandard verwenden"
+      "use_configured_default": "Standardaufwand verwenden ({{level}})",
+      "use_default_effort": "Standardaufwand verwenden"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Fügen Sie eine Organisations-Registry hinzu, um teamspezifische Apps zu entdecken",

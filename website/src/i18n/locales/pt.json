@@ -7822,11 +7822,11 @@
       "effort": "Esforço",
       "effort_help": "O esforço de raciocínio define por quanto tempo o modelo pensa antes de responder. Valores maiores significam mais tempo raciocinando sobre problemas difíceis (mais lento, respostas melhores); valores menores são mais rápidos. Ao desativar a substituição por sessão, o esforço volta ao padrão definido em Configurações → Chat, ou à escolha do próprio modelo quando nenhum padrão está definido (apenas Fable/Opus/Sonnet).",
       "faster": "Mais rápido",
-      "configured_default_marker": "Padrão configurado",
+      "configured_default_marker": "Esforço padrão",
       "reasoning_effort": "Esforço de raciocínio",
       "smarter": "Mais inteligente",
-      "use_configured_default": "Usar o padrão configurado",
-      "use_model_default": "Usar o padrão do modelo"
+      "use_configured_default": "Usar o esforço padrão ({{level}})",
+      "use_default_effort": "Usar o esforço padrão"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Adicione um registro da organização para descobrir apps específicos da equipe",

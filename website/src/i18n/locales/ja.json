@@ -7588,11 +7588,11 @@
       "effort": "エフォート",
       "effort_help": "推論エフォートは、モデルが回答前に考える時間を設定します。高いほど難しい問題を長く推論するため遅くなりますが、回答品質が向上します。低いほど高速です。セッションごとの上書きをオフにすると、設定 → チャットのデフォルトへフォールバックします。デフォルトがなければモデル自身の選択を使用します（Fable/Opus/Sonnet のみ）。",
       "faster": "高速",
-      "configured_default_marker": "設定済みのデフォルト",
+      "configured_default_marker": "デフォルトのエフォート",
       "reasoning_effort": "推論エフォート",
       "smarter": "スマート",
-      "use_configured_default": "設定されたデフォルトを使用",
-      "use_model_default": "モデルのデフォルトを使用"
+      "use_configured_default": "デフォルトのエフォートを使用（{{level}}）",
+      "use_default_effort": "デフォルトのエフォートを使用"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "チームに固有のアプリを検出するために組織レジストリを追加",

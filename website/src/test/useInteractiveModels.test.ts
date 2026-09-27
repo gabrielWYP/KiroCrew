@@ -6,7 +6,7 @@ import { api } from '../api/client'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-import { filterInteractiveModels, legacyCodexEffort, normalizeHiddenModels, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { effortToCarry, filterInteractiveModels, legacyCodexEffort, normalizeHiddenModels, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
 
 const MODELS = [
   { name: 'auto', description: '' },
@@ -114,6 +114,29 @@ describe('interactive model visibility', () => {
     expect(legacyCodexEffort('gpt-6-sol[max]', 'high', true)).toBe('')
     expect(legacyCodexEffort('gpt-6-sol[max]', '', false)).toBe('')
     expect(legacyCodexEffort('claude-opus-4.8[1m]', '', true)).toBe('')
+  })
+
+  it('carries a staged effort pick over the store and over a legacy pair level', () => {
+    // The store lags the slider: a pick inside its debounce is only staged,
+    // and one on the wire still reads as the old value. Neither may let a
+    // model pick migrate the stale pair level back over the user's choice.
+    expect(effortToCarry('gpt-6-sol[max]', '', 'high', 'high', true)).toBe('high')
+    expect(effortToCarry('gpt-6-sol[max]', '', '', '', true)).toBe('')
+    expect(effortToCarry('gpt-6-sol[max]', '', null, 'high', true)).toBeNull()
+    expect(effortToCarry('gpt-6-sol[max]', '', null, '', true)).toBeNull()
+    expect(effortToCarry('gpt-6-sol[max]', '', null, null, true)).toBe('max')
+    expect(effortToCarry('gpt-6-sol[max]', 'high', null, null, true)).toBeNull()
+    expect(effortToCarry('gpt-6-sol', '', null, null, true)).toBeNull()
+    expect(effortToCarry('gpt-6-sol[max]', '', 'low', null, false)).toBe('low')
+  })
+
+  it('writes a carried clear-override before the model and skips nothing else', async () => {
+    const calls: string[] = []
+    await switchGroupedModel('', async level => { calls.push(`effort:${JSON.stringify(level)}`) }, async () => { calls.push('model') })
+    expect(calls).toEqual(['effort:""', 'model'])
+    calls.length = 0
+    await switchGroupedModel(null, async level => { calls.push(`effort:${level}`) }, async () => { calls.push('model') })
+    expect(calls).toEqual(['model'])
   })
 
   it('commits a legacy effort before switching the grouped model', async () => {

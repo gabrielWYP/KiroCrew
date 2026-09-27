@@ -6,8 +6,8 @@ import type { ModelInfo } from '../providers/types'
 const EFFORT_SUFFIX = /^(.*)\[(low|medium|high|xhigh|max)\]$/
 
 /** Codex advertises each model/effort pair as a model ID. Keep the base model
- *  visible while effort is selected through its own control. Window suffixes
- *  such as [1m] remain part of the model ID. */
+ *  visible while effort is selected through the slider embedded in the model
+ *  picker. Window suffixes such as [1m] remain part of the model ID. */
 export function modelWithoutEffort(name: string): string {
   return EFFORT_SUFFIX.exec(name)?.[1] || name
 }
@@ -21,13 +21,36 @@ export function legacyCodexEffort(model: string, slotEffort: string, pairIds: bo
   return pairIds && !slotEffort ? modelEffortSuffix(model) : ''
 }
 
-/** A grouped model pick must not outrun migration of its old pair level. */
+/** The effort a model pick must write BEFORE the model, or null for none.
+ *  The store lags the user: an effort picked inside the slider's debounce is
+ *  only STAGED, and one already sent still reads as the old value until the
+ *  write settles. A pick on the model list in that window must not migrate
+ *  the old pair level over the user's newer choice. So: a staged pick is
+ *  carried onto the wire by the model pick itself ('' included -- it clears
+ *  the override); an in-flight one is already there and is left alone; only
+ *  with no declared intent does a legacy pair level migrate.
+ *  `staged` / `inFlight` come from `stagedSlotSwitchTarget` /
+ *  `pendingSlotSwitchTarget` for the slot's `reasoning_effort` field. */
+export function effortToCarry(
+  model: string,
+  storedEffort: string,
+  staged: string | null,
+  inFlight: string | null,
+  pairIds: boolean,
+): string | null {
+  if (staged !== null) return staged
+  if (inFlight !== null) return null
+  return legacyCodexEffort(model, storedEffort, pairIds) || null
+}
+
+/** A grouped model pick must not outrun the effort it carries (a staged pick
+ *  or an old pair level's migration): a failed effort write aborts the pick. */
 export async function switchGroupedModel(
-  legacyEffort: string,
+  effort: string | null,
   persistEffort: (level: string) => Promise<void>,
   persistModel: () => Promise<void>,
 ): Promise<void> {
-  if (legacyEffort) await persistEffort(legacyEffort)
+  if (effort !== null) await persistEffort(effort)
   await persistModel()
 }
 
@@ -53,12 +76,12 @@ export function filterInteractiveModels(
   models: ModelInfo[],
   hiddenModels: readonly string[],
   activeModels: readonly string[] = [],
-  separateEffort = false,
+  groupEffortPairs = false,
 ): ModelInfo[] {
   const hidden = new Set(hiddenModels)
   const kept = new Set(activeModels.filter(Boolean))
   const visible = models.filter(model => model.name === 'auto' || kept.has(model.name) || !hidden.has(model.name))
-  if (!separateEffort) return visible
+  if (!groupEffortPairs) return visible
 
   const seen = new Set<string>()
   const baseModels = new Map(visible.filter(model => modelWithoutEffort(model.name) === model.name).map(model => [model.name, model]))

@@ -7588,11 +7588,11 @@
       "effort": "强度",
       "effort_help": "推理强度决定模型在回答前思考多久。强度越高，用于思考难题的时间越长（更慢，但答案更好）；越低则越快。关闭会话级覆盖后，会回退到“设置 → 聊天”中的默认值，或在未设置默认值时交由模型自行决定（仅 Fable/Opus/Sonnet）。",
       "faster": "更快",
-      "configured_default_marker": "已配置默认值",
+      "configured_default_marker": "默认推理强度",
       "reasoning_effort": "推理强度",
       "smarter": "更聪明",
-      "use_configured_default": "使用已配置的默认值",
-      "use_model_default": "使用模型默认值"
+      "use_configured_default": "使用默认推理强度（{{level}}）",
+      "use_default_effort": "使用默认推理强度"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "添加组织注册表以发现团队专属应用",

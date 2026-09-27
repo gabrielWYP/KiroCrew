@@ -56,7 +56,7 @@ import { isPopoutOpen as isTerminalPopoutOpen } from '../utils/terminalPopout'
 import { disposeTerminalSession, useDeleteTerminalSession } from '../components/CliPanel'
 import { interceptSlashCommand, isInterceptedSlashCommand } from './chat/ChatInput'
 import { triggerRefresh, updateSlot, slotIsRemoteBound } from '../store/dashboardSlice'
-import { performSlotSwitch } from '../lib/slotSwitch'
+import { pendingSlotSwitchTarget, performSlotSwitch, stagedSlotSwitchTarget } from '../lib/slotSwitch'
 import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
 import { drainPendingChunks } from '../lib/pendingChunkDrain'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
@@ -254,7 +254,7 @@ import { MemoryModeChip, type MemoryMode } from '../components/MemoryModeChip'
 import { openPanelView, claimAppAutoOpen } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
-import { filterInteractiveModels, legacyCodexEffort, modelWithoutEffort, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { effortToCarry, filterInteractiveModels, legacyCodexEffort, modelWithoutEffort, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
 import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAgents } from '../hooks/useAgents'
@@ -294,7 +294,6 @@ import type { FollowupItem } from '../store/chatSlice'
 // Stable identity for the "no follow-up cards" case: returning a fresh {} from
 // the selector would make it a new reference on every store update.
 const EMPTY_FOLLOWUPS: Record<string, { items: FollowupItem[]; ts: number }> = {}
-import ReasoningEffortDropdown from '../components/ReasoningEffortDropdown'
 import FlyingQuote from '../components/FlyingQuote'
 import SearchHighlightContext, { MessageSearchScope } from '../hooks/SearchHighlightContext'
 import SearchBar from '../components/SearchBar'
@@ -1192,9 +1191,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       })
     },
   })
-  const [reasoningEffortDropdown, setReasoningEffortDropdown] = useState(false)
-  const [reasoningEffortBtnRect, setReasoningEffortBtnRect] = useState<DOMRect | null>(null)
-  const reasoningEffortDropdownRef = useRef<HTMLDivElement>(null)
   const [automationOpen, setAutomationOpen] = useState(false)
   const liveAutomation = useAppSelector(state => activeSlot
     ? selectAutomationForSlot(state, activeSlot)
@@ -1243,21 +1239,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     || (automationSnapshot.isSuccess && !automationSnapshot.isFetching)
   const automationSnapshotFailed = automationSnapshot.isError
   const approvalMode = useAppSelector(s => s.dashboard.approvalMode)
-
-  // ── Reasoning effort dropdown click-outside ──
-  useEffect(() => {
-    if (!reasoningEffortDropdown) return
-    const handler = (e: MouseEvent) => {
-      if (reasoningEffortDropdownRef.current?.contains(e.target as Node)) return
-      if (reasoningEffortBtnRect) {
-        const r = reasoningEffortBtnRect
-        if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) return
-      }
-      setReasoningEffortDropdown(false)
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [reasoningEffortDropdown, reasoningEffortBtnRect])
 
   // Close the slot-scoped automation surface on navigation. Its record comes
   // from the same Redux collection the sidebar reads; the WebSocket hook owns
@@ -3200,12 +3181,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     try {
       const slotState = store.getState().dashboard.slots.find(s => s.key === activeSlot)
-      const legacyEffort = legacyCodexEffort(
-        slotState?.model || '', slotState?.reasoning_effort || '', codexPairModels,
+      const carriedEffort = effortToCarry(
+        slotState?.model || '', slotState?.reasoning_effort || '',
+        stagedSlotSwitchTarget('reasoning_effort', activeSlot),
+        pendingSlotSwitchTarget('reasoning_effort', activeSlot),
+        codexPairModels,
       )
-      await switchGroupedModel(legacyEffort, async level => {
-        // Existing Codex slots may still pin model[max]. Move that level into
-        // the separate effort field before a grouped row sends the bare model.
+      await switchGroupedModel(carriedEffort, async level => {
+        // Either the effort the user just picked in the embedded slider (still
+        // inside its debounce, so not yet on the wire) or, on a Codex slot
+        // that still pins model[max], that old pair level moving into the
+        // separate effort field before a grouped row sends the bare model.
         // A failed effort write aborts the model pick instead of silently
         // resetting an owner's previous selection.
         let normalizedModel: string | undefined
@@ -8184,8 +8170,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               approvalMode={displayMode}
               providerId={provider.id}
               reasoningEffort={effectiveEffort}
-              separateEffort={effortSupported}
-              onReasoningEffortClick={effortSupported ? (rect) => { setReasoningEffortBtnRect(rect); setReasoningEffortDropdown(!reasoningEffortDropdown) } : undefined}
+              effortIsDefault={!currentSlot?.reasoning_effort && !legacyCodexEffort(currentSlot?.model || '', '', codexPairModels) && !!defaultEffort}
+              // Effort is edited INSIDE the model picker (one control, see
+              // docs/decisions/2026-06-14-chat-composer-model-and-effort-are-one-control.md);
+              // the chip only names the level in force.
+              hasEffort={effortSupported}
               onAutomationClick={setAutomationOpen}
               automation={automation}
               automationOpen={automationOpen}
@@ -8293,8 +8282,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 onRetryModels={() => remoteCrew.refetch()}
                 filter={modelFilter}
                 setFilter={setModelFilter}
+                onClose={() => setModelDropdown(false)}
                 modelVisibilityError={hiddenModelsQ.isError}
                 onRetryModelVisibility={() => hiddenModelsQ.refetch()}
+                // The embedded effort slider is fed by the slot's ACP
+                // capability read (#13637): the agent's own answer wins over
+                // the static model-name heuristic, and its level list replaces
+                // this machine's when it reports one.
+                hasEffort={!!(activeSlot && effortSupported)}
+                slot={activeSlot}
+                currentEffort={currentSlot?.reasoning_effort || legacyCodexEffort(currentSlot?.model || '', '', codexPairModels)}
+                defaultEffort={defaultEffort}
+                effortLevelsOverride={effortLevelsOverride}
                 onManageModels={modelPickerConfigured ? undefined : () => {
                   setModelDropdown(false)
                   navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: 'key:dashboard.model_picker_hidden_models' }))
@@ -8368,13 +8367,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 />
               )
             })()}
-            {/* Reasoning effort dropdown portal */}
-            {reasoningEffortDropdown && reasoningEffortBtnRect && activeSlot && effortSupported && createPortal(
-              <div ref={reasoningEffortDropdownRef} className="fixed z-[9999] animate-slide-up" style={(() => { const left = Math.max(8, Math.min(reasoningEffortBtnRect.left, window.innerWidth - 220)); return { bottom: window.innerHeight - reasoningEffortBtnRect.top + 4, left: isMobile ? 8 : left, ...(isMobile ? { right: 8, maxWidth: 'calc(100vw - 16px)' } : {}) } })()}>
-                <ReasoningEffortDropdown slot={activeSlot} currentEffort={currentSlot?.reasoning_effort || legacyCodexEffort(currentSlot?.model || '', '', codexPairModels)} defaultEffort={defaultEffort} levelsOverride={effortLevelsOverride} onClose={() => setReasoningEffortDropdown(false)} />
-              </div>,
-              document.body
-            )}
             </div>
           </div>
           </SearchHighlightContext.Provider>

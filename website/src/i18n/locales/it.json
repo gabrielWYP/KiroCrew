@@ -7822,11 +7822,11 @@
       "effort": "Impegno",
       "effort_help": "Il livello di ragionamento determina quanto tempo il modello riflette prima di rispondere. Un valore più alto significa più tempo per ragionare sui problemi difficili (risposte più lente ma migliori); uno più basso è più veloce. Se disattivi la sostituzione per sessione, si torna al valore predefinito in Impostazioni → Chat, oppure alla scelta del modello stesso quando non è impostato alcun valore predefinito (solo Fable/Opus/Sonnet).",
       "faster": "Più veloce",
-      "configured_default_marker": "Predefinito configurato",
+      "configured_default_marker": "Livello predefinito",
       "reasoning_effort": "Livello di ragionamento",
       "smarter": "Più intelligente",
-      "use_configured_default": "Usa il valore predefinito configurato",
-      "use_model_default": "Usa il valore predefinito del modello"
+      "use_configured_default": "Usa il livello predefinito ({{level}})",
+      "use_default_effort": "Usa il livello predefinito"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Aggiungi un registry dell'organizzazione per scoprire app specifiche del team",

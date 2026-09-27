@@ -7822,11 +7822,11 @@
       "effort": "Effort",
       "effort_help": "L’effort de raisonnement définit la durée de réflexion du modèle avant de répondre. Plus il est élevé, plus le modèle prend le temps de résoudre les problèmes difficiles (réponses plus lentes mais meilleures) ; plus il est faible, plus la réponse est rapide. Désactiver le remplacement par session revient à la valeur par défaut définie dans Paramètres → Chat, ou au choix du modèle lui-même si aucune valeur par défaut n’est définie (Fable/Opus/Sonnet uniquement).",
       "faster": "Plus rapide",
-      "configured_default_marker": "Valeur par défaut configurée",
+      "configured_default_marker": "Effort par défaut",
       "reasoning_effort": "Effort de raisonnement",
       "smarter": "Plus intelligent",
-      "use_configured_default": "Utiliser la valeur par défaut configurée",
-      "use_model_default": "Utiliser la valeur par défaut du modèle"
+      "use_configured_default": "Utiliser l’effort par défaut ({{level}})",
+      "use_default_effort": "Utiliser l’effort par défaut"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Ajoutez un registre d'organisation pour découvrir les applications propres à votre équipe",
