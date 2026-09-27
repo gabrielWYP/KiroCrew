@@ -13,7 +13,7 @@ import shutil
 import tarfile
 
 import pytest
-from test_snapshot import _setup_fake_kirocrew, unpinnable_argv
+from test_snapshot import _setup_fake_kirocrew, snapshot_family_paths, unpinnable_argv
 
 from kiro_crew import snapshot as snap
 
@@ -282,13 +282,16 @@ class TestTextIOPinsUtf8:
         import ast
         import pathlib
 
-        import kiro_crew.snapshot as sn
         import kiro_crew.snapshot_redact as sr
         from kiro_crew.apps.builtins.aws_control.backend import backup as app_backup
 
         offenders = []
-        for mod in (sn, sr, app_backup):
-            path = pathlib.Path(mod.__file__)
+        paths = [
+            *snapshot_family_paths(),
+            pathlib.Path(sr.__file__),
+            pathlib.Path(app_backup.__file__),
+        ]
+        for path in paths:
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):

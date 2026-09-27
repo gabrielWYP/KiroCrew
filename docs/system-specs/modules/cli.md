@@ -324,6 +324,22 @@ returned summary, with a logged warning. Snapshot and restore keep refusing, bec
 copy opens `O_NOFOLLOW` and the walk rejects links and reparse points — so what the import
 path gives up is ancestor-swap resistance, not link resistance.
 
+Each rule above has one owner. `kiro_crew.snapshot` is the command and API facade: it
+holds `snapshot_main` and `restore_main`, the `MANIFEST.json` writer (`_build_snapshot`),
+the outbound redaction seam, the merge-mode driver and the notification copy. It re-exports
+the owners' names, so every existing import keeps resolving. A test that replaces a helper
+replaces it on the module that calls it.
+
+- `kiro_crew.snapshot_components` owns the component table, the never-ship and host-local
+  rules, and the tree-root check `safe_tree_root`.
+- `kiro_crew.snapshot_archive` owns staging and the bundle format. That covers the pinned
+  tree copy with its refusal (`_staging_is_pinned`), the consistent SQLite capture, the
+  extraction filter, the archive bound and the manifest readers.
+- `kiro_crew.snapshot_restore` owns the checks that refuse an unsound bundle or an unsafe
+  destination before live state moves, plus the replace transaction and its rollback.
+- `kiro_crew.snapshot_merge` owns the merge algorithms: memory rows, cron jobs,
+  notification records and no-overwrite trees.
+
 | `kirocrew config get [key]` | Print full config or a dot-path value |
 | `kirocrew config set <key> <val>` | Set a config value (auto type detection). A key whose schema declares an enum refuses a value outside it on every write (exit 1, naming the selectable values), because the load path answers such a value by degrading it with a warning rather than rejecting it — the write is the last point where the mistake is still attributable to the command. What is written is the enum's own spelling: a case variant is canonicalised (`agent.log_level debug` stores `DEBUG`), and a key with a loader-side alias table (`stt.model`, through `stt.models.canonical_name`) stores the row the alias names (`turbo` stores `large-v3-turbo`). Only declared enums on concrete registry paths are checked; a wildcard path (`slack_channels.*.activation`) keeps reaching the loader's own degrade rule. Type is checked only on a declared leaf's first write (`_declared_type_error`); the enum check has no stored value to stand in for it. |
 | `kirocrew config set --file <path>` | Replace config from a JSON file |

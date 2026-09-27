@@ -16,6 +16,7 @@ from test_snapshot import _setup_fake_kirocrew, unpinnable_argv
 
 from conftest import make_dir_link
 from kiro_crew import snapshot as snap_mod
+from kiro_crew import snapshot_restore
 from kiro_crew.snapshot import restore_main, snapshot_main
 
 
@@ -251,7 +252,9 @@ class TestADestinationRootSwappedAfterPreflightRefuses:
             make_dir_link(home / "workspace", outside / "victim")
             fired.append(True)
 
-        monkeypatch.setattr(snap_mod, "_refuse_unsafe_destination_roots", _preflight_then_swap)
+        monkeypatch.setattr(
+            snapshot_restore, "_refuse_unsafe_destination_roots", _preflight_then_swap
+        )
         capsys.readouterr()
 
         rc = restore_main([str(bundle), "--mode", "replace", "--force"] + unpinnable_argv())
@@ -515,7 +518,7 @@ class TestAnInterruptDuringReplaceStillRollsBack:
             fired["n"] += 1
             raise KeyboardInterrupt("operator pressed Ctrl-C")
 
-        monkeypatch.setattr(snap_mod, "_do_replace_mutations", interrupting)
+        monkeypatch.setattr(snapshot_restore, "_do_replace_mutations", interrupting)
 
         with pytest.raises(KeyboardInterrupt):
             snap_mod._do_replace(snap, mc, None, allow_unpinned=bool(unpinnable_argv()))

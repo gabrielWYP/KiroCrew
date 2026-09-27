@@ -13,9 +13,10 @@ import tarfile
 from pathlib import Path
 
 import pytest
-from test_snapshot import unpinnable_argv
+from test_snapshot import snapshot_family_source, unpinnable_argv
 
 from kiro_crew import snapshot as snap
+from kiro_crew import snapshot_restore
 
 
 def _real_db(path: Path) -> bytes:
@@ -58,7 +59,7 @@ class TestAMidMutationIoFailureIsReportedNotRaised:
         def boom(*_a, **_k):
             raise OSError(28, "No space left on device")
 
-        monkeypatch.setattr(snap, "_do_replace_mutations", boom)
+        monkeypatch.setattr(snapshot_restore, "_do_replace_mutations", boom)
 
         rc = snap.restore_main(
             [str(bundle), "--mode", "replace", "--force", "--components", "memory"]
@@ -226,7 +227,7 @@ class TestTheIntegrityCheckLeavesNoOpenHandle:
         """`with sqlite3.connect(...)` anywhere in this module leaks a handle."""
         import re
 
-        source = Path(snap.__file__).read_text(encoding="utf-8")
+        source = snapshot_family_source()
         code = [ln for ln in source.splitlines() if not ln.lstrip().startswith("#")]
         bare = [ln.strip() for ln in code if re.search(r"with\s+sqlite3\.connect\(", ln)]
         assert bare == [], f"bare connection context managers leak handles: {bare}"

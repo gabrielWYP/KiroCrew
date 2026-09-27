@@ -36,6 +36,7 @@ from test_snapshot import _setup_fake_kirocrew
 
 from kiro_crew import pinned_fs
 from kiro_crew import snapshot as snap
+from kiro_crew import snapshot_archive
 
 pinned_only = pytest.mark.skipif(
     not pinned_fs.supports_pinned_tree_walk(),
@@ -357,7 +358,7 @@ class TestACorruptCoreDatabaseFailsInsteadOfPruningAGoodBackup:
                         (home / "memory.db").unlink()
                 return real_connect(*args, **kwargs)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(snap, "sqlite3", _VanishOnSecondConnect())
+        monkeypatch.setattr(snapshot_archive, "sqlite3", _VanishOnSecondConnect())
         with pytest.raises(snap.DatabaseCopyFailed) as excinfo:
             snap._build_snapshot(
                 home, tmp_path / "out", "vanished", selected=["memory"], **UNPINNED_OK
@@ -551,7 +552,7 @@ class TestACorruptCoreDatabaseFailsInsteadOfPruningAGoodBackup:
                 conn = sqlite3.connect(*args, **kwargs)  # type: ignore[arg-type]
                 return _FailingBackup(conn)
 
-        monkeypatch.setattr(snap, "sqlite3", _Shim())
+        monkeypatch.setattr(snapshot_archive, "sqlite3", _Shim())
         with pytest.raises(snap.DatabaseCopyFailed) as excinfo:
             snap._build_snapshot(home, tmp_path / "out", "loud", selected=["memory"], **UNPINNED_OK)
         assert "memory.db" in str(excinfo.value)
@@ -671,7 +672,9 @@ class TestASourceThatCannotBeVerifiedIsRefusedAndRecorded:
                 return False
             return real_chain_is_link_free(root, rel_parts)
 
-        monkeypatch.setattr(snap, "_chain_is_link_free", only_the_tree_db_is_unverifiable)
+        monkeypatch.setattr(
+            snapshot_archive, "_chain_is_link_free", only_the_tree_db_is_unverifiable
+        )
         archive = snap._build_snapshot(
             home, tmp_path / "out", "unverified-tree", selected=["memory"], **UNPINNED_OK
         )
