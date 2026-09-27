@@ -64,6 +64,24 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Detect/remove a dir link | `is_link_or_junction(path)` / `unlink_link_or_junction(path)` | `path.is_symlink()` (misses a Windows junction) |
 | Compare a resolved path against an unresolved one | `strip_extended_length_prefix(path)` on BOTH sides before comparing | comparing the two spellings as `Path.resolve` returns them (on Windows `ntpath.realpath` keeps the extended-length prefix when its prefix-strip re-check races a concurrent swap of the same file, so a prefixed child against an unprefixed parent reads as a path escape; the fold is LEXICAL and must not re-resolve, which would bless the redirect the caller is testing for) |
 | Hold a directory in place while a child writes into it by path | `pin_directory(path)` (then `os.close`) | `os.open(dir, O_RDONLY)` (EACCES on Windows, and even where it opens it follows a link planted at the name) |
+| Act on the ENTRIES of a directory you inspected (screen-then-remove, screen-then-descend) | `pinned_directory(path)` yielding `PinnedDirectory` (`names` / `is_link` / `is_dir` / `unlink` / `rmdir` / `child` / `read_text`); a parent stays pinned while its child is in use, so a chain of them pins the whole path, and `child` refuses past `PINNED_TREE_MAX_DEPTH` (64) levels with `ENAMETOOLONG` so a planted chain cannot spend another frame or descriptor | screening a NAME and then operating on that name -- every stdlib walker re-resolves it in between, and `os.walk`'s own descent re-check is `os.path.islink`, which is False for a junction, while `rglob` descends one unconditionally. The two platforms need OPPOSITE routes, which is why this is a helper rather than an `IS_POSIX` branch per call site: `dir_fd`-relative calls on POSIX, where the pin does NOT block a rename, and by-path calls on Windows, where there are no `dir_fd` operations at all and the pin is what holds the path still |
+| READ a file you judged in the same traversal (screen-then-read) | `PinnedDirectory.read_text(name)` -- the open itself refuses a link at the name, the descriptor's own `fstat` rejects a non-regular entry and a hardlink, and the open is non-blocking so a FIFO cannot stall the read. The layers under it are private on purpose: reaching for a raw descriptor would be operating outside the pin | screening a name and then reading that name -- the entry is re-resolved in between, and the screen only refuses a link that was PRESENT at check time, so a flip-flop serves a file of the adversary's choosing |
+
+**Its relationship to `pinned_fs`.** That module owns this discipline and says so —
+mechanism in one place, callers as thin consumers — and `PinnedDirectory` is the
+cross-platform arm of it, not a second opinion. What decides the split is the import
+direction: `pinned_fs` imports THIS module for its Windows no-reparse open, so nothing
+here can import it back. The Windows arm has to live at this layer anyway, because it IS
+platform mechanism (`CreateFileW`, a share mode omitting `FILE_SHARE_DELETE`,
+`st_file_attributes`) rather than the `dir_fd` discipline `pinned_fs` is built from —
+and `supports_pinned_walk()` means "`dir_fd` opens are available" to every one of its
+existing consumers, which read it to DEGRADE on Windows, so a Windows-capable pin cannot
+hide behind that boolean without changing what it promises them. The one thing genuinely
+spelled twice is the POSIX open-flag triple (`pinned_dir_flags()` here,
+`dir_flags()` there); `test_pinned_directory.py::TestItDoesNotDivergeFromPinnedFs`
+asserts the two are equal and records the one place the modules deliberately differ (a
+hardlinked file is refused on this read, where `pinned_fs.read_file_pinned` allows it),
+so neither can drift without a red test.
 | Process RSS (live) / peak RSS / CPU | `proc_rss_bytes()` / `proc_peak_rss_bytes()` / `proc_cpu_seconds()` | `resource.getrusage` (`ru_maxrss` is a high-water mark, never a live reading, and its unit is KiB on Linux but bytes on macOS). The peak on Linux is NOT `ru_maxrss`: `execve` seeds it with the pre-exec image's peak, so a gateway started from a large parent would report that parent's number for life; Linux reads its own `/proc/self/status` `VmHWM` instead, monotonic across reads (the kernel folds live RSS into `hiwater_rss` lazily, so raw consecutive readings can dip a few hundred KiB), and an unreadable `/proc` is the documented 0, never the inherited figure. `pdf_extract_child` carries the same `VmHWM` parser rather than importing this module (its imports stay minimal under a capped address space) |
 | Available host memory | `host_available_mib()` (0 = unknown, never 0 = no memory) | `/proc/meminfo` directly (Linux-only, so the bound built on it silently vanishes on macOS and Windows) |
 | FD soft limit | `raise_nofile_soft_limit(n)` | `resource.setrlimit` |
