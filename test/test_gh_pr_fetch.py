@@ -779,6 +779,53 @@ class TestTheCheckBoardIsReadWhole:
         assert observation.bucket("failing") == ()
         assert observation.as_facts()["checks"]["superseded"] == ["Lane"]
 
+    def test_the_three_bucket_consumers_share_one_vocabulary(self) -> None:
+        """``BUCKETS`` is load-bearing for every place that spells a bucket name.
+
+        Three places carry the vocabulary independently: ``_bucket()`` produces it,
+        ``_UNDATED_RANK`` ranks it, and ``_bounded_buckets()`` retains it. A sixth
+        name added to the producer alone would take ``0`` from the rank's ``.get``
+        default -- the LOWEST rank, so it loses every undated tie-break to a passing
+        row -- and would be dropped from the retained board entirely, and nothing
+        would go red. Pinning all three to the tuple is what makes such a drift red.
+        """
+        # Every conclusion this build knows, one it does not, and the status-only
+        # path: together they walk every return of the producer.
+        conclusions = sorted(gh_pr._FAILING | gh_pr._PASSING | gh_pr._NOISE | gh_pr._PENDING)
+        rows = [{"name": "Lane", "conclusion": c} for c in conclusions]
+        rows.append({"name": "Lane", "conclusion": "SOMETHING_NEW"})
+        rows.append({"name": "Lane", "status": "IN_PROGRESS", "conclusion": None})
+        emitted = {gh_pr._bucket(row)[1] for row in rows}
+        assert emitted <= set(gh_pr.BUCKETS), emitted - set(gh_pr.BUCKETS)
+        assert emitted == set(gh_pr.BUCKETS), "a BUCKETS member the producer never emits"
+
+        # The tie-break knows every name, and no name the producer cannot emit.
+        assert set(gh_pr._UNDATED_RANK) == set(gh_pr.BUCKETS)
+
+        # Every emitted bucket lands in exactly one retained list: four named
+        # states plus the displaced field.
+        observation = _bare_observation(
+            checks=tuple(
+                gh_pr.CheckRow(f"CI / {bucket}", bucket, bucket, "") for bucket in emitted
+            ),
+            checks_complete=True,
+        )
+        retained = observation.as_facts()["checks"]
+        assert set(retained) == {
+            "failed",
+            "pending",
+            "passed",
+            "unknown",
+            models.PULL_REQUEST_SUPERSEDED_CHECK_FIELD,
+        }
+        landed = [name for names in retained.values() for name in names]
+        assert sorted(landed) == sorted(f"CI / {bucket}" for bucket in emitted)
+        assert retained["failed"] == ["CI / failing"]
+        assert retained["pending"] == ["CI / pending"]
+        assert retained["passed"] == ["CI / passing"]
+        assert retained["unknown"] == ["CI / unknown"]
+        assert retained[models.PULL_REQUEST_SUPERSEDED_CHECK_FIELD] == ["CI / noise"]
+
 
 class TestWhatPeopleSaidIsCarried:
     """Comment and review bodies: the evidence no typed reading produces."""
@@ -903,10 +950,10 @@ class TestWhatPeopleSaidIsCarried:
         A terminal escape sequence in it is stripped where the prose enters the
         process rather than at each of those three readers.
         """
-        assert "\x1b" not in gh_pr.sanitize_body("before\x1b[31mafter\x00end")
-        assert gh_pr.sanitize_body("a\n\n\n\n\nb") == "a\n\nb"
-        assert gh_pr.sanitize_body(None) == ""
-        assert gh_pr.sanitize_body(12) == ""
+        assert "\x1b" not in gh_pr._sanitize_body("before\x1b[31mafter\x00end")
+        assert gh_pr._sanitize_body("a\n\n\n\n\nb") == "a\n\nb"
+        assert gh_pr._sanitize_body(None) == ""
+        assert gh_pr._sanitize_body(12) == ""
 
     def test_the_retained_buckets_are_bounded_like_the_canonical_record(self) -> None:
         """These identities are third-party and they are KEPT, so they need a bound.

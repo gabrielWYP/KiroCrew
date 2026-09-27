@@ -173,7 +173,10 @@ _NOISE = {"CANCELLED", "STALE"}
 #: state.
 _PENDING = {"PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", ""}
 
-#: Bucket names, in the order a reader wants them.
+#: Bucket names, in the order a reader wants them. This is the one vocabulary
+#: shared by the producer (:func:`_bucket`), the undated tie-break
+#: (:data:`_UNDATED_RANK`) and the retained board
+#: (:meth:`PrObservation._bounded_buckets`); a test pins all three to it.
 BUCKETS = ("failing", "pending", "passing", "noise", "unknown")
 
 #: Response-header names this module reads, lowercased.
@@ -251,14 +254,15 @@ def _sanitized_body_with_clip(value: object, limit: int = _MAX_BODY_CHARS) -> tu
     return text[:limit], len(text) > limit, _body_digest(text)
 
 
-def sanitize_body(value: object, limit: int = _MAX_BODY_CHARS) -> str:
+def _sanitize_body(value: object, limit: int = _MAX_BODY_CHARS) -> str:
     """*value* as bounded plain text, or ``""``.
 
     Control characters go, runs of blank lines collapse, and the result is clipped
     to *limit*. The judge's own per-item scrub is what decides whether a body may
-    be sent; this only makes it safe to hold, log and render. A caller that also
-    needs to know whether the clip fired reads :func:`_sanitized_body_with_clip`,
-    which this delegates to so the normalisation has one implementation.
+    be sent; this only makes it safe to hold, log and render. Private because the
+    module's own remark sites read :func:`_sanitized_body_with_clip`, which also
+    says whether the clip fired; this delegates to it so the normalisation has one
+    implementation, and exists so the normalisation can be asserted on its own.
     """
     return _sanitized_body_with_clip(value, limit)[0]
 
