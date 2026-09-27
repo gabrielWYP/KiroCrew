@@ -14,9 +14,13 @@ answers the engine's token request from it under a uid the worker shares, so no
 refusal here can be traded away for a clean environment.
 
 One thing DOES lift the refusal, and it is a trust boundary rather than a credential
-claim: ``settings.internal_only``, the deployment stating that this task serves the
-operator's own crews and takes no external prompts. The exposure is then accepted --
-there is no injected prompt content for an unsandboxed auto-approving worker to act on.
+claim: ``settings.internal_only``, the deployment stating that this task runs the
+operator's OWN crews and that the operator bears the risk of what those crews read. The
+exposure is then accepted, and it is bigger than the setting's name suggests -- untrusted
+CONTENT the crew reads in the ordinary course of its work (tool output, a fetched page, a
+connector payload) can inject the unsandboxed worker whoever sent the prompt, and that
+worker can read the vault. What the claim buys is that the credential at risk is the
+operator's own, not that injection cannot happen.
 The tests at the end of this file are mostly about the limits of that: it lifts a
 DENIED verdict and nothing else, and it never lifts the credential assertion.
 """
@@ -219,10 +223,11 @@ def test_bool_refuses_a_value_it_cannot_read(monkeypatch: pytest.MonkeyPatch, ra
 
 # ── The internal-only boundary ──
 #
-# The Fargate lane serves the operator's own crews and takes no external prompts. Under
-# that claim an unsandboxed model subprocess is ACCEPTED rather than fixed, which is what
-# lets the container start on a host with no user namespace -- every Fargate host, measured
-# on a real task. These pin what the claim does and, more importantly, what it does not.
+# The Fargate lane runs the operator's own crews, and the operator bears the risk of what
+# those crews read. Under that claim an unsandboxed model subprocess is ACCEPTED rather
+# than fixed, which is what lets the container start on a host with no user namespace --
+# every Fargate host, measured on a real task. These pin what the claim does and, more
+# importantly, what it does not.
 
 
 def test_a_denied_host_starts_when_the_deployment_claims_internal_only(tmp_path: Path) -> None:

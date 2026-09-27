@@ -15,10 +15,12 @@ touch the image, the task definition and every test that constructs an
 environment, so the names stay and this paragraph is the correction.
 
 `SMC_INTERNAL_ONLY` is the second declaration of that kind and the only one that
-LOOSENS anything: it is the deployment vouching that this task serves the
-operator's own crews and no external prompts, which is what makes an unsandboxed
-model subprocess acceptable on a host that cannot sandbox one. Both default to
-"not claimed", because a claim is what unlocks a posture and silence must never.
+LOOSENS anything: it is the deployment vouching that this task runs the operator's
+OWN crews and that the operator bears the risk of what those crews read, which is
+what makes an unsandboxed model subprocess acceptable on a host that cannot sandbox
+one. It does NOT claim that no untrusted input arrives -- see the field below for the
+exposure it accepts. Both default to "not claimed", because a claim is what unlocks a
+posture and silence must never.
 
 Two values are deliberately NOT configurable.
 
@@ -113,8 +115,9 @@ class Settings:
     # stack. It closes the case that rule cannot see: an image run by any other path.
     single_principal: bool = False
 
-    # Whether the DEPLOYMENT vouches that this task serves the operator's OWN crews and
-    # nobody else's prompts -- the internal-only trust boundary.
+    # Whether the DEPLOYMENT vouches that this task runs the operator's OWN crews and
+    # that the operator bears the risk of what those crews read -- the internal-only
+    # trust boundary.
     #
     # It exists because the container is sandboxed-only and Fargate cannot be sandboxed.
     # kiro-cli sandboxes the model subprocess in an unprivileged user namespace; Fargate's
@@ -128,10 +131,17 @@ class Settings:
     # the crew's vault to answer the engine's token request -- so the worker can reach
     # the model credential, and taking the credential out of its environment does not
     # change that. Measured: a uid-1000 process reads and decrypts that vault directly.
-    # The exposure is therefore prompt content reaching a credential, and it is ACCEPTED
-    # here rather than fixed, on the one ground that makes it acceptable: no external
-    # party sends prompts to this task. A user namespace is the real containment, and a
-    # Firecracker-based runtime is the answer for multi-tenant or external callers.
+    #
+    # Be exact about the size of that exposure, because the setting's name invites
+    # reading it as smaller. It is NOT only about who sends the prompt. A crew consumes
+    # untrusted CONTENT in the ordinary course of its work -- tool output, a fetched web
+    # page, a connector or API payload, text someone else wrote -- any of which can carry
+    # an injection, and all of which reach the worker whoever sent the prompt. So with
+    # this set, a worker injected through any of those routes can read the model
+    # credential. What the operator accepts is that whole exposure on their own crews,
+    # where the credential at risk and the account it belongs to are theirs. A user
+    # namespace is the real containment, and a Firecracker-based runtime is the answer
+    # for multi-tenant or external callers.
     #
     # A security property the container cannot observe arrives as a setting, exactly as
     # `single_principal` does. Defaults to False, which is the SAFE default: claiming the

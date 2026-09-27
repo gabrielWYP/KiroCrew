@@ -471,15 +471,21 @@ def verify_sandbox(
     assertion below is a tripwire on that invariant rather than a posture.
 
     **What CAN lift it is a trust boundary, not a credential claim.** With
-    ``settings.internal_only`` the deployment states that this task serves the
-    operator's own crews and takes no external prompts. The exposure is then ACCEPTED
-    rather than closed: there is no injected prompt content for an unsandboxed
-    auto-approving worker to act on. That is the one honest ground for it, which is why
-    the switch names the boundary and not the consequence -- an operator cannot set
-    "allow unsandboxed" without stating what makes it acceptable. Closing the route
-    properly still needs a user namespace, a worker under a different uid from the
-    BACKEND (the gateway's own spawn path), or a credential not worth stealing; a
-    Firecracker-based runtime is the answer for multi-tenant or external callers.
+    ``settings.internal_only`` the deployment states that this task runs the operator's
+    OWN crews and that the operator bears the risk of what those crews read. The
+    exposure is then ACCEPTED, and it is worth being exact about its size: it is NOT
+    only a prompt an outsider types. An internal crew consumes untrusted CONTENT as a
+    matter of course -- tool output, fetched web pages, connector and API payloads,
+    repository and ticket text -- any of which can carry an injection, and all of which
+    reach the worker whoever sent the prompt. So with this set, a worker injected
+    through any of those routes can read the vault. What the claim buys is not "no
+    injection can happen" but "the credential at risk and the account it belongs to are
+    the operator's own". That is why the switch names the boundary and not the
+    consequence -- an operator cannot set "allow unsandboxed" without saying whose crews
+    these are and therefore who bears it. Closing the route properly still needs a user
+    namespace, a worker under a different uid from the BACKEND (the gateway's own spawn
+    path), or a credential not worth stealing; a Firecracker-based runtime is the answer
+    for multi-tenant or external callers.
 
     **Only ``SANDBOX_AVAILABLE`` proceeds unconditionally, and only ``SANDBOX_DENIED``
     is lift-able.** Undetermined refuses whatever the boundary says, and so does any
@@ -527,27 +533,32 @@ def verify_sandbox(
             log.warning(
                 "no user-namespace sandbox on this host; starting UNSANDBOXED because "
                 "SMC_INTERNAL_ONLY is set. The model subprocess runs without a sandbox "
-                "and can reach the crew's vault under the backend's uid. Accepted only "
-                "because the deployment declares this task serves the operator's own "
-                "crews and takes no external prompts."
+                "and can reach the crew's vault under the backend's uid, so any "
+                "untrusted content it reads -- tool output, a fetched page, a connector "
+                "payload -- can inject a worker that reads the model credential. "
+                "Accepted because the deployment declares these are the operator's own "
+                "crews and the operator bears that risk."
             )
             return
         raise common.ConfigError(
             "No user-namespace sandbox is available on this host, so kiro-cli cannot "
             "spawn the model subprocess sandboxed. This container runs sandboxed-only "
             "unless the deployment declares the internal-only trust boundary by setting "
-            "SMC_INTERNAL_ONLY=1. Accepting that boundary means: this task serves the "
-            "operator's OWN crews and takes no prompts from anyone else, and an "
-            "unsandboxed worker is accepted rather than fixed -- the worker auto-approves "
-            "every tool it calls, the backend answers the engine's token request from the "
-            "crew's vault so the backend's uid must be able to decrypt it, and the worker "
-            "runs as a child of the backend under that same uid, so it can reach the "
-            "model credential. Taking the credential out of the worker's environment "
-            "does not change that and is not a substitute for the declaration. Do NOT "
-            "set it for a task any external party can send a prompt to: a user namespace "
-            "is the real containment, and a Firecracker-based runtime is the answer for "
-            "multi-tenant callers. Otherwise, run where unprivileged user namespaces are "
-            "permitted."
+            "SMC_INTERNAL_ONLY=1. Accepting that boundary means: these are the "
+            "operator's OWN crews and the operator bears the risk of what they read. Be "
+            "clear about that risk before setting it -- it is NOT only about who sends "
+            "the prompt. The worker auto-approves every tool it calls; the backend "
+            "answers the engine's token request from the crew's vault so the backend's "
+            "uid must be able to decrypt it, and the worker runs as a child of the "
+            "backend under that same uid. So untrusted CONTENT the crew reads in the "
+            "ordinary course of its work -- tool output, a fetched web page, a connector "
+            "or API payload, text someone else wrote -- can inject that worker into "
+            "reading the model credential, whoever sent the prompt. Taking the "
+            "credential out of the worker's environment does not change that and is not "
+            "a substitute for the declaration. Do NOT set it where the credential at "
+            "risk is not the operator's own to lose: a user namespace is the real "
+            "containment, and a Firecracker-based runtime is the answer for multi-tenant "
+            "callers. Otherwise, run where unprivileged user namespaces are permitted."
         )
     raise common.ConfigError(
         f"Whether this host permits an unprivileged user-namespace sandbox could not be "

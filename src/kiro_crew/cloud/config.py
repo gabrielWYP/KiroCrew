@@ -116,8 +116,9 @@ class FargateConfig:
     #: False is the safe direction, and the flag is not the boundary -- a task in
     #: a public subnet with no NAT gateway cannot pull its image without one.
     assign_public_ip: bool = False
-    #: Whether this lane serves the operator's OWN crews and takes no external
-    #: prompts. False means not claimed, which is the safe direction.
+    #: Whether this lane runs the operator's OWN crews, with the operator bearing the
+    #: risk of what those crews read. False means not claimed, which is the safe
+    #: direction.
     #:
     #: It is the only key in this block that LOOSENS anything, and it is here rather
     #: than anywhere else in the product because it is a statement only the operator
@@ -136,10 +137,18 @@ class FargateConfig:
     #: decrypt the crew's vault to answer the engine's token request, so the worker can
     #: reach the model credential. Moving the credential out of its environment does
     #: not change that -- measured, a uid-1000 process reads and decrypts that vault
-    #: directly. The claim is acceptable only because no external party sends prompts
-    #: to the task, so there is no injected content for the worker to act on. A user
-    #: namespace is the real containment; a Firecracker-based runtime is the answer for
-    #: multi-tenant or external callers.
+    #: directly.
+    #:
+    #: The accepted exposure is bigger than the name suggests, so do not read it as "no
+    #: untrusted input reaches this task". A crew reads untrusted CONTENT in the ordinary
+    #: course of its work -- tool output, a fetched web page, a connector or API payload,
+    #: text someone else wrote -- any of which can carry an injection, and all of which
+    #: reach the worker whoever sent the prompt. So with this set, a worker injected
+    #: through any of those routes can read the model credential. The operator accepts
+    #: that on their own crews, where the credential at risk and the account it belongs
+    #: to are theirs; it is a judgement about who bears the risk, not a claim that
+    #: injection cannot happen. A user namespace is the real containment; a
+    #: Firecracker-based runtime is the answer for multi-tenant or external callers.
     #:
     #: Deliberately NOT part of :meth:`is_complete`. A lane that does not claim it is
     #: a complete, usable lane -- it simply cannot run on a host with no user

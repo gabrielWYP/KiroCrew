@@ -308,10 +308,10 @@ need to be answered.
 
 ### The internal-only boundary, and what accepting it accepts
 
-Decided 2026-09-27. **The Fargate lane is internal-only: it serves the operator's
-own crews, and no external party sends prompts to it.** That sentence is the
-security property this section now rests on, and everything below is what follows
-from it.
+Decided 2026-09-27. **The Fargate lane is internal-only: it runs the operator's
+own crews, and the operator bears the whole risk of what those crews read.** That
+sentence is the security property this section now rests on, and everything below is
+what follows from it.
 
 It had to be decided because the lane could not otherwise run at all. The crew
 container is sandboxed-only: kiro-cli sandboxes the model subprocess in an
@@ -329,19 +329,30 @@ child of the backend under that same uid. Measured — a uid-1000 process reads 
 decrypts that vault directly. So an unsandboxed auto-approving worker can reach
 the credential wherever the credential is stored.
 
-**What the boundary accepts, stated plainly.** On a Fargate host the model
-subprocess runs unsandboxed, that subprocess auto-approves every tool it calls,
-and it can reach the model credential. This is ACCEPTED rather than fixed, on the
-single ground that makes it acceptable: there is no external prompt content for it
-to act on. Prompt injection needs a prompt from someone else, and by the boundary
-there is nobody else.
+**What the boundary accepts, stated plainly and without narrowing it.** On a Fargate
+host the model subprocess runs unsandboxed, that subprocess auto-approves every tool
+it calls, and it can reach the model credential in the crew's vault.
+
+The exposure is NOT limited to a prompt an outsider types. An internal crew consumes
+untrusted CONTENT as a matter of course: tool output, fetched web pages, connector and
+API payloads, repository and ticket text, a file someone else wrote. Any of that can
+carry an injection, and it reaches the unsandboxed worker regardless of who sent the
+prompt. With the flag on, a worker injected through any of those routes can read the
+vault. Saying "no external party sends prompts here" would describe a smaller exposure
+than the one being accepted, so it is not the claim this boundary makes.
+
+What the operator accepts is the whole of that, for their own crews: a prompt-injected
+worker on this task can read the crew's model credential, and the blast radius is the
+operator's own account and their own crew. That is a judgement about whose credential
+is at risk and who bears it, not a claim that injection cannot happen. It is a
+judgement only the operator can make, which is why the switch lives in their file.
 
 **The claim is explicit, and the switch names the boundary rather than the
 consequence.** `cloud.json`'s `fargate` block carries `internal_only`; the
 launcher derives `SMC_INTERNAL_ONLY` from it and a caller cannot supply that
 variable; the container's supervisor reads it and takes one branch. An operator
-therefore cannot ask for "allow unsandboxed" — they can only state what makes it
-acceptable, and the loosening follows. Absent means not claimed, so a lane that
+therefore cannot ask for "allow unsandboxed" — they can only state whose crews these
+are, and the loosening follows. Absent means not claimed, so a lane that
 says nothing keeps refusing, and every other lane and every local host is
 unchanged.
 

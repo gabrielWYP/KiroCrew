@@ -346,10 +346,10 @@ def build_backend_config(
     A non-dict where a section should be is REPLACED, not merged. The gateway coerces
     such a section to defaults, and defaults are not what this function is for.
 
-    *internal_only* is the deployment's own claim that this task serves the operator's
-    crews and no external prompts, and it is the ONLY way
-    :data:`INTERNAL_ONLY_AGENT_SETTINGS` is applied. It defaults to ``False`` so a
-    caller that says nothing gets the protective baseline -- which is what every
+    *internal_only* is the deployment's own claim that this task runs the operator's
+    crews and that the operator bears the risk of what those crews read, and it is the
+    ONLY way :data:`INTERNAL_ONLY_AGENT_SETTINGS` is applied. It defaults to ``False`` so
+    a caller that says nothing gets the protective baseline -- which is what every
     existing call site and every other lane gets, unchanged.
     """
     config: dict[str, object] = dict(existing or {})

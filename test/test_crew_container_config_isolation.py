@@ -308,10 +308,10 @@ def test_the_container_forces_no_agent_setting_the_gateway_does_not_have() -> No
 
 # ── The internal-only exception, and why it is stated as a SECOND rule ──
 #
-# The Fargate lane is internal-only (RFC section 7): it serves the operator's own crews
-# and takes no external prompts, so an unsandboxed model subprocess is accepted there.
-# That is the one posture the container may loosen, and the rules below are what keep it
-# the only one.
+# The Fargate lane is internal-only (RFC section 7): it runs the operator's own crews, and
+# the operator bears the risk of what those crews read, so an unsandboxed model subprocess
+# is accepted there. That is the one posture the container may loosen, and the rules below
+# are what keep it the only one.
 #
 # The ratchet above is deliberately NOT edited to accommodate it. Its universal
 # assertion -- every boolean `sandbox*` setting in `FORCED_AGENT_SETTINGS` is `False` --
@@ -428,9 +428,7 @@ def test_the_internal_only_loosening_is_unreachable_without_the_deployments_clai
         for branch in ast.walk(fn)
         if isinstance(branch, ast.If)
         and _reads_constant(branch)
-        and any(
-            isinstance(n, ast.Name) and n.id == "internal_only" for n in ast.walk(branch.test)
-        )
+        and any(isinstance(n, ast.Name) and n.id == "internal_only" for n in ast.walk(branch.test))
     ]
     assert guarded, (
         "INTERNAL_ONLY_AGENT_SETTINGS is not applied inside an `if` that tests "

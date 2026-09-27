@@ -188,7 +188,7 @@ operator writes it by hand.
 | `secrets` | list of `[canonical name, ARN]` pairs; one must be named for the model credential |
 | `cpu_architecture` | `X86_64` or `ARM64`; defaults to `X86_64` |
 | `assign_public_ip` | JSON boolean; defaults to `false` |
-| `internal_only` | JSON boolean; defaults to `false`. The operator's claim that this lane serves their OWN crews and takes no external prompts. With it the container starts the model subprocess **unsandboxed**, which is what lets it run on Fargate at all — see the security model for what claiming it accepts |
+| `internal_only` | JSON boolean; defaults to `false`. The operator's claim that this lane runs their OWN crews and that they bear the risk of what those crews read. With it the container starts the model subprocess **unsandboxed**, which is what lets it run on Fargate at all. It does NOT mean "no untrusted input reaches this task" — see the security model for the exposure it accepts |
 | `task_ttl_seconds` | how long one task may run before the launcher stops it; JSON integer above zero; omitted takes the engine's own default |
 
 `task_ttl_seconds` is the operator-reachable half of `TaskBounds`. Before it the
@@ -331,19 +331,26 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
   `privileged`, no `dockerSecurityOptions`, `linuxParameters` admits only
   `CAP_SYS_PTRACE`). Measured on a real task, which exited 1 at the sandbox check with
   every step before it succeeding. `cloud.json`'s `fargate.internal_only` is where the
-  operator states that this lane serves their OWN crews and takes no external prompts;
-  the launcher derives `SMC_INTERNAL_ONLY` from it, and with that set the container
-  starts with the model subprocess unsandboxed.
+  operator states that this lane runs their OWN crews and that they bear the risk of
+  what those crews read; the launcher derives `SMC_INTERNAL_ONLY` from it, and with that
+  set the container starts with the model subprocess unsandboxed.
   What claiming it ACCEPTS: that subprocess auto-approves every tool it calls and can
-  reach the model credential. Reachability, not residency, is the operative property —
-  the backend answers the engine's token request from the crew's vault so the backend's
-  uid must be able to decrypt it, and the worker is a child of the backend under that
-  same uid (measured: a uid-1000 process reads and decrypts it directly). So moving the
-  credential out of the worker's environment does not close it, and the claim is what
-  makes it acceptable: prompt injection needs a prompt from someone else, and the
-  boundary says there is nobody else.
+  reach the model credential in the crew's vault. Reachability, not residency, is the
+  operative property — the backend answers the engine's token request from that vault so
+  the backend's uid must be able to decrypt it, and the worker is a child of the backend
+  under that same uid (measured: a uid-1000 process reads and decrypts it directly). So
+  moving the credential out of the worker's environment does not close it.
+  The accepted exposure is NOT limited to a prompt an outsider types, and the setting
+  must not be read that way. An internal crew consumes untrusted CONTENT as a matter of
+  course — tool output, fetched web pages, connector and API payloads, repository and
+  ticket text — any of which can carry an injection, and all of which reach the
+  unsandboxed worker regardless of who sent the prompt. With the flag on, a worker
+  injected through any of those routes can read the vault. What the operator accepts is
+  that whole exposure on their own crews, where the credential at risk and the account
+  it belongs to are theirs. It is a judgement about who bears the risk, not a claim that
+  injection cannot happen.
   The setting names the BOUNDARY and not the consequence, deliberately: an operator
-  cannot ask for "allow unsandboxed", only state what makes it acceptable. Absent means
+  cannot ask for "allow unsandboxed", only state whose crews these are. Absent means
   not claimed, so a lane that says nothing keeps refusing, and no other lane and no
   local host is affected. It is not the multi-tenant answer — a user namespace is the
   real containment, and a Firecracker-based runtime is the answer for external or
