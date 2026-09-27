@@ -21,6 +21,7 @@ import pytest
 
 from kiro_crew.dashboard.handlers.knowledge import _validate_knowledge_bundle
 from kiro_crew.knowledge import store as store_module
+from kiro_crew.knowledge.agent_source import remove_document
 from kiro_crew.knowledge.store import (
     BUNDLE_STATE_KEY_COL,
     KnowledgeBundleError,
@@ -387,10 +388,12 @@ class TestOwnershipIsOnlyRestoredForItemsThatArrived:
         assert result["items_imported"] == 2
         assert result["ownership_rows_imported"] == 0
 
-    def test_group_is_dropped_when_one_item_lands_under_another_source(self, exporter, importer):
-        """An item id already present here keeps its LOCAL source, so a group naming
-        it is not fully held by the source the state row names -- even though every
-        id in the group is in the bundle."""
+    def test_an_item_landing_under_another_source_does_not_strand_its_sibling(
+        self, exporter, importer
+    ):
+        """An item id already present here keeps its LOCAL source, so the row may not
+        name it -- but the sibling this import DID write is the row's, and dropping the
+        whole row would leave that sibling searchable and owned by nothing."""
         other = importer.add_source(name="Other", source_type="local_file", uri="/local/other.md")
         importer.db.execute(
             "INSERT INTO items (id, title, content, item_type, source_id, "
@@ -418,13 +421,25 @@ class TestOwnershipIsOnlyRestoredForItemsThatArrived:
 
         # Only the first item lands; 'shared-id' is already taken locally.
         assert result["items_imported"] == 1
-        assert result["ownership_rows_imported"] == 0
+        assert result["ownership_rows_imported"] == 1
+        assert _owner_of(importer, "agent_item_state", first) is not None
+        group = json.loads(
+            importer.db.execute(
+                "SELECT item_ids FROM agent_item_state WHERE slug = 'doc'"
+            ).fetchone()["item_ids"]
+        )
+        assert group == [first], "the row claimed an id this import did not write"
         assert (
             importer.db.execute("SELECT source_id FROM items WHERE id = 'shared-id'").fetchone()[
                 "source_id"
             ]
             == other
         )
+        named = [
+            w for w in result["withheld"] if w.get("reason") == "ownership_row_names_absent_items"
+        ]
+        assert named, "the id left out of the group was not named"
+        assert "shared-id" in named[0]["items"]
 
     def test_group_cannot_claim_items_the_bundle_did_not_ship(self, exporter, importer):
         """A bundle naming ids that exist LOCALLY must not take them over: the
@@ -517,9 +532,10 @@ def _two_chunk_doc(store, *, slug="doc", bodies=("chunk one", "chunk two"), name
 
 class TestOwnershipSurvivesAPartlyDeletedDocument:
     """No delete path prunes a state row's group, by design -- so a document that lost one
-    chunk has a row naming a dead id. The accepting pass drops a row whose group is not
-    wholly inside the items the import wrote, so shipping that row verbatim discards the
-    WHOLE ownership and the surviving chunks arrive unowned. The export prunes instead."""
+    chunk has a row naming a dead id. The accepting pass keeps only the ids the import
+    wrote, so shipping that row verbatim leaves the dead id named in the account of what
+    nobody owns, on every restore of that document. The export prunes instead, which
+    keeps the account for the ids that really are unowned here."""
 
     def test_the_export_ships_only_ids_it_carries(self, exporter):
         sid, ids = _two_chunk_doc(exporter)
@@ -542,10 +558,11 @@ class TestOwnershipSurvivesAPartlyDeletedDocument:
             _owner_of(importer, "agent_item_state", ids[1]) is not None
         ), "the surviving chunk arrived unowned"
 
-    def test_a_bundle_naming_an_absent_item_is_refused_BY_NAME(self, exporter, importer):
+    def test_an_absent_item_is_named_and_left_out_of_the_group(self, exporter, importer):
         """A bundle built elsewhere, or before this pruning, can still name an item no
-        import wrote. The row is still refused -- partial ownership would claim items
-        another store holds -- but the caller is told which document and which ids."""
+        import wrote. That id stays out of the group -- partial ownership would claim
+        items another document holds -- and the caller is told which document and which
+        ids, because its content is here owned by nothing and nothing else says so."""
         sid, ids = _two_chunk_doc(exporter)
         bundle = exporter.export_all()
         bundle["items"] = [i for i in bundle["items"] if i["id"] != ids[0]]
@@ -555,9 +572,15 @@ class TestOwnershipSurvivesAPartlyDeletedDocument:
         named = [
             w for w in result["withheld"] if w.get("reason") == "ownership_row_names_absent_items"
         ]
-        assert named, f"the dropped ownership row was silent: {result['withheld']}"
+        assert named, f"the absent id was silent: {result['withheld']}"
         assert named[0]["key"] == "doc"
         assert ids[0] in named[0]["items"]
+        group = json.loads(
+            importer.db.execute(
+                "SELECT item_ids FROM agent_item_state WHERE slug = 'doc'"
+            ).fetchone()["item_ids"]
+        )
+        assert group == [ids[1]], "the row claimed an id no import wrote"
 
 
 class TestTheGroupParserIsBoundedAndLinear:
@@ -808,6 +831,214 @@ class TestAPartialDeleteStillRestores:
         assert _owner_of(importer, "agent_item_state", ids[1]) is not None
 
 
+def _newer_pruned_then_older_complete(store):
+    """``(ids, newer_pruned, older_complete)`` for one two-chunk document.
+
+    The complete export is taken first; a chunk is then deleted and the document
+    exported again. `export_all` prunes a group to the items it carries, so the second
+    bundle is a NEWER backup naming one chunk and the first an OLDER one naming both.
+    Restoring the newer backup and then the older one is an ordinary restore order --
+    the newest backup first, an older one to recover what it had already lost.
+    """
+    _, ids = _two_chunk_doc(store)
+    older_complete = store.export_all()
+    store.delete_item(ids[1])
+    newer_pruned = store.export_all()
+    return ids, newer_pruned, older_complete
+
+
+def _restore_both(exporter, importer):
+    """Restore the newer pruned backup, then the older complete one."""
+    ids, newer, older = _newer_pruned_then_older_complete(exporter)
+    importer.import_bundle(newer)
+    result = importer.import_bundle(older)
+    return ids, result
+
+
+def _group_of(store, slug="doc"):
+    row = store.db.execute(
+        "SELECT item_ids FROM agent_item_state WHERE slug = ?", (slug,)
+    ).fetchone()
+    return set(json.loads(row["item_ids"] or "[]")) if row else None
+
+
+class TestASecondBundleOwnsTheChunksItBrings:
+    """A second bundle for a document already here brings chunks the local row does
+    not name, and the row that names them is refused because the rest of its group was
+    already present. Nothing else re-derives ownership for the ids that DID arrive:
+    `agent_item_state` is the one table a bundle restores and no pass reaps it, so the
+    document's own delete takes the chunks its row names and leaves the arrived one
+    behind -- searchable, and owned by nothing that could ever remove it. This is the
+    shape the blocking pass already describes as "its absent ids arrive, to be merged
+    into that row's group by the accepting pass"."""
+
+    def test_the_older_bundle_chunk_arrives(self, exporter, importer):
+        """The control. Every pin below is vacuous if the chunk never lands."""
+        ids, result = _restore_both(exporter, importer)
+
+        assert result["items_imported"] == 1, "the older bundle brought no chunk"
+        assert _item_count(importer, "chunk two") == 1
+
+    def test_the_arriving_chunk_is_owned(self, exporter, importer):
+        ids, _ = _restore_both(exporter, importer)
+
+        local_sid = importer.get_source_by_uri(AGGREGATE_URI)["id"]
+        assert _owner_of(importer, "agent_item_state", ids[1]) == (
+            local_sid,
+            "doc",
+        ), "the chunk the older bundle brought is owned by nothing"
+
+    def test_the_row_names_both_chunks(self, exporter, importer):
+        ids, _ = _restore_both(exporter, importer)
+
+        assert _group_of(importer) == set(ids), "the row does not name both chunks"
+
+    def test_deleting_the_document_takes_both_chunks(self, exporter, importer):
+        ids, _ = _restore_both(exporter, importer)
+        local_sid = importer.get_source_by_uri(AGGREGATE_URI)["id"]
+
+        remove_document(importer, local_sid, "doc")
+
+        assert _item_count(importer, "chunk one") == 0
+        assert (
+            _item_count(importer, "chunk two") == 0
+        ), "a chunk outlived the document that brought it"
+
+    def test_nothing_the_document_brought_stays_searchable(self, exporter, importer):
+        ids, _ = _restore_both(exporter, importer)
+        local_sid = importer.get_source_by_uri(AGGREGATE_URI)["id"]
+        assert importer.search_items_fts("chunk two"), "fixture must index the chunk"
+
+        remove_document(importer, local_sid, "doc")
+
+        assert (
+            importer.search_items_fts("chunk two") == []
+        ), "a deleted document still answers searches"
+
+    def test_no_item_is_left_without_an_owner(self, exporter, importer):
+        _restore_both(exporter, importer)
+
+        owned = set()
+        for table in BUNDLE_STATE_KEY_COL:
+            for row in importer.db.execute(f"SELECT item_ids FROM {table}"):  # noqa: S608
+                owned.update(json.loads(row["item_ids"] or "[]"))
+        present = {r["id"] for r in importer.db.execute("SELECT id FROM items")}
+        assert present == owned, "an item arrived that no ownership row names"
+
+
+class TestTheMergeTakesOnlyWhatThisImportWrote:
+    """The other direction. A merge that takes more than the arriving ids is a data bug
+    of its own: it hands a bundle's document the authority to delete local content, or
+    puts one chunk in two groups so the first delete strands the second row's items."""
+
+    def test_local_content_the_bundle_names_is_not_merged_in(self, exporter, importer):
+        """Residue under the same source that no row owns. The bundle's row names it,
+        the live local row is being extended, and it must still not be captured."""
+        ids, newer, older = _newer_pruned_then_older_complete(exporter)
+        importer.import_bundle(newer)
+        local_sid = importer.get_source_by_uri(AGGREGATE_URI)["id"]
+        importer.db.execute(
+            "INSERT INTO items (id, title, content, item_type, source_id, "
+            "created_at, updated_at) VALUES ('residue-id', 'Residue', "
+            "'residue text', 'document', ?, '2026-01-01T00:00:00', "
+            "'2026-01-01T00:00:00')",
+            (local_sid,),
+        )
+        importer.db.commit()
+        next(r for r in older["agent_item_state"] if r["slug"] == "doc")["item_ids"] = json.dumps(
+            [*ids, "residue-id"]
+        )
+
+        importer.import_bundle(older)
+
+        assert _group_of(importer) == set(ids), "the merge adopted unowned local content"
+        assert _item_count(importer, "residue text") == 1, "the residue must be left alone"
+
+    def test_an_id_another_document_owns_is_not_merged_in(self, exporter, importer):
+        """A sibling row in the same bundle claims the arriving id first, so the row
+        being extended may not name it too -- one item in two groups means the first
+        document-level delete removes content the second row still names."""
+        ids, newer, older = _newer_pruned_then_older_complete(exporter)
+        importer.import_bundle(newer)
+        sibling = {
+            **next(r for r in older["agent_item_state"] if r["slug"] == "doc"),
+            "slug": "sibling",
+            "name": "Sibling",
+            "item_ids": json.dumps([ids[1]]),
+        }
+        # The sibling is accepted first, so it owns the arriving chunk.
+        older["agent_item_state"] = [sibling, *older["agent_item_state"]]
+
+        importer.import_bundle(older)
+
+        owners = [
+            row["slug"]
+            for row in importer.db.execute("SELECT slug, item_ids FROM agent_item_state")
+            if ids[1] in json.loads(row["item_ids"] or "[]")
+        ]
+        assert owners == ["sibling"], f"the chunk ended up in two groups: {owners}"
+
+    def test_a_different_document_on_the_same_key_is_not_merged_into(self, exporter, importer):
+        """Disjoint groups on one key are two different documents, not one coming back.
+        The bundle's items are withheld, and the local row is left exactly as it was."""
+        _, local_item = _owned_doc(importer, slug="doc", body="local body", name="Local")
+        _owned_doc(exporter, slug="doc", body="remote body", name="Remote")
+
+        importer.import_bundle(exporter.export_all())
+
+        assert _group_of(importer) == {local_item}, "a foreign document was merged in"
+        assert _item_count(importer, "remote body") == 0
+
+    def test_a_shared_id_does_not_reach_the_disjoint_row_it_escaped_the_block_for(
+        self, exporter, importer
+    ):
+        """The blocking pass cannot supply the merge's precondition, so this pass tests
+        it. An id two bundle rows both claim is SHARED, so the block never withholds it
+        -- the bundle does not agree who owns it -- and it arrives with the disjoint live
+        local row still sitting on its key. Merging there files imported content under an
+        unrelated local document, whose own delete then destroys it, unannounced."""
+        _, remote_item = _owned_doc(exporter, slug="doc", body="remote body", name="Remote")
+        local_sid, local_item = _owned_doc(importer, slug="doc", body="local body", name="Local")
+        bundle = exporter.export_all()
+        first = bundle["agent_item_state"][0]
+        bundle["agent_item_state"].append({**first, "slug": "sibling", "name": "Sibling"})
+
+        result = importer.import_bundle(bundle)
+
+        assert result["items_imported"] == 1, "the shared id must still arrive"
+        assert _group_of(importer) == {
+            local_item
+        }, "the unrelated local document absorbed the imported item"
+        named = [
+            w for w in result["withheld"] if w.get("reason") == "ownership_row_key_held_locally"
+        ]
+        assert [(w["key"], w["items"]) for w in named] == [("doc", remote_item)]
+        assert _owner_of(importer, "agent_item_state", remote_item) != (
+            local_sid,
+            "doc",
+        ), "the item is owned by the row whose document would delete it"
+
+    def test_the_merge_leaves_the_local_rows_identity_alone(self, exporter, importer):
+        """The bundle reaching this branch can be OLDER than the local copy, so its
+        hash and name must not replace the ones describing what this store holds."""
+        ids, newer, older = _newer_pruned_then_older_complete(exporter)
+        importer.import_bundle(newer)
+        importer.db.execute(
+            "UPDATE agent_item_state SET content_hash = 'local-hash', name = 'Local name' "
+            "WHERE slug = 'doc'"
+        )
+        importer.db.commit()
+
+        importer.import_bundle(older)
+
+        row = importer.db.execute(
+            "SELECT content_hash, name FROM agent_item_state WHERE slug = 'doc'"
+        ).fetchone()
+        assert row["content_hash"] == "local-hash", "an older bundle rewrote the local hash"
+        assert row["name"] == "Local name"
+        assert _group_of(importer) == set(ids), "the group did not grow"
+
+
 class TestWithholdingIsNeverSilent:
     """Withholding still happens for a DIFFERENT document holding the key, and that is
     correct -- but the caller has to be able to say WHICH content did not arrive, not
@@ -994,6 +1225,186 @@ class TestAKeyThisStoreAlreadyHoldsBlocksTheItems:
 
         assert result["items_imported"] == 1
         assert result["ownership_rows_imported"] == 1
+
+
+class TestTheSameRowExemptionCoversEveryStatedTable:
+    """The claimed-id rule's one exception is this document meeting its OWN row, keyed on
+    the bundle's row at the same `(table, source, key)`. That holds for a folder file or
+    artifact slug this host still has, even though no row of those tables is written:
+    `_delete_item_cascade` never prunes a group, so a per-chunk delete leaves the row
+    naming the chunk, and nothing re-derives an id withheld here -- `FolderWatcher._do_scan`
+    step 4 reaps only a row whose path the walk MISSED, and step 5 skips a `done` row whose
+    mtime and content hash did not change."""
+
+    def test_a_folder_rows_own_group_exempts_the_chunk_it_names(self, exporter, importer):
+        _, folder_item = _folder_doc(exporter)
+        bundle = exporter.export_all()
+        shipped = bundle["folder_file_state"][0]
+        assert folder_item in json.loads(
+            shipped["item_ids"]
+        ), "fixture must ship the id the local row claims"
+        # The deleter's own row: same (source, file_path) the bundle's row names, its group
+        # still naming the chunk `DELETE /api/knowledge/items/{id}` removed.
+        local_sid = importer.add_source(
+            name="Notes", source_type="local_folder", uri="/remote/notes"
+        )
+        importer.db.execute(
+            "INSERT INTO folder_file_state (source_id, file_path, content_hash, "
+            "text_hash, mtime, item_ids, last_seen, status, attempts) "
+            "VALUES (?, ?, 'raw-hash', 'text-hash', 123.5, ?, "
+            "'2026-01-01T00:00:00', 'done', 0)",
+            (local_sid, shipped["file_path"], json.dumps([folder_item])),
+        )
+        importer.db.commit()
+
+        result = importer.import_bundle(bundle)
+
+        assert result["items_withheld"] == 0, "the row's own chunk was withheld from it"
+        assert _item_count(importer, "folder body") == 1, "the deleted chunk did not come back"
+
+    def test_another_documents_claim_is_still_contested(self, exporter, importer):
+        """The rule the exception is carved out of. A local row at a DIFFERENT key claiming
+        the arriving id is not this document meeting itself, so the id stays contested --
+        otherwise the insert makes that claim live over content it never owned."""
+        _, folder_item = _folder_doc(exporter)
+        bundle = exporter.export_all()
+        shipped = bundle["folder_file_state"][0]
+        local_sid = importer.add_source(
+            name="Notes", source_type="local_folder", uri="/remote/notes"
+        )
+        importer.db.execute(
+            "INSERT INTO folder_file_state (source_id, file_path, content_hash, "
+            "text_hash, mtime, item_ids, last_seen, status, attempts) "
+            "VALUES (?, ?, 'other-hash', 'other-text', 9.0, ?, "
+            "'2026-01-01T00:00:00', 'done', 0)",
+            (local_sid, shipped["file_path"] + ".other", json.dumps([folder_item])),
+        )
+        importer.db.commit()
+
+        result = importer.import_bundle(bundle)
+
+        assert result["items_withheld"] == 1
+        assert _item_count(importer, "folder body") == 0, "a foreign claim captured the import"
+        assert [
+            w["item_id"]
+            for w in result["withheld"]
+            if w.get("reason") == "item_id_claimed_by_another_document"
+        ] == [folder_item]
+
+    def test_an_agent_row_still_exempts_the_document_it_restores(self, exporter, importer):
+        """The restored table's half, unchanged: a row meeting its own stale group -- what
+        `_delete_item_cascade` leaves behind -- must not withhold the only copy of the
+        chunk it brings."""
+        _, item_id = _owned_doc(exporter, slug="doc", body="saved body", name="Doc")
+        local_sid = importer.add_source(name="Auto-added", source_type="agent", uri=AGGREGATE_URI)
+        importer.db.execute(
+            "INSERT INTO agent_item_state (source_id, slug, content_hash, item_ids, "
+            "updated_at, name, status, source_uri) VALUES (?, 'doc', 'hash-doc', ?, "
+            "'2026-01-01T00:00:00', 'Doc', 'active', 'https://x/y')",
+            (local_sid, json.dumps([item_id])),
+        )
+        importer.db.commit()
+
+        result = importer.import_bundle(exporter.export_all())
+
+        assert result["items_withheld"] == 0, "the bundle's own row withheld its own item"
+        assert _item_count(importer, "saved body") == 1
+        assert _owner_of(importer, "agent_item_state", item_id) == (local_sid, "doc")
+
+
+class _BindSpy:
+    """Forwards to the real connection and records the widest bind count it saw."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.widest = 0
+
+    def execute(self, sql, params=()):
+        self.widest = max(self.widest, len(params))
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class TestNoBundleSizedInListPassesTheBindCeiling:
+    """sqlite's bind limit is 32,766 on the bundled build but only 999 on a host still
+    on a pre-3.32 library, and `vector_memory` already records that floor. A bundle
+    names as many sources as it likes and one state row's group runs to
+    `_MAX_ITEM_GROUP_MEMBERS` (4096), so an `IN` list built from either passes 999 on
+    ordinary input -- and the `OperationalError` lands mid-transaction, rolling the
+    whole import back and answering 500 where it should have succeeded. Every such list
+    is chunked under `store._MAX_SQL_PARAMS`, the way `_items_exist` already was."""
+
+    def test_the_chunk_helper_covers_its_input_within_the_ceiling(self):
+        values = [f"id-{i:05d}" for i in range(1100)]
+
+        chunks = list(store_module._sql_param_chunks(values))
+
+        assert chunks, "the helper yielded nothing for a non-empty input"
+        assert max(len(c) for c in chunks) <= store_module._MAX_SQL_PARAMS
+        assert [v for c in chunks for v in c] == values, "the helper dropped or reordered ids"
+        assert list(store_module._sql_param_chunks([])) == []
+
+    def test_an_import_past_the_ceiling_binds_no_statement_past_it(self, exporter, importer):
+        """Three axes at once: more sources than the ceiling, a group past it on the
+        bundle's row AND on the live local row the accepting pass probes, and a SECOND
+        document whose whole group arrives fresh -- the local row's group is the base the
+        first document's arriving ids are measured against, so only a key with no local
+        row makes `arriving` itself wider than the ceiling."""
+        remote_sid, first = _owned_doc(exporter, slug="doc", body="remote body", name="Remote")
+        ghosts = [f"ghost-{i:05d}" for i in range(1100)]
+        fresh = [f"fresh-{i:05d}" for i in range(600)]
+        for gid, body in [(g, "ghost") for g in ghosts] + [(f, "fresh") for f in fresh]:
+            exporter.db.execute(
+                "INSERT INTO items (id, title, content, item_type, source_id, "
+                "created_at, updated_at) VALUES (?, 'Extra', ?, 'document', ?, "
+                "'2026-01-01T00:00:00', '2026-01-01T00:00:00')",
+                (gid, f"{body} body {gid}", remote_sid),
+            )
+        exporter.db.execute(
+            "UPDATE agent_item_state SET item_ids = ? WHERE slug = 'doc'",
+            (json.dumps([first, *ghosts]),),
+        )
+        exporter.db.execute(
+            "INSERT INTO agent_item_state (source_id, slug, content_hash, item_ids, "
+            "updated_at, name, status, source_uri) VALUES (?, 'fresh', 'hash-fresh', ?, "
+            "'2026-01-01T00:00:00', 'Fresh', 'active', 'https://x/y')",
+            (remote_sid, json.dumps(fresh)),
+        )
+        exporter.db.commit()
+        bundle = exporter.export_all()
+        bundle["sources"].extend(
+            {
+                "id": f"spare-{i:05d}",
+                "name": f"Spare {i}",
+                "source_type": "agent",
+                "uri": f"agent://spare-{i:05d}",
+            }
+            for i in range(1100)
+        )
+        # A live local row on the 'doc' key whose own group is past the ceiling, so the
+        # ownership probe and the claimed-id read both see a bundle-sized list.
+        _, local_item = _owned_doc(importer, slug="doc", body="local body", name="Local")
+        importer.db.execute(
+            "UPDATE agent_item_state SET item_ids = ? WHERE slug = 'doc'",
+            (json.dumps([local_item, *ghosts]),),
+        )
+        importer.db.commit()
+
+        spy = _BindSpy(importer.db)
+        importer._thread_local.conn = spy
+        try:
+            result = importer.import_bundle(bundle)
+        finally:
+            importer._thread_local.conn = spy._conn
+
+        assert result["items_imported"] > len(fresh), "the fresh group did not arrive whole"
+        assert _group_of(importer, "fresh") is not None, "the fresh document was not restored"
+        assert spy.widest <= store_module._MAX_SQL_PARAMS, (
+            f"one statement bound {spy.widest} parameters, over the "
+            f"{store_module._MAX_SQL_PARAMS} ceiling"
+        )
 
 
 class TestOneItemIsNeverOwnedByTwoRows:
@@ -1606,10 +2017,14 @@ class TestMembershipIdentifiersMustBeText:
         importer._bundle_membership_ids({"relations": [{"source_item_id": None}, {}]})
 
 
-class TestUnresolvablePointersAreStillRefused:
-    """The remap rewrites a pointer it can resolve and leaves one it cannot exactly
-    as it arrived, so a bundle naming a source that is nowhere keeps being refused
-    by the foreign key instead of being filed somewhere plausible."""
+class TestAnUndeclaredSourceReferenceIsRefused:
+    """A bundle's source ids are local to the store that minted them, so the import
+    resolves them through the `sources` entry's uri. A reference the bundle does not
+    declare has no uri to resolve, leaving only the id -- and filing content under
+    whichever local row happens to share an id is what the DECLARED path already
+    refuses, where a bundle id held by a different uri gets a freshly minted one
+    instead. The undeclared case cannot be repaired that way, because nothing names
+    the source its content belongs to, so it is refused."""
 
     def test_item_naming_an_unknown_source_is_refused(self, importer):
         bundle = {
@@ -1624,7 +2039,7 @@ class TestUnresolvablePointersAreStillRefused:
                 }
             ],
         }
-        with pytest.raises(Exception, match="FOREIGN KEY"):
+        with pytest.raises(KnowledgeBundleError, match="items.source_id"):
             importer.import_bundle(bundle)
         assert importer.db.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"] == 0
 
@@ -1634,10 +2049,47 @@ class TestUnresolvablePointersAreStillRefused:
                 {"id": "loc1", "item_id": "no-such-item", "source_id": "no-such-source"}
             ]
         }
-        with pytest.raises(Exception, match="FOREIGN KEY"):
+        with pytest.raises(KnowledgeBundleError, match="source_locations.source_id"):
             importer.import_bundle(bundle)
 
+    def test_an_id_this_store_holds_is_refused_just_the_same(self, importer):
+        """The case the foreign key cannot catch, and the only one that loses data. The
+        id exists HERE, under a source the bundle never names, so the constraint is
+        satisfied and the content would be filed under an unrelated local source with
+        nothing naming it."""
+        other = importer.add_source(name="Other", source_type="local_file", uri="/local/other.md")
+        bundle = {
+            "items": [
+                {
+                    "id": "i1",
+                    "title": "T",
+                    "content": "foreign text",
+                    "item_type": "document",
+                    "source_id": other,
+                }
+            ]
+        }
+
+        with pytest.raises(KnowledgeBundleError, match="items.source_id"):
+            importer.import_bundle(bundle)
+
+        assert (
+            _item_count(importer, "foreign text") == 0
+        ), "foreign content was filed under a local source the bundle never named"
+
+    def test_a_declared_source_still_resolves(self, exporter, importer):
+        """The control. The refusal must not touch a bundle that carries its sources,
+        which is every bundle any exporter here produces."""
+        _owned_doc(exporter, slug="doc", body="remote body", name="Remote")
+
+        result = importer.import_bundle(exporter.export_all())
+
+        assert result["items_imported"] == 1
+        assert result["ownership_rows_imported"] == 1
+
     def test_item_with_no_source_at_all_still_imports(self, importer):
+        """A null reference is not a reference: an item filed under no source is
+        legitimate and must not be caught by the refusal."""
         bundle = {
             "items": [{"id": "i1", "title": "T", "content": "loose text", "item_type": "document"}]
         }
