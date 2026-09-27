@@ -44,7 +44,6 @@ _FAILED_STATES = {
     "DELETE_FAILED",
     "UPDATE_ROLLBACK_FAILED",
 }
-_DELETE_DONE = "DELETE_COMPLETE"
 _DISCOVERABLE_STACK_STATES = sorted(
     _COMPLETE_STATES
     | _FAILED_STATES
@@ -1221,8 +1220,10 @@ def destroy(
     deleting an already-gone stack is a no-op success.
 
     ``dry_run`` returns the argv without calling AWS. When ``wait`` is true this
-    blocks until the stack reaches ``DELETE_COMPLETE`` (or raises on
-    ``DELETE_FAILED``).
+    blocks on :func:`wait_for_delete` and returns its verdict as ``destroyed``:
+    ``False`` means the wait did not confirm ``DELETE_COMPLETE``
+    (``DELETE_FAILED``, the timeout, or any other failed ``wait`` call). That
+    outcome is returned, never raised.
     """
     if not dry_run:
         aws.assert_human_action("cloudformation:DeleteStack")
