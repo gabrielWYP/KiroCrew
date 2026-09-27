@@ -3095,11 +3095,15 @@ class AutoNudgeService:
                 await asyncio.shield(timer)
         return True
 
-    async def _deactivate_and_wait_unserialized(self, loop_id: str) -> bool:
+    async def _deactivate_and_wait_unserialized(
+        self, loop_id: str, *, stopped_reason: str | None = None
+    ) -> bool:
         """Quiesce a loop while the caller owns the maintenance transaction."""
         self._begin_maintenance_quiesce(loop_id)
         timer_before = self._timers.get(loop_id)
-        inner = asyncio.create_task(self._update_unserialized(loop_id, active=False))
+        inner = asyncio.create_task(
+            self._update_unserialized(loop_id, active=False, stopped_reason=stopped_reason)
+        )
         try:
             loop = await asyncio.shield(inner)
         except asyncio.CancelledError:
@@ -7684,9 +7688,11 @@ class _AutoNudgeMaintenanceView:
     def get_by_slot(self, slot_key: str) -> NudgeLoop | None:
         return self._service.get_by_slot(slot_key)
 
-    async def deactivate_and_wait(self, loop_id: str) -> bool:
+    async def deactivate_and_wait(self, loop_id: str, *, stopped_reason: str | None = None) -> bool:
         self._quiescing.add(loop_id)
-        quiesced = await self._service._deactivate_and_wait_unserialized(loop_id)
+        quiesced = await self._service._deactivate_and_wait_unserialized(
+            loop_id, stopped_reason=stopped_reason
+        )
         if quiesced:
             return True
         else:

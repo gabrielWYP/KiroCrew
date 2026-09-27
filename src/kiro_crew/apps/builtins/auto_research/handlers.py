@@ -1500,7 +1500,11 @@ async def _settle_campaign_from_watchdog(
                 and terminating_loop is not None
                 and terminating_loop.active
             ):
-                await svc.update(terminating_loop.id, active=False)
+                await svc.update(
+                    terminating_loop.id,
+                    active=False,
+                    stopped_reason=f"campaign_{status.value}",
+                )
             try:
                 await asyncio.to_thread(
                     update_campaign_status,
@@ -2274,8 +2278,11 @@ def _advance_exploration(campaign_id: str) -> None:
         logger.exception("auto_research: emergent exploration failed for %s", campaign_id)
 
 
-async def _stop_loop(cid: str, *, remove: bool) -> None:
-    """Pause (remove=False) or tear down (remove=True) a campaign's autonudge loop."""
+async def _stop_loop(cid: str, *, remove: bool, stop_reason: str = "") -> None:
+    """Pause (remove=False) or tear down (remove=True) a campaign's autonudge loop.
+
+    ``stop_reason`` names a teardown in the loop's stop log line.
+    """
     svc = _autonudge_instance()
     if svc is None:
         return
@@ -2283,7 +2290,7 @@ async def _stop_loop(cid: str, *, remove: bool) -> None:
     if not loop:
         return
     if remove:
-        await svc.remove(loop.id)
+        await svc.remove(loop.id, stop_reason=stop_reason)
     else:
         await svc.update(loop.id, active=False)
 
@@ -3034,7 +3041,7 @@ async def _handle_action(request: web.Request) -> web.Response:
             if mode == "workflow":
                 await _stop_workflow(request, cid)
             else:
-                await _stop_loop(cid, remove=True)
+                await _stop_loop(cid, remove=True, stop_reason="campaign_stopped")
         return web.json_response(result)
 
 
@@ -3050,7 +3057,7 @@ async def _handle_delete(request: web.Request) -> web.Response:
         if mode == "workflow":
             await _stop_workflow(request, cid)
         else:
-            await _stop_loop(cid, remove=True)
+            await _stop_loop(cid, remove=True, stop_reason="campaign_deleted")
         result = await asyncio.to_thread(delete_campaign, cid)
         if "error" in result:
             return web.json_response(result, status=404)

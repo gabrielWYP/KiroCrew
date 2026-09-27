@@ -2106,7 +2106,7 @@ class TestLoopLaunch:
         svc.get_by_slot.return_value = SimpleNamespace(id="loop1")
         monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
         await h._stop_loop("a1b2c3d4", remove=True)
-        svc.remove.assert_awaited_once_with("loop1")
+        svc.remove.assert_awaited_once_with("loop1", stop_reason="")
 
     @pytest.mark.asyncio
     async def test_pause_deactivates_loop(self, monkeypatch):

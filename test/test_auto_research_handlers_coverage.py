@@ -793,7 +793,9 @@ class TestWatchdogLoop:
             lambda: _status(cid) == h.CampaignStatus.FAILED and "failed" in sse.types(),
         )
         assert "stalled" in (h.get_campaign(cid) or {})["error_message"]
-        svc.update.assert_awaited_once_with(terminating_loop.id, active=False)
+        svc.update.assert_awaited_once_with(
+            terminating_loop.id, active=False, stopped_reason="campaign_failed"
+        )
         svc.remove.assert_awaited_once_with(terminating_loop.id)
         assert "failed" in sse.types()
 
@@ -1738,9 +1740,9 @@ class TestAssortedHelpers:
             get_by_slot=MagicMock(return_value=loop), remove=AsyncMock(), update=AsyncMock()
         )
         monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        await h._stop_loop("a1b2c3d4", remove=remove)
+        await h._stop_loop("a1b2c3d4", remove=remove, stop_reason="campaign_stopped")
         if remove:
-            svc.remove.assert_awaited_once_with("l1")
+            svc.remove.assert_awaited_once_with("l1", stop_reason="campaign_stopped")
         else:
             svc.update.assert_awaited_once_with("l1", active=False)
 
@@ -1941,7 +1943,9 @@ class TestActionDispatch:
         if mode == "workflow":
             dispatch.stop_workflow.assert_awaited_once()
         else:
-            dispatch.stop_loop.assert_awaited_once_with(cid, remove=True)
+            dispatch.stop_loop.assert_awaited_once_with(
+                cid, remove=True, stop_reason="campaign_stopped"
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mode", ["agent", "workflow"])
@@ -1955,7 +1959,9 @@ class TestActionDispatch:
         if mode == "workflow":
             dispatch.stop_workflow.assert_awaited_once()
         else:
-            dispatch.stop_loop.assert_awaited_once_with(cid, remove=True)
+            dispatch.stop_loop.assert_awaited_once_with(
+                cid, remove=True, stop_reason="campaign_deleted"
+            )
 
     @pytest.mark.asyncio
     async def test_delete_of_a_missing_campaign_is_a_404(self, _isolate: Path, dispatch):

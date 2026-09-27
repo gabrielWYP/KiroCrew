@@ -801,7 +801,7 @@ async def _remove_orphaned_executions_with_service(state: Any, service: Any) -> 
         if not loop_id:
             raise RuntimeError("orphaned loop has no stable identity")
         quiesced = await asyncio.wait_for(
-            service.deactivate_and_wait(loop_id),
+            service.deactivate_and_wait(loop_id, stopped_reason="orphaned_worker"),
             timeout=_ORPHAN_QUIESCE_TIMEOUT_SECS,
         )
         if not quiesced:
@@ -1011,18 +1011,25 @@ async def _effective_status(name: str, meta: dict, slot: Any) -> str:
     return "planning"
 
 
-async def _remove_nudge_loop(name: str, *, only_loop_id: Any = _UNPINNED) -> None:
+async def _remove_nudge_loop(
+    name: str, *, only_loop_id: Any = _UNPINNED, stop_reason: str = ""
+) -> None:
     """Remove this spec's autonudge loop, if any. Single site for the lookup so
     halt / delete / handoff-abort cannot drift apart.
 
     ``only_loop_id`` pins it to a loop the caller CAPTURED: the lookup is by slot
     key, which is derived from the name, so an unpinned removal on an abort path
     would cancel the loop belonging to a same-name spec created in the meantime.
+    ``stop_reason`` names the stop in the loop's WARNING stop line.
     """
-    await _remove_nudge_loop_for_slot(_slot_key(name), only_loop_id=only_loop_id)
+    await _remove_nudge_loop_for_slot(
+        _slot_key(name), only_loop_id=only_loop_id, stop_reason=stop_reason
+    )
 
 
-async def _remove_nudge_loop_for_slot(slot_key: str, *, only_loop_id: Any = _UNPINNED) -> None:
+async def _remove_nudge_loop_for_slot(
+    slot_key: str, *, only_loop_id: Any = _UNPINNED, stop_reason: str = ""
+) -> None:
     """Remove the pinned autonudge loop bound to an already-captured slot key."""
     if _autonudge_instance is None:  # pragma: no cover - present in prod
         return
@@ -1036,7 +1043,7 @@ async def _remove_nudge_loop_for_slot(slot_key: str, *, only_loop_id: Any = _UNP
         return
     loop = svc.get_by_slot(slot_key)
     if loop and (only_loop_id is _UNPINNED or getattr(loop, "id", None) == only_loop_id):
-        await svc.remove(loop.id)
+        await svc.remove(loop.id, stop_reason=stop_reason)
 
 
 #: One asyncio lock per spec, held across "is a turn running? -> claim pending ->
@@ -1466,7 +1473,7 @@ async def _halt_execution(
         # Not fatal: the two stops below are what actually end the run. Logged so an
         # operator can tell "no sentinel" from "sentinel ignored".
         logger.warning("spec %s: no stop sentinel written; halting by loop + turn", name)
-    await _remove_nudge_loop(name, only_loop_id=only_loop_id)
+    await _remove_nudge_loop(name, only_loop_id=only_loop_id, stop_reason="spec_stopped")
     # ...and stop the turn that is running RIGHT NOW. The sentinel and the loop
     # removal only prevent FUTURE nudges: the in-flight _run_chat kept going, so
     # Pause flipped the status to "planning" and returned ok while the agent

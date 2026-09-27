@@ -1753,7 +1753,9 @@ async def _handle_handoff(request: web.Request) -> web.Response:
         if loop_id:
             try:
                 await _remove_nudge_loop_for_slot(
-                    str(getattr(slot, "key", "")), only_loop_id=loop_id
+                    str(getattr(slot, "key", "")),
+                    only_loop_id=loop_id,
+                    stop_reason="spec_arm_aborted",
                 )
             except Exception:
                 # Best-effort HERE only: this is already an abort path, and the
@@ -3034,7 +3036,9 @@ async def _handle_stop_execution(request: web.Request) -> web.Response:
             for claimed_slot_key, claimed_loop_id in claimed_slot_keys.items():
                 if claimed_slot_key == captured_slot_key and claimed_loop_id == captured_loop_id:
                     continue
-                await _remove_nudge_loop_for_slot(claimed_slot_key, only_loop_id=claimed_loop_id)
+                await _remove_nudge_loop_for_slot(
+                    claimed_slot_key, only_loop_id=claimed_loop_id, stop_reason="spec_stopped"
+                )
             for extra_slot in stop_slots[1:]:
                 await _halt_active_turn(state, name, only_slot=extra_slot)
         except Exception:
@@ -3155,14 +3159,16 @@ async def _handle_delete(request: web.Request) -> web.Response:
         # Stop any execution loop; leave the .md files on disk (they are the user's
         # project files under .kiro/specs) — only drop app bookkeeping + the slot.
         try:
-            await _remove_nudge_loop(name, only_loop_id=doomed_loop_id)
+            await _remove_nudge_loop(name, only_loop_id=doomed_loop_id, stop_reason="spec_deleted")
             for claimed_slot_key, claimed_loop_id in claimed_slot_keys.items():
                 if (
                     claimed_slot_key == doomed_runtime_slot_key
                     and claimed_loop_id == doomed_loop_id
                 ):
                     continue
-                await _remove_nudge_loop_for_slot(claimed_slot_key, only_loop_id=claimed_loop_id)
+                await _remove_nudge_loop_for_slot(
+                    claimed_slot_key, only_loop_id=claimed_loop_id, stop_reason="spec_deleted"
+                )
         except Exception:
             # Fail the delete rather than report success: the entry is still in the
             # index, so a retry is meaningful, and the persisted loop cannot rearm

@@ -6805,7 +6805,7 @@ class GatewayOrchestrator:
                 "AutoNudge: slack session %s unroutable — removing loop %s", key, loop.id
             )
             if self.autonudge_svc and wake_message is None:
-                await self.autonudge_svc.remove(loop.id)
+                await self.autonudge_svc.remove(loop.id, stop_reason="slack_unroutable")
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         if wake_message is None:
             # Snapshot message, sentinel AND config generation TOGETHER, before
@@ -7145,18 +7145,24 @@ class GatewayOrchestrator:
             )
             return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
 
-        async def _retire(reason: str, *args: Any) -> bool | MonitorDispatchResult:
+        async def _retire(
+            stop_reason: str, reason: str, *args: Any
+        ) -> bool | MonitorDispatchResult:
             logger.warning("AutoNudge: " + reason, *args)
             if self.autonudge_svc and wake_message is None:
-                await self.autonudge_svc.remove(loop.id)
+                await self.autonudge_svc.remove(loop.id, stop_reason=stop_reason)
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
 
         parts = key.split(":")
         if len(parts) < 4 or parts[2] != "direct":
-            return await _retire("unsupported %s key %s, removing loop %s", channel, key, loop.id)
+            return await _retire(
+                "unsupported_key", "unsupported %s key %s, removing loop %s", channel, key, loop.id
+            )
         principal = parts[3]
         if not adapter.authorize(transport, dispatcher, principal):
-            return await _retire("%s user not authorized, removing loop %s", channel, loop.id)
+            return await _retire(
+                "user_not_authorized", "%s user not authorized, removing loop %s", channel, loop.id
+            )
         try:
             current_key = dispatcher.current_session_key(principal)
         except Exception:
@@ -7174,7 +7180,7 @@ class GatewayOrchestrator:
                 loop.id,
             )
             if self.autonudge_svc and wake_message is None:
-                await self.autonudge_svc.remove(loop.id)
+                await self.autonudge_svc.remove(loop.id, stop_reason="session_rotated")
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         sessions = getattr(dispatcher, "sessions", None)
         if sessions is not None and sessions.is_busy(key):
@@ -7480,7 +7486,9 @@ class GatewayOrchestrator:
                     loop.id,
                 )
                 if wake_message is None:
-                    await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
+                    await self.autonudge_svc.remove(  # type: ignore[union-attr]
+                        loop.id, stop_reason="session_unreachable"
+                    )
                 return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
             logger.info(
                 "AutoNudge: rehydrated session %s from history for loop %s",
@@ -7940,7 +7948,9 @@ class GatewayOrchestrator:
                     loop.slot_key,
                     loop.id,
                 )
-                await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
+                await self.autonudge_svc.remove(  # type: ignore[union-attr]
+                    loop.id, stop_reason="unsupported_channel"
+                )
                 return False
             result = await self._fire_dashboard_nudge(loop)
             assert isinstance(result, bool)

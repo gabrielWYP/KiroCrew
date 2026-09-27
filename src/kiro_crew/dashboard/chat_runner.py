@@ -7603,7 +7603,7 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
     elif _rest == "clear":
         _loop = _goal_svc.get_by_slot(slot.key)
         if _loop is not None:
-            await _goal_svc.remove(_loop.id)
+            await _goal_svc.remove(_loop.id, stop_reason="goal_cleared")
             body = "🎯 Goal cleared."
         else:
             body = "No active goal to clear."

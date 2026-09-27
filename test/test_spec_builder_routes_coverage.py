@@ -1459,8 +1459,8 @@ class TestRemoveNudgeLoop:
     async def test_an_unpinned_removal_takes_whatever_loop_is_there(self):
         patcher = _autonudge(SimpleNamespace(id="loop-7"))
         with patcher:
-            await r._remove_nudge_loop("demo")
-        patcher.svc.remove.assert_awaited_once_with("loop-7")  # type: ignore[attr-defined]
+            await r._remove_nudge_loop("demo", stop_reason="spec_deleted")
+        patcher.svc.remove.assert_awaited_once_with("loop-7", stop_reason="spec_deleted")  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_a_pin_that_does_not_match_the_live_loop_removes_nothing(self):

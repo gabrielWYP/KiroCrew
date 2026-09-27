@@ -184,6 +184,24 @@ def test_deactivation_is_logged_at_warning(tmp_path, caplog):
     )
 
 
+def test_maintenance_deactivation_logs_the_callers_reason(tmp_path):
+    """Spec Builder's orphan cleanup quiesces through the maintenance view."""
+
+    async def body():
+        svc = AutoNudgeService(base_dir=tmp_path)
+        loop = await svc.add("chat-9", "tick", idle_secs=60)
+        _an._INSTANCE = svc
+        async with AutoNudgeService.maintenance_service(base_dir=tmp_path) as view:
+            assert await view.deactivate_and_wait(loop.id, stopped_reason="orphaned_worker")
+            await view.remove(loop.id)
+        svc.stop()
+        return loop.id
+
+    loop_id = _run(body())
+    [rec] = _records(tmp_path)
+    assert (rec["loop_id"], rec["reason"]) == (loop_id, "orphaned_worker")
+
+
 def test_removed_legacy_loop_keeps_the_agents_reason(tmp_path):
     async def body():
         svc = AutoNudgeService(base_dir=tmp_path)

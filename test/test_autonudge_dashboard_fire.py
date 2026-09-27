@@ -505,7 +505,9 @@ class TestDashboardNudgeSlotResolution:
             caplog.at_level(logging.WARNING, logger=gw.logger.name),
         ):
             assert await orch._fire_dashboard_nudge(loop) is False
-        orch.autonudge_svc.remove.assert_awaited_once_with(loop.id)
+        orch.autonudge_svc.remove.assert_awaited_once_with(
+            loop.id, stop_reason="session_unreachable"
+        )
         assert spawn.calls == []
         assert loop.slot_key in caplog.text
         assert "unreachable" in caplog.text
