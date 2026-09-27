@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
-from kiro_crew import name_grant
+from kiro_crew import name_grant, runtime_death
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
 from kiro_crew.acp.types import (
     STOP_REASON_CANCELLED,
@@ -151,7 +151,7 @@ from kiro_crew.security import (
     redact_local_paths,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session import SessionClosingError, SessionManager
+from kiro_crew.session import _CIRCUIT_BREAKER_THRESHOLD, SessionClosingError, SessionManager
 from kiro_crew.slack.blocks import build_working_blocks, deprecation_warning_block
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.format import (
@@ -4717,7 +4717,36 @@ async def handle_message(
         _had_error = True
         accumulated = accumulated or "💀 Agent process died. Please try again."
         task.fail("process_died")
-        await sessions.record_failure(session_key)
+        # The circuit breaker counts a session's OWN consecutive failures, and
+        # trips into a reset. A process this session was sharing dying is not
+        # this session's failure, and counting it there is how N co-tenants each
+        # marched their own breaker toward tripping over one process event. The
+        # death was classified once where it was detected; this reads that record.
+        # A single-tenant runtime is charged exactly as before.
+        if runtime_death.caused_by_this_session(client):
+            await sessions.record_failure(session_key)
+        else:
+            # Bounded, like every other exemption: the breaker is what resets a
+            # session whose runtime keeps dying, so an unbounded skip would leave
+            # a session on a permanently dying shared process never recovering.
+            # The streak is counted against that runtime rather than the session,
+            # and the breaker is allowed to trip once it reaches the same limit.
+            _shared_streak = runtime_death.note_shared_death(session_key)
+            if _shared_streak >= _CIRCUIT_BREAKER_THRESHOLD:
+                logger.warning(
+                    "session %s: the runtime it shares has died %d times running — "
+                    "counting this one so the breaker can still trip",
+                    session_key,
+                    _shared_streak,
+                )
+                await sessions.record_failure(session_key)
+            else:
+                logger.warning(
+                    "session %s lost a turn to a SHARED runtime's death (%d running) — "
+                    "not counting it toward the circuit breaker",
+                    session_key,
+                    _shared_streak,
+                )
         Stats().inc_message_failed()
     except AcpPromptBusy as e:
         _had_error = True
@@ -4851,6 +4880,11 @@ async def handle_message(
                 return
             _verdict_booked = True
             sessions.record_success(session_key)
+            # Reset with the counter it substitutes for: record_success clears
+            # consecutive_failures, so a completed turn must clear the shared-death
+            # streak too. Otherwise the streak is a LIFETIME total and the bound
+            # stays permanently tripped, silently ending the exemption.
+            runtime_death.clear_shared_deaths(session_key)
             Stats().inc_message_success()
             if client is not None:
                 record_interaction_event(client, session_key, "slack")
