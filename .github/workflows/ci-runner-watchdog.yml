@@ -52,19 +52,36 @@ name: CI Runner Watchdog
 # cost at most 40 calls per tick: eight pages for each of three live statuses,
 # plus 16 cancelled pages.
 # Heal safety never reads this job's checkout. A workflow clears
-# TWO gates: HEAL_SAFE_WORKFLOWS declares it safe, and its run-level concurrency
-# group references `github.ref`, `github.ref_name`, `github.head_ref`, or the pull
-# request number while its YAML carries no publish or deploy signal. Every DECLARED
-# entry is ref-keyed, because the successor guard filters by head branch and never
-# by pull-request number, so the five PR-keyed workflows are watched and classified
-# but never auto-healed: four of the fifteen are. Package or
+# TWO gates: it is DECLARED safe, and its run-level concurrency group is keyed the
+# way its successor check needs while its YAML carries no publish or deploy signal.
+# There are two declarations. HEAL_SAFE_WORKFLOWS is ref-keyed (`github.ref`,
+# `github.ref_name`, `github.head_ref`) and covers every event: a push run's
+# successor is judged by the branch listing, which filters by head branch and never
+# by pull-request number. HEAL_SAFE_PULL_REQUEST_WORKFLOWS is PR-keyed
+# (`<name>-${{ github.event.pull_request.number }}`) and covers pull-request runs
+# only: a pull-request run's successor is judged by HEAD SHA against the open pull
+# requests on its branch (one `pulls?head=` read) and then by the branch listing for
+# a newer run at that same SHA (`labeled`, `edited`, `reopened` start one, and the
+# group cancels the older run) -- a same-SHA newer run counts as the successor when
+# both payloads name the same pull request, as a sibling's on a shared head branch
+# when they name different ones, and when either names none it FAILS CLOSED: the
+# run is left untouched (judged before its cancel), the tick reds and names both
+# runs. Not resolved by watching the group's own cancel: every orphan lives in a
+# fleet outage where the run to watch stays queued and nothing settles, and a green
+# resting on unobserved provider behaviour is the false green this script must
+# never produce. A successor is restored only when identified as the same pull
+# request's; a same-SHA run or a head move that appears after the re-run started
+# withdraws the re-run and reds the tick, naming the head. The one green path that
+# touches a group -- cancel then re-run of a run judged current with no newer run
+# at its SHA -- is the push path's, unchanged. On a push the PR number is empty and such a group is a
+# constant, so a push run of a PR-keyed workflow stays exempt. Package or
 # release publishing, Pages deployment, Docker pushes, S3 or CodeArtifact
 # publishing, signing/notarization, a job-level `environment:`, and `pages: write`,
 # `packages: write`, or `deployments: write` require human recovery.
-# `id-token: write` alone is ordinary OIDC authentication. `HEAL_SAFE_WORKFLOWS`
-# in the script is the membership and a partition test pins it against
-# WATCHED_WORKFLOWS, so read the set rather than a count here: prose restating a
-# pinned set goes stale in silence. A workflow lands outside it by publishing, by
+# `id-token: write` alone is ordinary OIDC authentication. The two sets
+# in the script are the membership and a partition test pins them against
+# WATCHED_WORKFLOWS, so read the sets rather than a count here: prose restating a
+# pinned set goes stale in silence. A workflow lands outside both by publishing, by
 # a per-commit or per-run concurrency key, by having no run-level group, or by a
 # constant group. Exempt runs stay classified, logged, and named in the summary
 # with `human-required-heal-exempt-workflow`; they are never cancelled or re-run.
@@ -199,7 +216,10 @@ name: CI Runner Watchdog
 #     hand first), is logged and skipped;
 #   - `dry_run` performs every read and no write.
 #
-# Recovery covers pull-request runs as well as pushes: a heal whose cancel
+# Recovery covers pull-request runs as well as pushes, and so do live heals: a
+# pull-request run is judged current by head SHA (its SHA is the head of an open
+# pull request on its branch); one whose head moved is superseded, one whose pull
+# request closed is cancelled and never re-run. A heal whose cancel
 # outlives the budget leaves the run cancelled with nobody to re-run it, which
 # is exactly what the pass exists for. Its fingerprint (a cancelled
 # `codebuild-` job that never had a runner and queued past the threshold) is
@@ -244,6 +264,7 @@ on:
 permissions:
   actions: write        # cancel and re-run workflow runs
   contents: read        # check out the script
+  pull-requests: read   # `pulls?head=` read that judges a pull-request run current
 
 env:
   # The arming flip. While "false", every SCHEDULED tick is a dry run: it

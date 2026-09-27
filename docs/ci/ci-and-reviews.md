@@ -839,13 +839,13 @@ Details worth knowing:
     them unspent. Spending the whole bound oldest first would
     leave a backlogged sweep unable to tell a dead fleet from a busy one, so it
     would heal nothing exactly when the watchdog is needed. Ranking inside the classify
-    slice puts the heal-eligible shape first — a `push` run of a heal-safe workflow,
-    the only shape a heal can act on, AND past the orphan threshold — then oldest
-    within each class, because age alone hands those slots to runs no heal will ever
-    touch: 220 watched live runs
-    sat past the orphan threshold on 2026-09-24 and 18 past a day, the oldest 36
-    days, every one of them a pull-request run that stays listed and re-reads the
-    same slot on every tick. The log names the
+    slice puts the heal-eligible shape first — a same-repository `push` or
+    `pull_request` run of a workflow declared heal-safe for that event, AND past the
+    orphan threshold — then oldest within each class, because age alone hands those
+    slots to runs no heal will ever touch: 220 watched live runs sat past the orphan
+    threshold on 2026-09-24 and 18 past a day, the oldest 36 days, runs that stay
+    listed and re-read the same slot on every tick (a fork's run, or a closed pull
+    request's, which the heal now cancels rather than re-reads). The log names the
     bound when other runs wait for the
     next tick. Cancelled recovery reads at most ten pages, the same as the live
     listings, because GitHub caps a status-filtered runs listing at 1000 results —
@@ -883,19 +883,46 @@ Details worth knowing:
     say whether it honours that. A workflow clears TWO heal-safety gates. The
     declared gate is `HEAL_SAFE_WORKFLOWS`, a written judgement that a full
     re-run is safe, and it is the LOAD-BEARING one: a workflow joining the
-    watched set is exempt until a person puts it there. Every declared entry is
-    REF-KEYED, which is a requirement: the successor guard filters by head branch,
-    event and head repository, never by pull-request number, and two pull requests
-    can share a head branch, so for a PR-keyed group another PR's newer run would
-    read as this run's successor. The five PR-keyed workflows are therefore watched
-    and classified but never auto-healed. A declared entry must also have a trigger
-    a heal can REACH: pull-request runs are never healed, so `macos-on-demand.yml`,
-    whose only trigger is `pull_request`, is exempt as well -- declaring it would
-    read as coverage no run could use, and a test enforces that. Three of the
-    fifteen are auto-healed.
+    watched set is exempt until a person puts it there. There are two declared
+    sets, keyed the way their successor check needs. `HEAL_SAFE_WORKFLOWS` is
+    REF-KEYED and covers every event: a push run's successor is the newest run of
+    its branch in the runs listing, which filters by head branch, event and head
+    repository, never by pull-request number. `HEAL_SAFE_PULL_REQUEST_WORKFLOWS` is
+    PR-KEYED and covers pull-request runs only: a pull-request run is judged by HEAD
+    SHA — one `pulls?head=owner:branch&state=open` read says which SHAs the open
+    pull requests on the branch have — and then by the branch listing for a newer
+    run AT that SHA. Superseded when the head moved (its successor is the newest
+    listed run at an open head) or when no open pull request has the branch
+    (nothing to restore; a live orphan is cancelled and not re-run). A newer run at
+    the SAME SHA — `labeled`, `unlabeled`, `edited` and `reopened` each start one,
+    and every declared pull-request workflow cancels the run in progress when it
+    arrives — is the successor when both payloads name the same pull request,
+    a sibling pull request's run (shared head branch, its own group) when they name
+    different ones, and when either names none the listing cannot say and the
+    watchdog fails closed: the run is left untouched (a live pull-request orphan is
+    judged before its cancel, so nothing is cancelled that nobody can then re-run),
+    the tick reds and names both runs. It deliberately does not resolve that case by
+    watching the group's own cancel: every orphan this script meets exists during a
+    fleet outage, where the run to watch stays queued and observation cannot settle,
+    and a green resting on an unobserved provider behaviour is the false green this
+    script must never produce. A successor is restored only when identified as the
+    same pull request's; a same-SHA run of unknown pull request, or a head move with
+    no identifiable successor, that appears after the re-run started withdraws the
+    re-run and reds the tick naming the head, rather than restore a sibling's run and
+    hide the loss. The one green path that touches a concurrency group — cancel, then
+    re-run of a run judged current with no newer run at its SHA — is the path push
+    runs already take. That is the only use of `pull_requests[].number`
+    on the run payload; the head question never depends on it (most same-repository
+    runs lack it). On a push
+    the PR number is empty and a PR-keyed group is a constant, so a push run of a
+    PR-keyed workflow is exempt; a test pins every PR-keyed entry pull-request-only.
+    `macos-on-demand.yml`, ref-keyed and pull-request-only, is declared: its runs
+    are pull-request runs, which are healed, and a test pins that every declared
+    workflow has a trigger a heal can act on. Nine of the fifteen are auto-healed.
     The derived gate is
     BEST-EFFORT. It requires a run-level concurrency group
-    keyed on `github.ref`, `github.ref_name` or `github.head_ref`, which is a
+    keyed on `github.ref`, `github.ref_name` or `github.head_ref` — or, for a
+    pull-request run and only then, on the pull-request number — which is a
     structural fact it reads
     reliably, and it rejects the publish and deploy spellings it knows: package
     or release

@@ -140,8 +140,10 @@ which looks at recently *cancelled* runs (within ``Policy.recovery_window``,
 90 minutes), obeys the same saturation/outage hold as the live pass, recognises
 the orphan shape on their cancelled jobs (a ``codebuild-`` label, no runner
 name, queued past the threshold when cancelled), and re-runs them only when
-they are still the newest run of their branch. This makes the pass safe for a
-pull-request run superseded by a newer push.
+they still carry their branch's verdict: a push run when it is the newest run of
+its branch, a pull-request run when its head SHA is the head of an open pull
+request on its branch. A run superseded by a newer push, or of a closed pull
+request, is left cancelled.
 
 Guard rails
 -----------
@@ -261,28 +263,48 @@ _WATCHED_SET = frozenset(WATCHED_WORKFLOWS)
 # declared workflow's content instead would expire the declaration on every edit
 # to ci.yml or fast-gate.yml, the most-edited files here.
 #
-# Every entry is REF-KEYED, and that is a requirement rather than a coincidence.
-# Healing is cancel plus a full re-run, whose only protection against cancelling a
-# live successor is the newest-of-branch check, and that check filters by head
-# branch, event and head repository -- never by pull-request number. Two pull
-# requests can share a head branch (different base branches), so for a PR-KEYED
-# concurrency group another PR's newer run would be read as this run's successor
-# and the cancelled verdict would be left unrestored. Scoping the check to the PR
-# number would need a fourth mechanism to decide which workflows are PR-keyed; the
-# gate that already exists answers it by declaring fewer workflows instead, so
-# code-review.yml, cross-platform.yml, dependency-review.yml, pr-scope.yml and
-# screenshot-evidence.yml are watched and classified but never auto-healed.
+# Every entry here is REF-KEYED, and that is a requirement rather than a
+# coincidence. Healing is cancel plus a full re-run, whose only protection against
+# cancelling a live successor is the successor check. For a PUSH run that check is
+# the newest-of-branch listing, which filters by head branch, event and head
+# repository -- never by pull-request number. Two pull requests can share a head
+# branch (different base branches), so for a PR-KEYED concurrency group another
+# PR's newer run would be read as a push run's successor. A push run of a PR-keyed
+# workflow has no group at all (`github.event.pull_request.number` is empty on a
+# push), so such a workflow can only ever be healed on its pull-request runs, and
+# it is declared in HEAL_SAFE_PULL_REQUEST_WORKFLOWS below instead.
 #
-# A declared entry must also have a trigger a heal can reach. Pull-request runs are
-# never healed (see SKIPPED_PULL_REQUEST), so a workflow triggered ONLY by
-# `pull_request` -- macos-on-demand.yml is one -- could be declared here and still
-# never produce a single healable run. Such an entry reads as coverage that does not
-# exist, so it stays out and a test enforces that.
+# `macos-on-demand.yml` is ref-keyed and triggered only by `pull_request`. Its
+# runs are pull-request runs, which are healed (see `current_or_successor_id`), so
+# the declaration is reachable; a test pins that every declared workflow has a
+# trigger a heal can act on.
 HEAL_SAFE_WORKFLOWS: frozenset[str] = frozenset(
     {
         "build.yml",
         "ci.yml",
         "fast-gate.yml",
+        "macos-on-demand.yml",
+    }
+)
+# Declared heal-safe for PULL-REQUEST runs only. Every entry is PR-KEYED
+# (`<name>-${{ github.event.pull_request.number }}`, `cancel-in-progress: true`)
+# and triggered only by `pull_request`, so no push run of these exists to judge by
+# branch name. A pull-request run's successor is judged by HEAD SHA against the
+# open pull requests on its head branch, then by the listing for a newer run AT
+# that SHA (`current_or_successor_id`): a check indifferent to how the group is
+# keyed, and one that two pull requests sharing a branch cannot confuse when the
+# payloads name their pull requests, and that fails closed when they do not.
+# The derived gate admits the PR-number key for a pull-request run and only then.
+# None of these publish, deploy or sign; a test pins each one PR-keyed and
+# pull-request-only so a workflow that grows a `push` trigger falls back to exempt
+# until somebody moves it.
+HEAL_SAFE_PULL_REQUEST_WORKFLOWS: frozenset[str] = frozenset(
+    {
+        "code-review.yml",
+        "cross-platform.yml",
+        "dependency-review.yml",
+        "pr-scope.yml",
+        "screenshot-evidence.yml",
     }
 )
 _PUBLISH_OR_DEPLOY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
@@ -300,13 +322,35 @@ _PUBLISH_OR_DEPLOY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\b(?:sign-and-notarize\.yml|notarytool\b|codesign\b|signtool\b|cosign\s+sign\b|aws\s+signer\b)",
     )
 )
-# A REF-keyed run-level concurrency group, and only that. A PR-keyed group is
-# deliberately not accepted: the successor check filters the runs listing by branch
-# NAME, so it cannot tell one pull request's run from another's on a shared head
-# branch, which is why pull-request runs are never healed and why every declared
-# heal-safe workflow must be ref-keyed. Admitting `event.pull_request.number` here
-# would let the derived gate bless a workflow the declaration's own test forbids.
+# A REF-keyed run-level concurrency group. This is what a PUSH run needs: its
+# successor check filters the runs listing by branch NAME, so a PR-keyed group
+# cannot tell one pull request's run from another's on a shared head branch.
 _BRANCH_GROUP_SIGNAL = re.compile(r"\bgithub\.(?:ref(?:_name)?|head_ref)\b")
+# A PR-keyed group. Admitted for a PULL-REQUEST run and only then: its successor is
+# judged by head SHA against the open pull requests on the branch, not by the
+# listing, so how the group is keyed does not enter that judgement. On a push the
+# PR number is empty and the group degenerates to a constant, which is why a push
+# run never gets this signal.
+_PULL_REQUEST_GROUP_SIGNAL = re.compile(r"\bgithub\.event\.(?:pull_request\.)?number\b")
+# The open pull requests on a head branch are read one page deep. A branch with
+# more open pull requests than this is not a shape this repository has, and a
+# full page is treated as "cannot tell" rather than trusted as complete.
+PULL_REQUEST_LISTING_DEPTH = 30
+# What `current_or_successor_id` answers for a pull-request run whose pull request
+# is CLOSED or merged: no open pull request has its branch as head. Negative, so it
+# never collides with a run id. A re-run that lands on this is cancelled again and
+# nothing is restored, because no run anyone wants exists for it to have displaced.
+SUPERSEDED_WITHOUT_SUCCESSOR = -2
+# A pull-request run whose head MOVED while its pull request stays open: either the
+# newer runs at the open head cannot be identified as the same pull request's (the
+# payloads name no pull request), or none is listed yet. Superseded for every
+# judgement made BEFORE a mutation -- nothing at the old head is worth re-running --
+# but never a successor anyone may restore: restoring a sibling's run would leave
+# the same pull request's run, cancelled through the group, unrestored and
+# unreported, and an unlisted run may exist and have been cancelled the same way.
+# A re-run that finds this AFTER it started is withdrawn and reported FAILED, naming
+# the head, since what its group displaced cannot be told.
+SUPERSEDED_SUCCESSOR_UNIDENTIFIED = -3
 # The watchdog's own workflow, never watched: its comment names the fleet label.
 WATCHDOG_WORKFLOW = "ci-runner-watchdog.yml"
 # A rate-limited call whose window resets within this many seconds, and inside
@@ -459,17 +503,13 @@ CANCELLED_ORPHAN = "cancelled-orphan"
 HEALTHY = "healthy"
 SKIPPED_YOUNG = "skipped-young"
 SKIPPED_FORK = "skipped-fork"
-# A pull-request run: reported, never automatically healed. The successor check
-# asks "is a NEWER run of this branch in flight?", and GitHub's runs listing can
-# only be filtered by branch name, so two pull requests open on the same head
-# branch make each other look like successors -- which would abandon a cancelled
-# orphan behind a green `skipped-superseded`. Matching by pull-request number
-# instead is not available: of 20 sampled same-repository `pull_request` runs only
-# 9 carried `pull_requests[].number`, so that path would fail closed on most PR
-# runs and red the schedule for a healthy repo. Reported like a fork run, and green
-# for the same reason: its owner is looking at their own pull request's checks,
-# unlike a `main` orphan, which is the blindness this watchdog exists to end.
-SKIPPED_PULL_REQUEST = "skipped-pull-request-successor-unknown"
+# Pull-request runs are healed like push runs. Their successor is judged by head
+# SHA against the open pull requests on the head branch, then by the listing for a
+# newer run at that same SHA (`current_or_successor_id`). The head question is
+# answered from the pulls API by branch, never from `pull_requests[].number` on the
+# run payload (of 20 sampled same-repository runs only 9 carried it); that field is
+# consulted only to tell a same-SHA newer run's pull request from the judged run's,
+# and its absence fails that one question closed.
 SKIPPED_ATTEMPT_CAP = "skipped-attempt-cap"
 SKIPPED_SUPERSEDED = "skipped-superseded"
 SKIPPED_SATURATED = "skipped-saturated"
@@ -511,6 +551,13 @@ OUTCOME_SUCCESSOR_LOST = "superseded-after-rerun-successor-lost"
 OUTCOME_SUCCESSOR_UNSETTLED = "superseded-after-rerun-successor-unsettled"
 OUTCOME_OWN_RERUN_UNCANCELLED = "superseded-after-rerun-own-rerun-still-running"
 OUTCOME_SUCCESSOR_SUPERSEDED = "superseded-after-rerun-successor-superseded-too"
+# A pull-request run re-run by this script and then found to belong to a CLOSED
+# pull request. The re-run is cancelled again (it serves a head nobody wants) and
+# nothing is restored: no open pull request has a run it could have displaced. Not
+# a failed outcome: no verdict is lost. A head that moved while the pull request
+# stays open is NOT this case; that is `OUTCOME_LOOKUP_FAILED`, since the re-run may
+# have displaced the run at the new head.
+OUTCOME_RERUN_WITHDRAWN = "superseded-after-rerun-pull-request-closed"
 OUTCOME_LOOKUP_FAILED = "branch-lookup-inconclusive"
 
 OUTCOME_CANCEL_FAILED = "cancel-failed"
@@ -826,6 +873,11 @@ class RunVerdict:
     verdict: str
     workflow: str
     head_sha: str = ""
+    # The pull requests the run payload names, when it names any. Carried only so a
+    # newer run at the SAME head SHA can be told to be the same pull request's (its
+    # successor) or a sibling's on a shared head branch; absent on most same-repo
+    # runs, in which case that question fails closed.
+    pull_request_numbers: tuple[int, ...] = ()
     revision_heal_safe: bool = False
     orphans: list[OrphanedJob] = field(default_factory=list)
     detail: str = ""
@@ -939,14 +991,25 @@ def _workflow_without_full_line_comments(raw: str) -> str:
     return "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("#"))
 
 
-def workflow_has_ref_or_pr_concurrency(text: str) -> bool:
-    """Whether the run-level concurrency group names a ref or pull request."""
+def workflow_has_ref_or_pr_concurrency(text: str, *, event: str = "push") -> bool:
+    """Whether the run-level concurrency group names a ref, or -- for a pull-request
+    run -- a pull-request number.
+
+    The event decides which key is enough. A push run's successor is judged by the
+    branch listing, so its group must be ref-keyed. A pull-request run's successor is
+    judged by head SHA against the open pull requests on its branch, which does not
+    depend on the group at all, so the PR-number key is admitted for it; on a push
+    that key is empty and the group a constant, so it is never admitted there.
+    """
     groups = [
         value.partition("#")[0]
         for keys, value in _yaml_mapping_entries(text)
         if keys == ("concurrency", "group") or (keys == ("concurrency",) and value)
     ]
-    return any(_BRANCH_GROUP_SIGNAL.search(group) for group in groups)
+    signals: tuple[re.Pattern[str], ...] = (_BRANCH_GROUP_SIGNAL,)
+    if event == "pull_request":
+        signals = (_BRANCH_GROUP_SIGNAL, _PULL_REQUEST_GROUP_SIGNAL)
+    return any(signal.search(group) for group in groups for signal in signals)
 
 
 def workflow_text_has_publish_or_deploy_step(raw: str) -> bool:
@@ -971,19 +1034,32 @@ def workflow_text_has_publish_or_deploy_step(raw: str) -> bool:
     )
 
 
-def workflow_text_is_heal_safe(raw: str) -> bool:
-    """Whether workflow text is branch-scoped and free of durable side effects."""
+def workflow_text_is_heal_safe(raw: str, *, event: str = "push") -> bool:
+    """Whether workflow text is branch-scoped (for this event) and free of durable side effects."""
     text = _workflow_without_full_line_comments(raw)
     return workflow_has_ref_or_pr_concurrency(
-        text
+        text, event=event
     ) and not workflow_text_has_publish_or_deploy_step(text)
+
+
+def heal_safe_declared(workflow: str, event: str) -> bool:
+    """The DECLARED gate for one run: is this workflow declared heal-safe for this event.
+
+    A ref-keyed declaration covers every event, pull-request runs included. A
+    PR-keyed declaration covers pull-request runs only: on any other event the PR
+    number is empty, so the workflow has no concurrency group and nothing protects
+    a re-run of it from a live successor; such a run stays exempt.
+    """
+    if workflow in HEAL_SAFE_WORKFLOWS:
+        return True
+    return workflow in HEAL_SAFE_PULL_REQUEST_WORKFLOWS and event == "pull_request"
 
 
 def heal_exempt_workflows(
     workflows: tuple[str, ...] = WATCHED_WORKFLOWS,
-    heal_safe: frozenset[str] = HEAL_SAFE_WORKFLOWS,
+    heal_safe: frozenset[str] = HEAL_SAFE_WORKFLOWS | HEAL_SAFE_PULL_REQUEST_WORKFLOWS,
 ) -> frozenset[str]:
-    """Watched workflows that require human recovery: everything not declared heal-safe.
+    """Watched workflows that require human recovery: everything declared safe for NO event.
 
     Classification reads the declaration alone. The YAML itself is read at the
     RUN'S OWN revision, by ``workflow_is_heal_safe_at_revision``, immediately
@@ -991,14 +1067,18 @@ def heal_exempt_workflows(
     weaker subject: a branch can change a group or add publishing, and the
     checkout cannot see that. Anything the checkout read would have stopped, the
     revision read stops too, before a run is touched.
+
+    A workflow declared safe for pull-request runs only is NOT in this set; its
+    push runs are marked exempt per run by ``_mark_heal_exempt`` through
+    ``heal_safe_declared``, which sees the event.
     """
     return frozenset(workflow for workflow in workflows if workflow not in heal_safe)
 
 
 def workflow_is_heal_safe_at_revision(
-    api: Api, repo: str, workflow: str, head_sha: str
+    api: Api, repo: str, workflow: str, head_sha: str, *, event: str = "push"
 ) -> bool | None:
-    """Whether a workflow is heal-safe AT ONE RUN'S OWN revision.
+    """Whether a workflow is heal-safe AT ONE RUN'S OWN revision, for that run's event.
 
     Three answers, because a declared-unsafe workflow and one whose safety cannot
     be established are not the same fact and must not share an outcome. ``False``
@@ -1010,7 +1090,7 @@ def workflow_is_heal_safe_at_revision(
 
     Either way nothing is cancelled or re-run: only ``True`` admits a mutation.
     """
-    if workflow not in HEAL_SAFE_WORKFLOWS:
+    if not heal_safe_declared(workflow, event):
         return False
     if not head_sha:
         return None
@@ -1031,7 +1111,7 @@ def workflow_is_heal_safe_at_revision(
         raw = base64.b64decode(encoded, validate=True).decode("utf-8")
     except (UnicodeError, ValueError):
         return None
-    return workflow_text_is_heal_safe(raw)
+    return workflow_text_is_heal_safe(raw, event=event)
 
 
 def _mark_heal_exempt(verdict: RunVerdict, exempt_workflows: frozenset[str]) -> RunVerdict:
@@ -1042,7 +1122,12 @@ def _mark_heal_exempt(verdict: RunVerdict, exempt_workflows: frozenset[str]) -> 
     # no outcome. The label the summary shows becomes `heal-exempt`; the attempt is
     # kept in the detail so the escalation reason is not lost. Forks are left alone:
     # nobody's token can re-run one, which is a more specific answer than exemption.
-    if verdict.workflow in exempt_workflows and verdict.verdict in (
+    # A workflow declared safe for pull-request runs only is exempt on its push runs
+    # (`heal_safe_declared`), so the event is consulted alongside the set.
+    exempt = verdict.workflow in exempt_workflows or not heal_safe_declared(
+        verdict.workflow, verdict.event
+    )
+    if exempt and verdict.verdict in (
         ORPHANED,
         CANCELLED_ORPHAN,
         SKIPPED_ATTEMPT_CAP,
@@ -1080,7 +1165,18 @@ def _base_verdict(run: dict[str, Any], now: datetime) -> RunVerdict:
         verdict=HEALTHY,
         workflow=workflow,
         head_sha=_safe_text(run.get("head_sha")),
+        pull_request_numbers=_pull_request_numbers(run),
     )
+
+
+def _pull_request_numbers(run: dict[str, Any]) -> tuple[int, ...]:
+    """The pull-request numbers a run payload names; empty when it names none."""
+    numbers: list[int] = []
+    for pull in run.get("pull_requests") or []:
+        number = (pull or {}).get("number") if isinstance(pull, dict) else None
+        if isinstance(number, int):
+            numbers.append(number)
+    return tuple(sorted(set(numbers)))
 
 
 def _guard(
@@ -1091,14 +1187,10 @@ def _guard(
         verdict.verdict = SKIPPED_FORK
         verdict.detail = "head repository is a fork; the workflow token cannot re-run it"
         return verdict
-    if verdict.event == "pull_request":
-        verdict.verdict = SKIPPED_PULL_REQUEST
-        verdict.detail = (
-            "a pull-request run: whether a listed run of this branch is really this run's "
-            "successor cannot be established, because the runs listing filters by branch name "
-            "and two pull requests can share one head branch; re-running is not attempted"
-        )
-        return verdict
+    # A pull-request run passes here like a push run. Its successor check is by
+    # head SHA against the open pull requests on its branch, then by the listing for
+    # a newer run at that SHA (`current_or_successor_id`), asked immediately before
+    # the cancel (`_supersession_is_answerable`) and again before the re-run.
     if verdict.run_attempt >= policy.max_attempt:
         verdict.verdict = SKIPPED_ATTEMPT_CAP
         verdict.detail = (
@@ -1158,9 +1250,10 @@ def classify_cancelled_run(
 
     A cancelled job that never had a runner keeps the orphan's fingerprint: a
     ``codebuild-`` label, an empty runner name, and a queue wait (creation to
-    completion) past the threshold. Only the newest run of its branch is worth
-    re-running: anything older has been superseded and, on a pull request,
-    re-running it would cancel its successor through the concurrency group.
+    completion) past the threshold. Only the run that still carries its branch's
+    verdict is worth re-running (``current_or_successor_id``): anything superseded
+    would, re-run, only cancel its successor through the concurrency group, and a
+    closed pull request's run has nobody left to want its result.
     """
     verdict = _base_verdict(run, policy.now)
     updated = parse_timestamp(str(run.get("updated_at") or run["created_at"]))
@@ -1196,7 +1289,8 @@ def classify_cancelled_run(
     if not newest:
         verdict.verdict = SKIPPED_SUPERSEDED
         verdict.detail = (
-            "a newer run exists for this branch; re-running this one would only cancel it"
+            "a newer run exists for this branch, or its pull request has closed; re-running "
+            "this one would only cancel a successor or serve a head nobody wants"
         )
         return verdict
     verdict = _guard(verdict, run, policy, CANCELLED_ORPHAN)
@@ -1510,17 +1604,25 @@ def list_all_candidate_runs(
     return runs
 
 
-def _heal_eligible_shape(run: dict[str, Any]) -> bool:
+def _heal_eligible_shape(run: dict[str, Any], repo: str) -> bool:
     """Whether a listed run has a SHAPE a heal could act on, from the listing alone.
 
     Priority only, never authorization. Every real gate still runs afterwards and
     can still refuse: the workflow's concurrency group read at the run's own
-    revision, the newest-of-branch check, the saturation hold. What this reads is
-    the pair those gates cannot reverse -- a ``push`` event, because the successor
-    check filters the runs listing by branch NAME and so a pull-request run is
-    never healed, and a declared heal-safe workflow.
+    revision, the successor check, the saturation hold. What this reads is what
+    those gates cannot reverse -- an event a heal can act on (``push`` or
+    ``pull_request``), a head repository that is this one (no token can re-run a
+    fork's run), and a workflow declared heal-safe for that event. All three are on
+    the listing row, so the ranking costs no read.
     """
-    return _safe_text(run.get("event")) == "push" and _workflow_of(run) in HEAL_SAFE_WORKFLOWS
+    event = _safe_text(run.get("event"))
+    workflow = _workflow_of(run)
+    return (
+        event in {"push", "pull_request"}
+        and not is_fork_run(run, repo)
+        and workflow is not None
+        and heal_safe_declared(workflow, event)
+    )
 
 
 def _can_carry_a_slow_start(run: dict[str, Any], policy: Policy) -> bool:
@@ -1647,11 +1749,12 @@ def live_runs_within_read_bound(
     alone
     ranks by age, and the oldest live runs at this repository are runs no heal can
     ever act on: measured on this repository, 220 watched live runs sit past the
-    orphan threshold and 18 past a day, the oldest 36 days, every one of them a
-    pull-request run that stays listed and therefore re-reads the same slots on
-    every tick. A ``push`` run of a heal-safe workflow -- the only kind that can
-    be cleared, and the kind that holds a branch's concurrency slot while it is
-    stuck -- ranked 30th of 40 slots at six hours old. That margin shrinks as
+    orphan threshold and 18 past a day, the oldest 36 days, runs that stay listed
+    and therefore re-read the same slots on every tick -- a fork's, which no token
+    can re-run, or a closed pull request's, which is cancelled and not re-read. A
+    same-repository run of a workflow declared heal-safe for its event -- the only
+    kind that can be cleared, and the kind that holds a branch's concurrency slot
+    while it is stuck -- ranked 30th of 40 slots at six hours old. That margin shrinks as
     zombies accumulate, so age is the ordering WITHIN each class rather than
     across them.
 
@@ -1700,7 +1803,7 @@ def live_runs_within_read_bound(
         # shape alone would let the youngest pushes outrank an orphan that has been
         # stuck for hours. They are still read, just not ahead of it.
         return (
-            _heal_eligible_shape(run)
+            _heal_eligible_shape(run, policy.repo)
             and policy.now - parse_timestamp(str(run["created_at"])) >= policy.orphan_after
         )
 
@@ -1796,7 +1899,15 @@ def list_jobs(api: Api, repo: str, run_id: int) -> list[dict[str, Any]]:
 
 
 class LookupInconclusive(Exception):
-    """The branch listing did not reach the run being judged, so "newest" is unknown."""
+    """The successor question could not be answered, so no mutation may rest on it.
+
+    For a push run: the branch listing did not reach the run being judged, so
+    "newest" is unknown. For a pull-request run also: a newer run at the judged
+    run's own head SHA whose pull request neither payload identifies, so successor
+    (the same pull request's; a re-run of the judged run would cancel it through the
+    group) and sibling (another pull request on a shared head branch) cannot be told
+    apart. Both fail closed: the run is left as it is, the tick reds and names it.
+    """
 
 
 def newest_run_id_for_branch(api: Api, repo: str, verdict: RunVerdict) -> int:
@@ -1859,10 +1970,181 @@ def newest_run_id_for_branch(api: Api, repo: str, verdict: RunVerdict) -> int:
     )
 
 
-def is_newest_for_branch(api: Api, repo: str, verdict: RunVerdict) -> bool:
+def _open_pull_request_heads(api: Api, repo: str, verdict: RunVerdict) -> set[str]:
+    """The head SHAs of every OPEN pull request whose head is this run's branch.
+
+    Read from the pulls API by ``head=<owner>:<branch>``, which is exact on the
+    branch name within one head repository -- a fork's same-named branch is a
+    different owner and is not listed. Two pull requests open on the same head
+    branch return the same SHA twice; the set is what matters. One page, and a full
+    page is refused: it may have a tail, and "current" must never be answered from
+    a listing that might not contain the run's pull request.
+    """
+    owner = verdict.head_repo.partition("/")[0] or repo.partition("/")[0]
+    query = urllib.parse.urlencode(
+        {
+            "head": f"{owner}:{verdict.head_branch}",
+            "state": "open",
+            "per_page": PULL_REQUEST_LISTING_DEPTH,
+        }
+    )
+    try:
+        pulls = api.get(f"repos/{repo}/pulls?{query}")
+    except ApiError as exc:
+        raise LookupInconclusive(
+            f"the open pull requests on {verdict.head_repo}:{verdict.head_branch} could not be read: {exc}"
+        ) from exc
+    if not isinstance(pulls, list):
+        raise LookupInconclusive(
+            f"the open pull requests on {verdict.head_repo}:{verdict.head_branch} came back malformed"
+        )
+    if len(pulls) >= PULL_REQUEST_LISTING_DEPTH:
+        raise LookupInconclusive(
+            f"{verdict.head_repo}:{verdict.head_branch} has {len(pulls)} or more open pull requests, "
+            f"more than one page; whether run {verdict.run_id} is current cannot be told"
+        )
+    return {
+        str(((pull or {}).get("head") or {}).get("sha") or "").lower()
+        for pull in pulls
+        if isinstance(pull, dict)
+    } - {""}
+
+
+def _current_or_successor_for_pull_request(api: Api, repo: str, verdict: RunVerdict) -> int:
+    """The pull-request analogue of ``newest_run_id_for_branch``: judged by HEAD SHA,
+    then by the listing for a newer run AT that SHA.
+
+    Two reads. The pulls API says which head SHAs the open pull requests on the
+    branch have; the runs listing (this branch, this event, same head repository,
+    paged newest-first until the judged run is seen, as the push path does) says
+    which newer runs exist. Neither alone is enough.
+
+    The SHA answers supersession by PUSH, and answers it without the ambiguity a
+    branch-name listing has: two pull requests sharing a head branch carry the same
+    head SHA, so a run at that SHA is current for both, and nothing here needs
+    ``pull_requests[].number`` for that. No open pull request has the branch: the
+    request closed or merged, ``SUPERSEDED_WITHOUT_SUCCESSOR``. The head moved: the
+    successor is the newest listed run at an open head that the payloads identify as
+    the same pull request's.
+
+    The listing answers supersession WITHOUT a push. `labeled`, `unlabeled`,
+    `edited` and `reopened` each start a new run at the SAME head SHA, and every
+    declared pull-request workflow cancels the run in progress when one arrives. A
+    re-run of the older run would cancel that newer one through the group and
+    stand in its place -- with no successor named, nothing would restore it. So a
+    newer same-repository run at the judged run's own SHA is read as this run's
+    successor when the two payloads name a common pull request, ignored as a sibling
+    pull request's run (a shared head branch) when they name disjoint ones, and
+    otherwise -- most same-repository runs carry no ``pull_requests[]`` at all --
+    the answer is ``LookupInconclusive``, naming the runs, because "current" is what
+    licenses a cancel through the other run's group and is never assumed. That is
+    deliberately not resolved by observing the group's own cancel: every orphan this
+    script meets exists during a fleet outage, where the run to observe stays queued
+    and observation cannot settle, and a green outcome resting on an unobserved
+    provider behaviour is the false green this script must never produce.
+
+    A successor is named only when identified as the same pull request's. When the
+    head moved while the pull request stays open, the answer is
+    ``SUPERSEDED_SUCCESSOR_UNIDENTIFIED`` whether a newer run at the new head is
+    listed and unidentified or not listed yet: superseded for every judgement made
+    before a mutation, never a run to restore -- restoring a sibling's run would
+    leave the same pull request's run, cancelled through the group, unreported.
+    """
+    open_heads = _open_pull_request_heads(api, repo, verdict)
+    if not open_heads:
+        return SUPERSEDED_WITHOUT_SUCCESSOR
+    own_sha = verdict.head_sha.lower()
+    at_open_head = own_sha in open_heads
+    successor: int | None = None
+    ambiguous: list[int] = []
+    page = 1
+    while page <= BRANCH_LISTING_MAX_PAGES:
+        query = urllib.parse.urlencode(
+            {
+                "branch": verdict.head_branch,
+                "event": verdict.event,
+                "per_page": BRANCH_LISTING_DEPTH,
+                "page": page,
+            }
+        )
+        try:
+            payload = api.get(f"{_runs_path(repo, verdict.workflow)}?{query}")
+        except ApiError as exc:
+            raise LookupInconclusive(
+                f"the branch listing for {verdict.head_repo}:{verdict.head_branch} could not be read: {exc}"
+            ) from exc
+        runs = (payload or {}).get("workflow_runs") or []
+        for run in runs:
+            run_id = int(run["id"])
+            if run_id == verdict.run_id:
+                # The judged run is in view, so every newer run of the branch has
+                # been seen and the answer is settled. An identified same-pull-request
+                # successor decides it whatever else was seen.
+                if successor is not None:
+                    return successor
+                if ambiguous:
+                    raise LookupInconclusive(
+                        f"run(s) {', '.join(str(r) for r in ambiguous)} are newer {verdict.event} "
+                        f"runs of {verdict.head_repo}:{verdict.head_branch} at the same head SHA "
+                        f"{own_sha[:12]} as run {verdict.run_id}, and whether each belongs to the "
+                        f"same pull request (its successor, from a label or edit) or to another pull "
+                        f"request sharing the branch cannot be told from the payloads; re-running "
+                        f"{verdict.run_id} could cancel a successor, so neither is assumed"
+                    )
+                if at_open_head:
+                    return verdict.run_id
+                # The head moved past this run while its pull request stays open. Whether
+                # a newer run at the new head is listed and unidentified, or not listed
+                # yet, the answer is the same: superseded, with no run to restore.
+                return SUPERSEDED_SUCCESSOR_UNIDENTIFIED
+            head_repo = str((run.get("head_repository") or {}).get("full_name") or "")
+            if head_repo.lower() != verdict.head_repo.lower():
+                continue
+            head_sha = str(run.get("head_sha") or "").lower()
+            if head_sha not in open_heads:
+                continue
+            theirs = _pull_request_numbers(run)
+            same_pull_request = bool(set(theirs) & set(verdict.pull_request_numbers))
+            if same_pull_request:
+                if successor is None:
+                    successor = run_id
+                continue
+            if theirs and verdict.pull_request_numbers:
+                # Disjoint, both known: a sibling pull request's run on a shared head
+                # branch, in its own concurrency group. Neither successor nor threat.
+                continue
+            if head_sha == own_sha:
+                ambiguous.append(run_id)
+        if not runs:
+            break
+        page += 1
+    raise LookupInconclusive(
+        f"run {verdict.run_id} of {verdict.head_repo}:{verdict.head_branch} ({verdict.event}) is not "
+        f"within the {BRANCH_LISTING_MAX_PAGES * BRANCH_LISTING_DEPTH} newest listed runs, so which "
+        f"run succeeded it cannot be told"
+    )
+
+
+def current_or_successor_id(api: Api, repo: str, verdict: RunVerdict) -> int:
+    """The run that carries this branch's verdict now: this run, its successor, or
+    ``SUPERSEDED_WITHOUT_SUCCESSOR``.
+
+    Dispatches on the event. A push run is judged by the branch listing
+    (``newest_run_id_for_branch``); a pull-request run by head SHA against the open
+    pull requests on the branch and by the listing for a newer run at that SHA
+    (``_current_or_successor_for_pull_request``). Every
+    caller asks this, never one shape's function directly, so the two shapes cannot
+    drift apart at one call site and not another.
+    """
+    if verdict.event == "pull_request":
+        return _current_or_successor_for_pull_request(api, repo, verdict)
+    return newest_run_id_for_branch(api, repo, verdict)
+
+
+def is_current_run(api: Api, repo: str, verdict: RunVerdict) -> bool:
     """Re-running a run that a newer push has superseded would cancel the newer run
     through the workflow's own concurrency group, so every re-run checks this first."""
-    return newest_run_id_for_branch(api, repo, verdict) == verdict.run_id
+    return current_or_successor_id(api, repo, verdict) == verdict.run_id
 
 
 def supersession_clears_hold(
@@ -1887,11 +2169,11 @@ def supersession_clears_hold(
     zero verdicts.
 
     Asked ONLY when a hold would otherwise apply, so the ordinary orphan pays no extra
-    listing. Restricted to ``push``: on a pull request two open requests can share one
-    head branch, so a newer run of that branch does not establish that THIS run was
-    superseded -- the same reason ``_guard`` refuses the pull-request shape. The head
-    repository is compared too; a fork cannot push to this repository's branches, so
-    that test is belt-and-braces rather than the fork boundary itself.
+    listing. Push and pull-request runs alike, through ``current_or_successor_id``: a
+    pull-request run is judged by head SHA against its branch's open pull requests
+    and by the listing for a newer run at that SHA.
+    The head repository must be this repository; a fork cannot push to its branches,
+    so that test is belt-and-braces rather than the fork boundary itself.
 
     A lookup that cannot answer leaves the hold standing: cancelling needs
     supersession ESTABLISHED, never assumed from a failed read.
@@ -1905,10 +2187,12 @@ def supersession_clears_hold(
     way -- reported red, not held green with no outcome -- and so the answer is
     given once, where the irreversible step is.
     """
-    if verdict.event != "push" or verdict.head_repo.lower() != policy.repo.lower():
+    if verdict.event not in {"push", "pull_request"}:
+        return False
+    if verdict.head_repo.lower() != policy.repo.lower():
         return False
     try:
-        if is_newest_for_branch(api, policy.repo, verdict):
+        if is_current_run(api, policy.repo, verdict):
             return False
     except LookupInconclusive as exc:
         log(
@@ -1946,7 +2230,7 @@ def _rerun_attempt_may_be_cancelled(
     group until a human frees it, and nothing else will tell them.
     """
     try:
-        if is_newest_for_branch(api, policy.repo, verdict):
+        if is_current_run(api, policy.repo, verdict):
             return True
     except LookupInconclusive as exc:
         log(
@@ -1967,6 +2251,43 @@ def _rerun_attempt_may_be_cancelled(
         f"`gh run cancel {verdict.run_id}`."
     )
     return False
+
+
+def _supersession_is_answerable(
+    api: Api, policy: Policy, verdict: RunVerdict, log: Callable[[str], None]
+) -> bool:
+    """Whether the successor question for a first-attempt PULL-REQUEST orphan can be
+    answered, asked immediately before its cancel.
+
+    The cancel comes first and the re-run second, and only the re-run asks whether a
+    newer run supersedes this one. For a first attempt a superseded answer is the
+    intended trade (the cancel frees the group; nothing anyone did is lost), so the
+    answer itself is not needed here. An UNANSWERABLE lookup is another matter: after
+    the cancel it leaves the run cancelled with nobody to re-run it, the lost verdict
+    this script exists to prevent. On a push run that takes a failed listing read,
+    rare enough that the push path keeps its one-listing budget and reports it after
+    the fact. On a pull-request run it is an ordinary shape: a newer run at the same
+    head SHA whose pull request neither payload names, so successor or sibling cannot
+    be told, and cancelling THIS run on that uncertainty would destroy a verdict that
+    may be the current one. So for a pull-request run the lookup is made here, before
+    anything irreversible, and an inconclusive answer leaves the run untouched under
+    the same failed outcome the re-run would have reported, naming the run and the
+    command. The answer is not cached: the re-run asks again on the state after the
+    cancel, which is the state that matters for it, and a same-SHA run that appears in
+    between is met there the same way (withdrawn, failed, named).
+    """
+    try:
+        current_or_successor_id(api, policy.repo, verdict)
+    except LookupInconclusive as exc:
+        log(
+            f"::error::{_label(verdict)}: left untouched, because whether a newer run supersedes "
+            f"it cannot be told ({exc}); cancelling it first would leave it cancelled with nobody "
+            f"able to re-run it. Decide by hand: `gh run cancel {verdict.run_id}` if the branch "
+            f"or pull request has moved on, `gh run rerun {verdict.run_id}` if its result is still "
+            f"wanted."
+        )
+        return False
+    return True
 
 
 def _fmt_delta(delta: timedelta) -> str:
@@ -2088,6 +2409,13 @@ def heal_runs(
         ):
             outcomes[verdict.run_id] = OUTCOME_RERUN_ATTEMPT_LEFT
             continue
+        if (
+            verdict.run_attempt == 1
+            and verdict.event == "pull_request"
+            and not _supersession_is_answerable(api, policy, verdict, log)
+        ):
+            outcomes[verdict.run_id] = OUTCOME_LOOKUP_FAILED
+            continue
         if tick.remaining() < RERUN_RESERVE_SECONDS:
             # A cancel is only worth posting if its re-run can still be started
             # and verified inside this tick; otherwise it would discard the
@@ -2100,7 +2428,7 @@ def heal_runs(
             outcomes[verdict.run_id] = OUTCOME_NOT_ATTEMPTED
             continue
         revision_safe = workflow_is_heal_safe_at_revision(
-            api, policy.repo, verdict.workflow, verdict.head_sha
+            api, policy.repo, verdict.workflow, verdict.head_sha, event=verdict.event
         )
         if revision_safe is None:
             log(
@@ -2371,7 +2699,7 @@ def _rerun(
     """
     if not verdict.revision_heal_safe:
         revision_safe = workflow_is_heal_safe_at_revision(
-            api, policy.repo, verdict.workflow, verdict.head_sha
+            api, policy.repo, verdict.workflow, verdict.head_sha, event=verdict.event
         )
         if revision_safe is None:
             log(
@@ -2385,12 +2713,16 @@ def _rerun(
             return OUTCOME_HUMAN_REQUIRED
         verdict.revision_heal_safe = True
     try:
-        if not is_newest_for_branch(api, policy.repo, verdict):
-            log(f"{_label(verdict)} was superseded by a newer run of its branch; not re-running it")
+        if not is_current_run(api, policy.repo, verdict):
+            log(
+                f"{_label(verdict)} was superseded (a newer run of its branch, or its pull request "
+                f"closed); not re-running it"
+            )
             return OUTCOME_SUPERSEDED
     except LookupInconclusive as exc:
         log(
-            f"::error::{_label(verdict)} is cancelled and NOT re-run: {exc}. Run `gh run rerun {verdict.run_id}` by hand."
+            f"::error::{_label(verdict)} is cancelled and NOT re-run: {exc}. Run `gh run rerun "
+            f"{verdict.run_id}` by hand."
         )
         return OUTCOME_LOOKUP_FAILED
     # Checked HERE, after the lookup and immediately before the POST: the lookup
@@ -2440,8 +2772,21 @@ def _rerun(
         log(f"re-ran {_label(verdict)}")
     for attempt in range(2):
         try:
-            newest = newest_run_id_for_branch(api, policy.repo, verdict)
+            newest = current_or_successor_id(api, policy.repo, verdict)
         except LookupInconclusive as exc:
+            if verdict.event == "pull_request":
+                # A same-SHA run whose pull request cannot be identified appeared in the
+                # settle window. If it is this pull request's, the re-run has displaced
+                # it through the group and nothing can restore it on a guess; if it is
+                # a sibling's, the re-run is harmless but its heal cannot be called done.
+                # Withdraw the re-run so nothing runs on the uncertainty, and fail loudly.
+                log(
+                    f"::error::{_label(verdict)} was re-run, but {exc}. The re-run is cancelled; "
+                    f"if a run at this head ends cancelled, `gh run rerun` it by hand -- a group "
+                    f"cancel leaves no orphan fingerprint, so the recovery pass will not find it."
+                )
+                _withdraw(api, run_path, verdict, log)
+                return OUTCOME_LOOKUP_FAILED
             log(
                 f"::error::{_label(verdict)} was re-run, but whether a newer run superseded it cannot be told: {exc}"
             )
@@ -2451,10 +2796,41 @@ def _rerun(
                 tick.sleep(POST_RERUN_SETTLE_SECONDS)
                 continue
             return OUTCOME_HEALED
+        if newest == SUPERSEDED_SUCCESSOR_UNIDENTIFIED:
+            # The head moved during the settle window while the pull request stays
+            # open. A run at the new head -- listed and unidentified, or not listed
+            # yet -- may have been cancelled by this re-run through the group, and
+            # restoring a sibling's would hide that. Withdraw the re-run and fail loudly.
+            log(
+                f"::error::{_label(verdict)} was re-run, but its pull request's head has since "
+                f"moved and the run at the new head cannot be identified as this pull request's; "
+                f"the re-run is cancelled, and if that newer run ends cancelled it was displaced "
+                f"by this one: `gh run rerun` it by hand."
+            )
+            _withdraw(api, run_path, verdict, log)
+            return OUTCOME_LOOKUP_FAILED
+        if newest == SUPERSEDED_WITHOUT_SUCCESSOR:
+            # The pull request closed between the pre-check and here. The re-run
+            # serves a head nobody wants, so it is withdrawn; no open pull request has
+            # a run it could have displaced, so nothing is restored.
+            log(
+                f"{_label(verdict)} was re-run, but its pull request has since closed; cancelling "
+                f"the re-run, nothing to restore"
+            )
+            _withdraw(api, run_path, verdict, log)
+            return OUTCOME_RERUN_WITHDRAWN
         return _restore_successor(
             api, run_path, verdict, newest, policy, log, tick=tick, depth=depth
         )
     return OUTCOME_HEALED
+
+
+def _withdraw(api: Api, run_path: str, verdict: RunVerdict, log: Callable[[str], None]) -> None:
+    """Cancel this script's own re-run; a refused cancel is logged, never fatal."""
+    try:
+        api.post(f"{run_path}/cancel")
+    except ApiError as exc:
+        log(f"could not cancel the withdrawn re-run of {_label(verdict)}: {exc}")
 
 
 def _status_or_unknown(api: Api, run_path: str, log: Callable[[str], None]) -> str:
@@ -2770,7 +3146,7 @@ def recover_cancelled_runs(
         def is_newest(run: dict[str, Any] = run) -> bool:
             # Only asked once the orphan fingerprint matched, so a tick that finds
             # nothing costs one listing per cancelled run, not two.
-            return is_newest_for_branch(api, policy.repo, _base_verdict(run, policy.now))
+            return is_current_run(api, policy.repo, _base_verdict(run, policy.now))
 
         verdict = _mark_heal_exempt(
             classify_cancelled_run(run, jobs, policy, newest_check=is_newest),
@@ -2863,7 +3239,6 @@ def render_summary(verdicts: list[RunVerdict], outcomes: dict[int, str], policy:
         if v.verdict
         in (
             SKIPPED_FORK,
-            SKIPPED_PULL_REQUEST,
             SKIPPED_ATTEMPT_CAP,
             SKIPPED_SUPERSEDED,
             SKIPPED_SATURATED,
