@@ -378,13 +378,23 @@ CLI login (cached 300s, never written to disk).
 
 * Note paths resolve through `safe_join`, which rejects anything landing outside the vault
   root after symlink resolution (400).
-* **`.trash` is refused when it is a symlink at all** (`trash_dir_path`), not only when it
+* **`.trash` is refused when it is a symlink at all** (`reject_linked_trash`), not only when it
   escapes the vault. A clone can carry `.trash -> public`, whose target is *contained*, so the
   escape check passes — then `mkdir(exist_ok=True)` follows the link and the note lands at
   `public/One.md`, a path `status()` does not filter (it filters the `.trash/` prefix), so the
   next sync pushes the deleted note. `is_symlink()` (`lstat`) is the only test that sees this;
-  `exists()` and `is_dir()` both follow. Both the delete route and the reveal route go through
-  the same resolver.
+  `exists()` and `is_dir()` both follow. The delete route runs `reject_linked_trash` inside the
+  vault write lock, in the same worker thread as the move, so a refused delete never even
+  creates `.trash`; the reveal route resolves the trash directory through `trash_dir_path`.
+* **No note write follows an in-vault symlinked folder, even one a sync's merge swaps in
+  mid-request** (400 `folder_is_symlink`). Create, save, move and duplicate walk every
+  destination folder component with `lstat` (`reject_linked_folder_component`) and then resolve
+  the destination directory — both steps under a per-vault `vault_write_lock`, in the same
+  worker thread as the write, so a `git merge` that replaces a real directory with a symlink
+  into `.git` (or another tracked folder) cannot land between the check and the write, and the
+  write can never aim at a link target resolved before the lock. All three `git_ops.sync`
+  callers hold the same lock for their whole run, so a sync's tree-rewriting merge and a note
+  write never overlap.
 * **Containment is not sufficient, so every caller-supplied path also passes
   `require_note_path()`** (`require_folder_path()` for the new-note `folder`): each component
   must be undotted and the file must end in `.md`. A vault holds far more than notes, and
