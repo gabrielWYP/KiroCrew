@@ -3298,6 +3298,9 @@ export const api = {
       writesDrained: read.writes_drained !== false,
     }
   },
+  /** The conductor's accepted work, not worker-reported completion. */
+  sessionWorkProjection: (slot: string) =>
+    get(`/api/sessions/${encodeURIComponent(slot)}/crew-log/projection/work`).then(j),
   telemetryStartup: () => fetch('/api/telemetry/startup').then(j),
   // Per-turn context injection breakdown for one session. Independent of the
   // telemetry main switch: the usage rows it reads are always written.

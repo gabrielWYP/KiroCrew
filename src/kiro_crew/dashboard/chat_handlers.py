@@ -13085,7 +13085,10 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
                     state.sessions.set_approval_policy(effective_session_key(s), "")
             state.push_slots_update()
         action = "approved"
-    resolved = action if action in ("approved", "approved_trust_reads") else "rejected"
+    resolved = (
+        action if action in ("approved", "approved_trust_reads", "rejected_once") else "rejected"
+    )
+    approved = resolved in ("approved", "approved_trust_reads")
     if not fut or fut.done():
         # Distinguish ambiguous (multiple pending) from truly empty
         if not request_id and slot._approval_futures:
@@ -13106,7 +13109,7 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
         # the cross-slot approval the session-identity owner scan above prevents.
         # State-level futures have no per-slot trust semantics, so the bool
         # coercion loses nothing.
-        if request_id and state.resolve_state_approval(request_id, resolved != "rejected"):
+        if request_id and state.resolve_state_approval(request_id, approved):
             return web.json_response({"ok": True})
         return web.json_response({"error": "no pending approval"}, status=404)
     fut.set_result(resolved)
@@ -13127,7 +13130,7 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
             "approval_resolved",
             {
                 "id": request_id,
-                "approved": resolved != "rejected",
+                "approved": approved,
                 # Keys the frame for the slot-scoped WS gate (see
                 # ws_event_scope._SLOT_SCOPED_EVENTS).
                 "slot": owner.key,

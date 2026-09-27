@@ -32,6 +32,49 @@ Loading, empty results, filtering, and read errors therefore keep the same mode.
 
 ## Storage Layout
 
+### Dynamic Dashboard presentation
+
+An HTML/widget artifact tagged `task-dashboard` is a model-authored task view,
+not a fixed dashboard schema. The chat and Crew **Dynamic Dashboard** panel select
+only artifacts whose recorded originating slot is the current slot or a durable
+`created_by` descendant. A presentation-only child session can therefore publish
+without impersonating its conductor. The same slug is updated at milestones;
+visible hosts poll the artifact inventory every ten seconds and load new revisions.
+Models choose the layout and task-specific content; no particular board or graph
+is mandatory. The `artifacts` skill documents this publishing contract.
+
+The host independently projects live sessions, subagents, workflows and accepted
+conductor work. It never treats idle sessions as completed work, nor worker
+`done` reports as conductor acceptance. Missing/failed sources are shown as
+unknown or stale, not as an empty successful run. Questions and approvals have
+native host controls, exact session/request identities and explicit submission;
+Normal/Reads/Trust/YOLO mode is explicitly labeled as the permission mode, never
+changed by the dashboard. Native Reject once addresses both the owning slot and
+exact request ID through the slot approval endpoint, which preserves the
+`rejected_once` decision without rejecting the remaining batch. Connection-scoped
+request IDs may collide across unrelated sessions and must never be resolved by
+a global ID scan. Coordinator requests use the approval coordinator.
+Command input stays verbatim in a keyboard-accessible scrolling
+preview, including on narrow screens. No bulk approval is implied. A failed or
+uncertain send retains the answer and
+does not automatically retry. Approvals are separate from informational blockers.
+
+`TaskDashboardFrame` uses the sandbox-document service with an empty sandbox:
+no scripts, same-origin, forms, popups or control bridge. A dedicated document
+builder removes executable code, resource hints, nested documents and outbound
+navigation before rendering. Models freely design HTML/CSS/SVG layouts and native
+disclosures; dynamic evidence arrives through published revisions, not model
+JavaScript. Deny-by-default CSP permits only inline styling and data images/fonts.
+The page receives no credentials or host state. Model-authored status is labeled a
+published view/snapshot; it never replaces the host's trusted approval inventory.
+The optional creation request is a model-facing English prompt; translated UI
+copy names the published view, and the artifacts skill owns its technical
+publishing contract. Source failures render through the shared error notice in
+both the dock and panel, with no navigation hand-off beside unsent answer drafts.
+Incognito/temporary artifact persistence restrictions remain unchanged.
+
+### Artifact files
+
 ```
 ~/.kiro/crew/artifacts/
 └── <slug>/

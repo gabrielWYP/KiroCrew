@@ -433,8 +433,9 @@ async def test_app_never_resolves_state_level_approvals(state, target: str, acti
     assert future.done() is False
 
 
+@pytest.mark.parametrize("action", ["approved", "rejected", "rejected_once"])
 @pytest.mark.asyncio
-async def test_dashboard_still_resolves_state_level_approvals(state) -> None:
+async def test_dashboard_still_resolves_state_level_approvals(state, action: str) -> None:
     # The dashboard owner keeps the pre-existing fallback: a parked background
     # approval is theirs to answer from the tab it appears in.
     state.get_or_create_slot("addressed", origin=SlotOrigin.USER)
@@ -454,10 +455,48 @@ async def test_dashboard_still_resolves_state_level_approvals(state) -> None:
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/api/chat/slots/addressed/approve",
-            json={"action": "approved", "request_id": "req-state"},
+            json={"action": action, "request_id": "req-state"},
         )
     assert resp.status == 200
-    assert future.result() is True
+    assert future.result() is (action == "approved")
+
+
+@pytest.mark.parametrize("action", ["approved", "rejected", "rejected_once"])
+@pytest.mark.asyncio
+async def test_dashboard_decision_targets_slot_and_request_with_colliding_ids(
+    state, action
+) -> None:
+    other = state.get_or_create_slot("other", origin=SlotOrigin.USER)
+    selected = state.get_or_create_slot("selected", origin=SlotOrigin.USER)
+    loop = asyncio.get_running_loop()
+    other_future = loop.create_future()
+    selected_future = loop.create_future()
+    sibling_future = loop.create_future()
+    other._approval_futures["same-id"] = other_future
+    selected._approval_futures.update({"same-id": selected_future, "sibling": sibling_future})
+    app = _make_mode_app(state)
+    app.router.add_post("/api/chat/slots/{slot}/approve", api_chat_slot_approve)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/api/chat/slots/selected/approve",
+            json={"action": action, "request_id": "same-id"},
+        )
+        assert response.status == 200
+        assert selected_future.result() == action
+        assert not other_future.done()
+        assert not sibling_future.done()
+        state.broadcast_ws.assert_any_call(
+            "approval_resolved",
+            {"id": "same-id", "approved": action == "approved", "slot": "selected"},
+        )
+        # An expired request cannot fall through to the colliding other session.
+        response = await client.post(
+            "/api/chat/slots/selected/approve",
+            json={"action": action, "request_id": "same-id"},
+        )
+        assert response.status == 404
+        assert not other_future.done()
+        assert not sibling_future.done()
 
 
 @pytest.mark.asyncio

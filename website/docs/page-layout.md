@@ -11,6 +11,37 @@ conventions around them (a11y, data fetching, typography) live in
 
 ## Page skeleton
 
+### Dynamic Dashboard in chat and Crew
+
+Long-run status uses the existing side-panel dock, expansion and narrow-screen
+overlay, not another drawer. A collapsible summary above the composer opens the
+Dynamic Dashboard tab; the panel's + menu remains the empty-state entry. The task
+page itself is model-authored HTML and may choose any appropriate responsive
+layout. Host chrome owns scope, current activity, questions and one-shot tool
+approvals. Keep the document and answer drafts mounted when hiding the panel
+or switching tabs. Approval counts and exact session identity stay outside the
+sandboxed page, so a model redesign cannot hide or impersonate those controls.
+
+The Sessions header's three-dot menu offers **All Dynamic Dashboards**, a standalone
+`/session-dashboards` page with each session's saved summary and authored
+dashboards. Native pending questions and approvals appear in a central **Needs
+you** inbox above the summary gallery, with each request labeled by its exact
+session. Summary cards do not repeat these controls. Unavailable inventory shows
+a stale notice rather than an empty-inbox claim. Input-needed sessions appear
+first in the gallery, then blocked and running ones.
+Search and Needs you filter the cards and inbox without discarding answer drafts. The
+first 12 cards read summary/dashboard contents; Show more reveals the rest.
+This is an explicit fleet view, never a fallback for an unresolved task scope.
+It uses the standard page header and scroll container, with one column narrow
+and two wide, and never generates a summary merely because the page opened.
+Verify at both 320px and 390px: keep native approval targets at least 44px tall
+and the page free of horizontal overflow. Main labels use meaningful names or
+localized numbered session/task labels; opaque IDs remain routing data, not
+headings. The artifact authoring contract asks models for the same readable,
+phone-friendly treatment without prescribing their layout.
+
+### Standard page composition
+
 ```tsx
 <>
   <PageHeader title="PageName" subtitle="Short description" />
