@@ -5760,6 +5760,7 @@
       "trust_desc": "এই চ্যাটে, {{productName}} আগে জিজ্ঞাসা না করেই কাজ করে",
       "trust_label": "ট্রাস্ট",
       "chat_mode_hint": "চ্যাট মোড",
+      "trust_scope_tooltip": "এই চ্যাটে একটি অ্যাপ অনুমতির মাধ্যমে বিশ্বস্ত; এটি নিজে থেকেই শেষ হয়। এখনই শেষ করতে সাধারণ বেছে নাও।",
       "trust_tooltip": "এই চ্যাটে, {{productName}} আগে জিজ্ঞাসা না করেই কাজ করে",
       "yolo_desc": "প্রতিটি চ্যাটে, {{productName}} আগে জিজ্ঞাসা না করেই কাজ করে",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",

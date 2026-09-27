@@ -5851,6 +5851,7 @@
       "trust_desc": "In questa chat, {{productName}} lavora senza chiederti prima",
       "trust_label": "Fiducia",
       "chat_mode_hint": "modalità chat",
+      "trust_scope_tooltip": "Attendibile grazie a un'autorizzazione dell'app per questa chat; scade da sola. Scegli Normale per terminarla ora.",
       "trust_tooltip": "In questa chat, {{productName}} lavora senza chiederti prima",
       "yolo_desc": "In ogni chat, {{productName}} lavora senza chiederti prima",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",

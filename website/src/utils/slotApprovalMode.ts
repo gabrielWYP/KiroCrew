@@ -18,3 +18,13 @@ export function slotApprovalMode(
   if (slot?.trust_reads) return 'trust_reads'
   return 'normal'
 }
+
+/**
+ * True when an app-armed scoped grant, not the person's own flag, is what makes
+ * the slot trusted. The picker names the grant in that state.
+ */
+export function slotTrustIsScoped(
+  slot: Pick<ChatSlot, 'trust' | 'trust_scope'> | undefined,
+): boolean {
+  return !slot?.trust && !!slot?.trust_scope
+}

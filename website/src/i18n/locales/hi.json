@@ -5760,6 +5760,7 @@
       "trust_desc": "इस चैट में, {{productName}} तुमसे पूछे बिना काम करता है",
       "trust_label": "ट्रस्ट",
       "chat_mode_hint": "चैट मोड",
+      "trust_scope_tooltip": "इस चैट के लिए एक ऐप अनुमति से भरोसेमंद; यह अपने आप खत्म हो जाती है। अभी खत्म करने के लिए सामान्य चुनो।",
       "trust_tooltip": "इस चैट में, {{productName}} तुमसे पूछे बिना काम करता है",
       "yolo_desc": "हर चैट में, {{productName}} तुमसे पूछे बिना काम करता है",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",

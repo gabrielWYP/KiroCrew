@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard import chat_runner
@@ -154,3 +156,150 @@ class TestProjection:
             d = slot.to_dict()
         assert d["trust_scope"] == _SCOPE
         assert d["trust"] is False
+
+
+def _dashboard_state(tmp_path):
+    from kiro_crew.dashboard.state import DashboardState
+    from kiro_crew.history import ConversationLog
+
+    sessions = MagicMock(count=0)
+    sessions.get_pid = MagicMock(return_value=None)
+    sessions.remove = AsyncMock()
+    return DashboardState(
+        sessions=sessions,
+        crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),
+        lessons=MagicMock(load_all=MagicMock(return_value=[])),
+        start_time=0.0,
+        conversation_log=ConversationLog(base_dir=tmp_path),
+    )
+
+
+async def _choose_mode(state, body: dict) -> web.Response:
+    from kiro_crew.dashboard import chat_handlers
+
+    app = web.Application()
+    app["state"] = state
+    req = make_mocked_request("POST", "/api/chat/mode", app=app)
+    req["internal_auth"] = True
+
+    async def _read(_request, **_kw):
+        return body, None
+
+    with patch.object(chat_handlers, "read_bounded_json", _read):
+        return await chat_handlers.api_chat_mode(req)
+
+
+class TestNormalEndsTheScopedGrant:
+    """Normal is the off-switch for every state the header shows as Trust."""
+
+    @pytest.mark.asyncio
+    async def test_normal_on_the_slot_ends_its_live_scope(self, tmp_path) -> None:
+        state = _dashboard_state(tmp_path)
+        slot = state.get_or_create_slot("crew-slot")
+        so = safety_override()
+        assert so.activate_scoped(_SCOPE, source="test", ttl=600).active
+        slot._trust_scope = _SCOPE
+        try:
+            with patch.object(gw, "sel"), patch("kiro_crew.dashboard.chat_handlers.sel") as hsel:
+                resp = await _choose_mode(state, {"mode": "normal", "slot": "crew-slot"})
+            assert resp.status == 200
+            assert so.scope_remaining_secs(_SCOPE) == 0
+            assert slot._trust_scope == ""
+            assert slot.to_dict()["trust_scope"] == ""
+            assert slot.to_dict()["trust"] is False
+            ops = [
+                c.kwargs.get("operation") for c in hsel.return_value.log_api_access.call_args_list
+            ]
+            assert "approval_mode.scope_cleared_by_user" in ops
+            cleared = [
+                c
+                for c in hsel.return_value.log_api_access.call_args_list
+                if c.kwargs.get("operation") == "approval_mode.scope_cleared_by_user"
+            ]
+            assert cleared[0].kwargs["resources"] == f"scope:{_SCOPE}"
+        finally:
+            so.deactivate_scope(_SCOPE)
+
+    @pytest.mark.asyncio
+    async def test_normal_without_a_scope_writes_no_scope_record(self, tmp_path) -> None:
+        state = _dashboard_state(tmp_path)
+        state.get_or_create_slot("plain-slot")
+        with patch("kiro_crew.dashboard.chat_handlers.sel") as hsel:
+            resp = await _choose_mode(state, {"mode": "normal", "slot": "plain-slot"})
+        assert resp.status == 200
+        ops = [c.kwargs.get("operation") for c in hsel.return_value.log_api_access.call_args_list]
+        assert "approval_mode.scope_cleared_by_user" not in ops
+
+    @pytest.mark.asyncio
+    async def test_trust_leaves_a_live_scope_alone(self, tmp_path) -> None:
+        state = _dashboard_state(tmp_path)
+        slot = state.get_or_create_slot("crew-slot")
+        so = safety_override()
+        assert so.activate_scoped(_SCOPE, source="test", ttl=600).active
+        slot._trust_scope = _SCOPE
+        try:
+            with patch("kiro_crew.dashboard.chat_handlers.sel"):
+                resp = await _choose_mode(state, {"mode": "trust", "slot": "crew-slot"})
+            assert resp.status == 200
+            assert so.scope_remaining_secs(_SCOPE) > 0
+            assert slot._trust_scope == _SCOPE
+        finally:
+            so.deactivate_scope(_SCOPE)
+
+    @pytest.mark.parametrize("body", [{"mode": "normal", "slot": "crew-slot"}, {"mode": "normal"}])
+    @pytest.mark.asyncio
+    async def test_a_slot_added_while_the_clear_awaits_does_not_abort_it(
+        self, tmp_path, body
+    ) -> None:
+        state = _dashboard_state(tmp_path)
+        slot = state.get_or_create_slot("crew-slot")
+        so = safety_override()
+        real_deactivate = so.deactivate_scope
+
+        def _deactivate_and_grow(scope: str) -> None:
+            real_deactivate(scope)
+            state._slots["late-slot"] = state._slots["crew-slot"]
+
+        assert so.activate_scoped(_SCOPE, source="test", ttl=600).active
+        slot._trust_scope = _SCOPE
+        try:
+            with (
+                patch.object(so, "deactivate_scope", _deactivate_and_grow),
+                patch("kiro_crew.dashboard.chat_handlers.sel"),
+            ):
+                resp = await _choose_mode(state, body)
+            assert resp.status == 200
+            assert slot._trust_scope == ""
+            state.sessions.set_approval_policy.assert_called()
+        finally:
+            so.deactivate_scope(_SCOPE)
+
+    @pytest.mark.parametrize("body", [{"mode": "normal", "slot": "crew-slot"}, {"mode": "normal"}])
+    @pytest.mark.asyncio
+    async def test_a_trust_landing_while_the_grant_ends_is_still_revoked(
+        self, tmp_path, body
+    ) -> None:
+        """Flags and stored policy are cleared together, after every await."""
+        state = _dashboard_state(tmp_path)
+        slot = state.get_or_create_slot("crew-slot")
+        so = safety_override()
+        real_deactivate = so.deactivate_scope
+
+        def _deactivate_while_trust_lands(scope: str) -> None:
+            real_deactivate(scope)
+            slot._trust = True
+
+        assert so.activate_scoped(_SCOPE, source="test", ttl=600).active
+        slot._trust_scope = _SCOPE
+        try:
+            with (
+                patch.object(so, "deactivate_scope", _deactivate_while_trust_lands),
+                patch("kiro_crew.dashboard.chat_handlers.sel"),
+            ):
+                resp = await _choose_mode(state, body)
+            assert resp.status == 200
+            assert slot._trust is False
+            assert slot._trust_scope == ""
+            assert so.scope_remaining_secs(_SCOPE) == 0
+        finally:
+            so.deactivate_scope(_SCOPE)

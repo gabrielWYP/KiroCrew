@@ -1730,6 +1730,7 @@
       "reads_desc": "{{productName}} runs read-only shell commands on its own, but asks for everything else",
       "trust_label": "Trust",
       "chat_mode_hint": "chat mode",
+      "trust_scope_tooltip": "Trusted by an app grant for this chat; it expires on its own. Pick Normal to end it now.",
       "trust_tooltip": "In this chat, {{productName}} works without asking you first",
       "trust_desc": "In this chat, {{productName}} works without asking you first",
       "yolo_label": "YOLO",

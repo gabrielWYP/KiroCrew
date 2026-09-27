@@ -5642,6 +5642,7 @@
       "trust_desc": "이 채팅에서 {{productName}}은(는) 먼저 묻지 않고 작업합니다",
       "trust_label": "신뢰",
       "chat_mode_hint": "채팅 모드",
+      "trust_scope_tooltip": "이 채팅은 앱 권한으로 신뢰됩니다. 권한은 스스로 만료됩니다. 지금 끝내려면 표준을 선택하세요.",
       "trust_tooltip": "이 채팅에서 {{productName}}은(는) 먼저 묻지 않고 작업합니다",
       "yolo_desc": "모든 채팅에서 {{productName}}은(는) 먼저 묻지 않고 작업합니다",
       "yolo_expiration_timed": "{{duration}} 후 자동으로 꺼지고 다시 물어봅니다.",

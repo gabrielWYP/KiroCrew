@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { slotApprovalMode } from './slotApprovalMode'
+import { slotApprovalMode, slotTrustIsScoped } from './slotApprovalMode'
 
 describe('slotApprovalMode', () => {
   it('shows yolo over any slot trust', () => {
@@ -24,5 +24,23 @@ describe('slotApprovalMode', () => {
 
   it('shows normal with no slot', () => {
     expect(slotApprovalMode(undefined, undefined)).toBe('normal')
+  })
+})
+
+describe('slotTrustIsScoped', () => {
+  it('is true for a live scope without the session flag', () => {
+    expect(slotTrustIsScoped({ trust: false, trust_scope: 'crew:x' })).toBe(true)
+  })
+
+  it('is false when the session flag is set too', () => {
+    expect(slotTrustIsScoped({ trust: true, trust_scope: 'crew:x' })).toBe(false)
+  })
+
+  it('is false once the scope lapses', () => {
+    expect(slotTrustIsScoped({ trust: false, trust_scope: '' })).toBe(false)
+  })
+
+  it('is false with no slot', () => {
+    expect(slotTrustIsScoped(undefined)).toBe(false)
   })
 })

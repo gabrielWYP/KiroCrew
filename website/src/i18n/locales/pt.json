@@ -5851,6 +5851,7 @@
       "trust_desc": "Neste chat, o {{productName}} trabalha sem perguntar primeiro",
       "trust_label": "Confiança",
       "chat_mode_hint": "modo de chat",
+      "trust_scope_tooltip": "Confiável por uma permissão de app para este chat; ela expira sozinha. Escolha Normal para encerrá-la agora.",
       "trust_tooltip": "Neste chat, o {{productName}} trabalha sem perguntar primeiro",
       "yolo_desc": "Em todos os chats, o {{productName}} trabalha sem perguntar primeiro",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",

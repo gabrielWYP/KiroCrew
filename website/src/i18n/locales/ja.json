@@ -5642,6 +5642,7 @@
       "trust_desc": "このチャットでは、{{productName}} は最初に確認せずに機能します",
       "trust_label": "信頼",
       "chat_mode_hint": "チャットモード",
+      "trust_scope_tooltip": "このチャットはアプリの許可で信頼されています。許可は自動で期限切れになります。今すぐ終了するには標準を選んでください。",
       "trust_tooltip": "このチャットでは、{{productName}} は最初に確認せずに機能します",
       "yolo_desc": "すべてのチャットで、{{productName}} は最初に確認せずに機能します",
       "yolo_expiration_timed": "{{duration}} 後に自動的にオフになり、その後再び確認します。",
