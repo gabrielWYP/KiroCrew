@@ -2819,6 +2819,68 @@ class TestLentHopReservation:
         finally:
             mgr._hop_guard.close_all()
 
+    def test_a_second_mint_cannot_shorten_a_live_lease_in_the_cache(self, tmp_path, monkeypatch):
+        """Max wins in the cache, the same rule the record and the guard already state.
+
+        The durable record maxes (`InstancesRegistry.lend_hop`) and a hold is never
+        shortened (`HopPortGuard.hold`), because the credential that earned the longer
+        deadline stays valid until ITS deadline. The in-memory cache is the only table
+        the synchronous exit seam can read, so a shorter deadline written over a live one
+        there lets a tunnel exit past the short deadline find the lease lapsed, bind
+        nothing, and leave the port free while the earlier credential still names it.
+        """
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
+        asyncio.run(mgr.connect("c"))
+        hop = mgr.status("c").local_port
+
+        # What an earlier mint for a longer-lived credential leaves behind.
+        standing = time.time() + 30 * 3600
+        mgr._lent_hops[hop] = standing
+        reg.lend_hop(hop, standing)
+
+        ok, _ = asyncio.run(mgr.mint_embed_token("c", 9191))
+        assert ok is True, "the mint itself failed -- re-derive this pin"
+        assert mgr._lent_hops[hop] == standing, (
+            "a later mint shortened a live lease in the cache, so an exit after the "
+            "shorter deadline reads it as lapsed and leaves the port unheld while the "
+            "earlier credential is still valid"
+        )
+        assert hop not in mgr._pending_lends, "left an in-flight marker behind on success"
+
+    def test_a_refused_lend_restores_an_earlier_lease_instead_of_deleting_it(
+        self, tmp_path, monkeypatch
+    ):
+        """Unwinding this call's write must not unwind someone else's lease.
+
+        The early registration is unwound when the record cannot be written, because a
+        lease the registry does not name withholds a port for nothing. But popping the
+        entry outright also erases a STANDING lease this call merely raised the deadline
+        of, and that one protects a credential still in the hub's hands -- so the unwind
+        would open the very unbound-port window the early registration exists to close.
+        """
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
+        asyncio.run(mgr.connect("c"))
+        hop = mgr.status("c").local_port
+
+        standing = time.time() + 30 * 3600
+        mgr._lent_hops[hop] = standing
+
+        def refuse_lease(_port, _until):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(reg, "lend_hop", refuse_lease)
+
+        ok, payload = asyncio.run(mgr.mint_embed_token("c", 9191))
+        assert ok is False, "handed over a credential it could not protect"
+        assert payload["code"] == "instance_hop_lease_failed"
+        assert mgr._lent_hops.get(hop) == standing, (
+            "a refused lend deleted a standing lease it did not create, leaving the only "
+            "table the exit seam reads with no record of a hop whose credential is live"
+        )
+        assert hop not in mgr._pending_lends, "a refused lend left its in-flight marker"
+
     def test_the_recovery_releases_before_rebinding_and_resettles_on_every_exit(self):
         """Structural, because both orderings end with the port held.
 
@@ -2868,11 +2930,11 @@ class TestLentHopReservation:
         recover = ast.parse(textwrap.dedent(inspect.getsource(stm.SshTunnelManager._recover))).body[
             0
         ]
-        # `_recover` must release NOTHING. It used to release in Phase 1 under a comment
-        # claiming the hold was "re-armed below", but the only re-arm is `_recover_after`'s
-        # `finally` -- after the WHOLE two-tier recovery -- so a failed tier-1 rebuild left
-        # the port unheld across tier 2's mint, bounded by the mint timeout rather than by
-        # a bind, with the chained credential still naming it.
+        # `_recover` must release NOTHING. The only re-arm outside `_rebuild` is
+        # `_recover_after`'s `finally` -- which runs after the WHOLE two-tier recovery --
+        # so a release in this method leaves the port unheld across tier 2's mint whenever
+        # tier 1's rebuild fails, bounded by the mint timeout rather than by a bind, with
+        # the chained credential still naming it.
         stray = [
             n.lineno
             for n in ast.walk(recover)

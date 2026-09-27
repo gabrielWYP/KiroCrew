@@ -2907,21 +2907,42 @@ class SshTunnelManager:
         # deadline is the ttl this payload promises.
         #
         # This is deliberately the pessimistic order. A lease recorded for a write that
-        # then fails withholds a port for nothing until the entry is removed two lines
-        # below; a lease recorded too late hands out a credential with an unprotected
-        # port. The first costs a port, the second costs the credential.
-        self._pending_lends[hop] = until
-        self._lent_hops[hop] = until
+        # then fails withholds a port for nothing until the unwind below puts the entry
+        # back as it found it; a lease recorded too late hands out a credential with an
+        # unprotected port. The first costs a port, the second costs the credential.
+        #
+        # Both caches take the LATER deadline, the same max-wins rule the durable record
+        # and the guard's own hold already follow: a mint for a hop whose lease is still
+        # live must not shorten it, because the credential that earned the longer deadline
+        # stays valid until ITS deadline and the synchronous exit seam reads these tables
+        # alone. Capture what is there first, so a failed write can put it back rather
+        # than delete a lease this call never earned.
+        prior_pending = self._pending_lends.get(hop)
+        prior_lent = self._lent_hops.get(hop)
+        registered = max(until, prior_pending or 0.0, prior_lent or 0.0)
+        self._pending_lends[hop] = registered
+        self._lent_hops[hop] = registered
         try:
             await asyncio.to_thread(self._registry.lend_hop, hop, until)
         except Exception as e:
             # Unwind the early registration, but only if it is still OURS: a concurrent
-            # mint for the same hop may have replaced it, and popping blindly would
-            # delete a live lease this call never owned.
-            if self._pending_lends.get(hop) == until:
-                self._pending_lends.pop(hop, None)
-                if self._lent_hops.get(hop) == until:
+            # mint for the same hop may have replaced it, and writing blindly would
+            # damage a live lease this call never owned. Putting the CAPTURED value back
+            # rather than popping is what keeps an earlier lease intact -- this call may
+            # have been the one that raised the deadline, and deleting the entry would
+            # leave the only table the exit seam can read with no record of a hop whose
+            # credential is still valid, which is the window the early registration
+            # above exists to close.
+            if self._pending_lends.get(hop) == registered:
+                if prior_pending is None:
+                    self._pending_lends.pop(hop, None)
+                else:
+                    self._pending_lends[hop] = prior_pending
+            if self._lent_hops.get(hop) == registered:
+                if prior_lent is None:
                     self._lent_hops.pop(hop, None)
+                else:
+                    self._lent_hops[hop] = prior_lent
             # NOT through `_persist_hint`, whose documented semantics are best-effort
             # (`except Exception: pass`). That is right for a hint that only has to be
             # usually-there and wrong for the record that keeps this port away from
@@ -2944,9 +2965,14 @@ class SshTunnelManager:
             }
         # The write resolved, so the registry names this lease and the settle's re-seed
         # will carry it on its own. Only the in-flight marker is dropped; the cache entry
-        # registered before the write stays exactly as it was.
-        if self._pending_lends.get(hop) == until:
-            self._pending_lends.pop(hop, None)
+        # registered before the write stays exactly as it was. The comparison is against
+        # what this call WROTE, and it puts back what it captured, so a marker a
+        # concurrent mint owns is neither erased nor mistaken for this one's.
+        if self._pending_lends.get(hop) == registered:
+            if prior_pending is None:
+                self._pending_lends.pop(hop, None)
+            else:
+                self._pending_lends[hop] = prior_pending
         return True, {
             "token": token,
             "port": hop,
@@ -3824,17 +3850,17 @@ class SshTunnelManager:
         # bind succeeded -- which is what makes the unheld window exactly the bind it
         # exists for.
         #
-        # It used to be released once in the recovery's Phase 1, whose comment claimed the
-        # hold was "re-armed below". The only re-arm was the CALLER's `finally`, which runs
-        # after the whole two-tier recovery, so a failed tier-1 rebuild left the port
-        # unheld across tier 2's mint -- bounded by the mint timeout, not by a bind -- with
-        # the chained credential still naming it. Releasing here instead means a failed
-        # start re-takes the port before returning, so tier 2 mints with it held.
+        # Releasing any earlier, in the recovery's locked phase, would leave the port
+        # unheld across tier 2's mint whenever tier 1's rebuild fails -- bounded by the
+        # mint timeout rather than by a bind -- with the chained credential still naming
+        # it. The caller's `finally` is no substitute: it runs only after the whole
+        # two-tier recovery returns. Releasing here means a failed start re-takes the
+        # port before returning, so tier 2 mints with it held.
         #
         # The `finally` is what covers every exit, including `_RecoverySuperseded` from the
         # revalidation below. A successful start needs no hold: the live forward owns the
         # port, `_apply_hop_holds` excludes it from `want`, and the re-arm here is a no-op
-        # against a lease the cache no longer names.
+        # against a lease the cache does not name.
         self._hop_guard.release(local_port)
         owned = False
         try:
@@ -3972,13 +3998,13 @@ class SshTunnelManager:
                 return
 
             local_port = current.status.local_port or inst.local_port
-            # The hold is NOT released here. It used to be, with a comment claiming it was
-            # "re-armed below" -- but the only re-arm was the caller's `finally`, which runs
-            # after the whole two-tier recovery, so a failed tier-1 rebuild left this port
-            # unheld across tier 2's mint while the chained credential still named it. The
-            # release now lives in `_rebuild`, immediately before the bind that needs it and
-            # taken straight back when that bind does not produce a live forward, so every
-            # slow step here -- the mint above all -- runs with the port held.
+            # The hold is NOT released here. Releasing it in this locked phase would leave
+            # the port unheld across tier 2's mint whenever tier 1's rebuild fails, while
+            # the chained credential still names it, and the caller's `finally` is no
+            # substitute because it runs only after the whole two-tier recovery returns.
+            # The release lives in `_rebuild`, immediately before the bind that needs it
+            # and taken straight back when that bind does not produce a live forward, so
+            # every slow step here -- the mint above all -- runs with the port held.
             # Which tunnel generation this recovery found. Nothing between here
             # and tier 1's rebuild installs a tunnel, so tier 2 can bind its
             # store to the ONE bump that a failed tier-1 rebuild is guaranteed
