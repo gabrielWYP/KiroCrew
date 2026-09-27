@@ -27,9 +27,27 @@ schedules the loop. Those two `monitor_start` surfaces are the only callers that
 ask for the gate; the chokepoint defaults every other caller UNGATED, the generic
 REST route included. Gating is the state that can silently stop work, so a caller
 that names no value resolves toward spending a turn per interval rather than toward
-a watch that deactivates itself. A loop whose instruction names exactly one public
-GitHub pull request attaches `PrWatchProbe`, which FETCHES that pull request every
-tick and hands the reading to the wake judge.
+a watch that deactivates itself.
+
+A gated loop's WATCHED SUBJECT comes from the two strings it holds, resolved in one
+place (`autonudge.infer_subject`) so the monitor and the judge's collector are about
+the same pull request. The judge brief's `targets` list is read first, because
+`autonudge_judge.parse_targets` reads it first and asks about nothing else once it is
+present. A brief naming exactly one public GitHub pull request supplies the subject
+when the instruction names none, which is what makes a loop armed as "Babysit PR
+13936" with the URL in its brief watchable at all. Otherwise the INSTRUCTION decides:
+when it names its own pull request the watch stays on that one even if the brief names
+a different one, since a brief naming a blocker is an evidence scope and not a subject
+declaration. A brief naming two or more pull requests leaves the instruction deciding,
+because a loop holds one monitor. Resolution can answer "no subject", in which case no
+probe is attached and the loop fires on its plain interval: an instruction naming a
+pull request only in a shorthand (`owner/name#123`, `PR #42`) carries no host and
+`#123` is equally an issue reference, and an instruction naming two at once is not
+resolved by preferring either. A loop that does resolve to one subject attaches
+`PrWatchProbe`, which FETCHES that pull request every tick and hands the reading to
+the wake judge. A retarget that changes the subject advances `config_generation`, so a
+structural-terminal verdict recorded for the old subject cannot deactivate the new
+watch.
 
 There is no script-cron driver. A babysit request uses `monitor_watch` or a finite
 `monitor_start` loop owned by the session that can inspect and act on a wake, both

@@ -25,10 +25,13 @@ from kiro_crew.autonudge import (
     NudgeLoop,
     _bounded_judge_spec,
     infer_monitor,
+    infer_subject,
+    loop_subject,
 )
 from kiro_crew.decisions.points import nudge_wake as point
 from kiro_crew.decisions.types import Answer
 from kiro_crew.irq import Outcome, Verdict
+from kiro_crew.probes import targets as probe_targets
 from kiro_crew.validation import JUDGE_OFF_KEY, ValidationError, validate_judge_spec
 
 
@@ -3986,3 +3989,319 @@ class TestEveryOutcomeHasALocalizedWord:
     def test_an_unmapped_token_still_reads_as_a_word(self) -> None:
         """The verdict record can store ``unknown``, so that token needs a word too."""
         assert "unknown" in self._words()
+
+
+class TestTheBriefsOwnTargetListDecidesTheWatchedSubject:
+    """A loop naming its pull request in ``judge.targets`` and not in its message is watched.
+
+    Observed on a live gateway: a gated loop whose brief named its pull request by
+    full URL, while its own message named only the number, had NO monitor at all.
+    Nothing was ever fetched, the tick recorded zero evidence items and fell back, and
+    every interval fired on the plain timer -- so no pull-request comment reached the
+    judge, which is what reading the bodies exists for.
+
+    The two halves have to be about ONE pull request. ``parse_targets`` reads the
+    brief's list first and returns nothing else once it is present, so a monitor
+    resolved from the message publishes a reading the reader drops as "a pull request
+    this loop does not watch". Both halves read the brief first, or the watch reads
+    nothing.
+    """
+
+    URL = "https://github.com/kirodotdev/KiroCrew/pull/13936"
+    MESSAGE = "Babysit PR 13936 until every check is green; stop when it merges."
+    SUBJECT = "kirodotdev/KiroCrew#13936"
+
+    def _spec(self) -> dict[str, Any]:
+        return {
+            "wake_when": "a reviewer asked for a change",
+            "quiet_when": "checks are still running",
+            "targets": [self.URL],
+        }
+
+    def _monitor(self) -> MonitorState:
+        monitor = infer_monitor(self.MESSAGE, now=1_000.0, judge=self._spec())
+        assert monitor is not None
+        return monitor
+
+    def _reading(self) -> dict[str, Any]:
+        """The reading the gh probe publishes, in ``PrObservation.as_facts`` shape."""
+        return {
+            "kind": "gh-pr",
+            "target": self.SUBJECT,
+            "observation_status": "ok",
+            "observed_at": 1_000.0,
+            "state": "OPEN",
+            "mergeability": "MERGEABLE",
+            "review_decision": "",
+            "head_revision": "a" * 40,
+            "checks": {"passed": ["build"], "failed": [], "pending": []},
+            "checks_complete": True,
+            "remarks": [
+                {
+                    "kind": "comment",
+                    "id": "IC_1",
+                    "author": "buluoray",
+                    "at": "2026-09-27T10:40:00+00:00",
+                    "age_s": 60.0,
+                    "verdict": "",
+                    "body_digest": "d" * 12,
+                    "clipped": False,
+                    "first_seen_this_tick": True,
+                }
+            ],
+            "remarks_total": 1,
+        }
+
+    def test_the_message_alone_names_no_subject(self) -> None:
+        """The premise: a bare ``PR <number>`` is a shorthand, and inference refuses it."""
+        assert infer_monitor(self.MESSAGE, now=1_000.0) is None
+
+    def test_the_brief_names_it_so_the_loop_gets_a_monitor(self) -> None:
+        monitor = self._monitor()
+        assert (monitor.kind, monitor.target) == ("gh-pr", self.SUBJECT)
+
+    def test_the_probe_config_the_tick_derives_names_that_same_subject(self) -> None:
+        """A tick whose own derivation disagrees fires WITHOUT observing."""
+        monitor = self._monitor()
+        loop = _loop(self._spec())
+        loop.message = self.MESSAGE
+        loop.monitor = monitor
+        target = loop_subject(loop)
+        assert target is not None
+        assert (target.kind, target.subject) == (monitor.kind, monitor.target)
+
+    def test_the_target_the_collector_asks_about_is_accepted(self) -> None:
+        monitor = self._monitor()
+        asked = judge.parse_targets(self._spec(), self.MESSAGE)
+        assert asked == [self.URL], "the brief's list is what the collector asks about"
+        assert (
+            judge.pr_observation_is_about(
+                self.URL,
+                monitor_kind=monitor.kind,
+                monitor_target=monitor.target,
+                observation=self._reading(),
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_comment_on_that_pull_request_reaches_the_judge(self, tmp_path) -> None:
+        """End to end over the stored loop: a fresh comment becomes a ``pr_comment`` item."""
+        svc = AutoNudgeService(base_dir=tmp_path)
+        loop = await svc.add(
+            slot_key="chat-1-123",
+            message=self.MESSAGE,
+            idle_secs=300,
+            judge=self._spec(),
+            gate=True,
+        )
+        svc._cancel_timer(loop.id)
+        assert loop.monitor is not None, "the arm path stores the brief's subject"
+        assert loop.monitor.target == self.SUBJECT
+
+        # What the tick does with a reading: the facts on the record, the bodies in the
+        # process-local stash. Both, because a payload missing its bodies is counted
+        # unread rather than judged as prose nobody wrote.
+        reading = self._reading()
+        loop.monitor.last_observation = reading
+        judge.publish_pr_bodies(loop.id, {"IC_1": "please rebase before this lands"})
+
+        bodies, stash_dropped = judge.take_pr_bodies(loop.id)
+        payload = judge.payload_for_judge(reading, bodies, stash_dropped)
+        assert payload is not None
+
+        async def read_pr(target: str) -> dict[str, Any]:
+            assert target == self.URL
+            return payload
+
+        items, dropped = await judge.collect_evidence(
+            judge.parse_targets(judge.spec_of(loop), loop.message),
+            read_pr=read_pr,
+            now_ts=1_060.0,
+        )
+        assert dropped == 0, "the watched target is read, not dropped"
+        comments = [item for item in items if item["kind"] == point.KIND_PR_COMMENT]
+        assert len(comments) == 1
+        assert "please rebase before this lands" in comments[0]["text"]
+        assert "new since the last tick" in comments[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_replaced_brief_moves_the_watch_with_it(self, tmp_path) -> None:
+        """The collector asks about the NEW list from the next tick, so the monitor follows."""
+        svc = AutoNudgeService(base_dir=tmp_path)
+        loop = await svc.add(
+            slot_key="chat-1-123",
+            message=self.MESSAGE,
+            idle_secs=300,
+            judge=self._spec(),
+            gate=True,
+        )
+        svc._cancel_timer(loop.id)
+        other = "https://github.com/kirodotdev/KiroCrew/pull/14017"
+        updated = await svc.update(loop.id, judge={"targets": [other]})
+        svc._cancel_timer(loop.id)
+        assert updated.monitor is not None
+        assert updated.monitor.target == "kirodotdev/KiroCrew#14017"
+
+    @pytest.mark.asyncio
+    async def test_a_brief_retarget_advances_the_config_generation(self, tmp_path) -> None:
+        """A changed SUBJECT is a changed configuration, even when the instruction stands.
+
+        A structural-terminal verdict is captured against the generation at fire time.
+        Without advancing it, a verdict recorded for the OLD subject still reads as
+        current and deactivates the watch the retarget just rebound -- and the stale
+        flag sits on the slot until the next genuine turn, so the window is a whole
+        interval rather than one in-flight turn.
+        """
+        svc = AutoNudgeService(base_dir=tmp_path)
+        loop = await svc.add(
+            slot_key="chat-1-123",
+            message=self.MESSAGE,
+            idle_secs=300,
+            judge=self._spec(),
+            gate=True,
+        )
+        svc._cancel_timer(loop.id)
+        before = loop.config_generation
+        other = "https://github.com/kirodotdev/KiroCrew/pull/14017"
+        updated = await svc.update(loop.id, judge={"targets": [other]})
+        svc._cancel_timer(loop.id)
+        assert updated.monitor is not None and updated.monitor.target.endswith("#14017")
+        assert updated.config_generation == before + 1
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_subject_spends_no_generation(self, tmp_path) -> None:
+        """Only a real change spends one, so a settings save does not burn a generation."""
+        svc = AutoNudgeService(base_dir=tmp_path)
+        loop = await svc.add(
+            slot_key="chat-1-123",
+            message=self.MESSAGE,
+            idle_secs=300,
+            judge=self._spec(),
+            gate=True,
+        )
+        svc._cancel_timer(loop.id)
+        before = loop.config_generation
+        updated = await svc.update(loop.id, judge=self._spec())
+        svc._cancel_timer(loop.id)
+        assert updated.config_generation == before
+
+    def test_two_pull_requests_in_the_brief_leave_the_message_deciding(self) -> None:
+        """A loop holds one monitor, so a list of two selects none -- and takes nothing away."""
+        spec = {
+            "targets": [self.URL, "https://github.com/kirodotdev/KiroCrew/pull/14017"],
+        }
+        assert infer_monitor(self.MESSAGE, now=1_000.0, judge=spec) is None
+        message = f"Watch {self.URL} until it merges."
+        monitor = infer_monitor(message, now=1_000.0, judge=spec)
+        assert monitor is not None and monitor.target == self.SUBJECT
+
+    def test_a_shorthand_in_the_brief_still_selects_nothing(self) -> None:
+        """One grammar: the collector drops ``owner/name#N`` too, so it cannot be watched."""
+        spec = {"targets": ["kirodotdev/KiroCrew#13936"]}
+        assert judge.pr_targets_of(spec) == []
+        assert infer_monitor(self.MESSAGE, now=1_000.0, judge=spec) is None
+
+    def test_a_session_only_brief_leaves_the_message_deciding(self) -> None:
+        """A conductor patrolling sessions keeps the subject its instruction names."""
+        spec = {"targets": ["chat-2-2"]}
+        message = f"Patrol chat-2-2 while {self.URL} is in flight."
+        monitor = infer_monitor(message, now=1_000.0, judge=spec)
+        assert monitor is not None and monitor.target == self.SUBJECT
+
+    def test_a_brief_naming_a_different_pull_request_keeps_the_instructions(self) -> None:
+        """The brief NARROWS a watch; one entry cannot overrule the instruction's own subject.
+
+        The ordinary "blocked on" brief: the loop owns one pull request and the judge
+        is pointed at the blocker to read evidence from. The watch stays on the loop's
+        OWN pull request, which is what base did -- so it is still polled and the loop
+        still retires when it merges. Watching the brief's entry instead would let the
+        BLOCKER merging retire a loop whose own work was never observed.
+        """
+        blocker = "https://github.com/kirodotdev/KiroCrew/pull/14017"
+        spec = {"wake_when": "the blocker moves", "targets": [blocker]}
+        message = f"Babysit {self.URL} to green."
+        subject = infer_subject(message, spec)
+        assert subject is not None, "the instruction's own pull request still decides"
+        assert subject.subject == self.SUBJECT
+
+    def test_the_blocker_is_never_the_watched_subject(self) -> None:
+        """Named separately because watching the blocker is the specific harm."""
+        blocker = "https://github.com/kirodotdev/KiroCrew/pull/14017"
+        for message in (
+            f"Drive {self.URL} to green.",
+            "Babysit PR #13936 until every check is green.",
+            "Drive kirodotdev/KiroCrew#13936 to green.",
+        ):
+            monitor = infer_monitor(message, now=1_000.0, judge={"targets": [blocker]})
+            assert monitor is None or monitor.target != "kirodotdev/KiroCrew#14017", message
+
+    def test_a_shorthand_instruction_refuses_the_briefs_entry(self) -> None:
+        """The predicate must use ``infer``'s own wider notion of naming a pull request.
+
+        ``PR #42`` and ``owner/name#42`` select nothing themselves, but they DO name a
+        pull request, so the brief must not step in. A URL-only predicate read these as
+        "names none" and handed the watch to the blocker.
+        """
+        blocker = "https://github.com/kirodotdev/KiroCrew/pull/14017"
+        for message in (
+            "Babysit PR #13936 until every check is green.",
+            "Drive kirodotdev/KiroCrew#13936 to green.",
+        ):
+            assert probe_targets.names_pull_request(message) is True, message
+            assert infer_subject(message, {"targets": [blocker]}) is None, message
+
+    def test_the_motivating_spelling_still_gates(self) -> None:
+        """A bare ``PR <number>`` with no ``#`` names nothing, so the brief decides."""
+        assert probe_targets.names_pull_request(self.MESSAGE) is False
+        monitor = self._monitor()
+        assert (monitor.kind, monitor.target) == ("gh-pr", self.SUBJECT)
+
+    def test_a_source_location_is_not_a_pull_request(self) -> None:
+        """A cited line number must not read as a second subject and strip the gate."""
+        message = "Babysit PR 13936; the site is src/kiro_crew/autonudge.py#1751."
+        assert probe_targets.names_pull_request(message) is False
+        monitor = infer_monitor(message, now=1_000.0, judge=self._spec())
+        assert monitor is not None and monitor.target == self.SUBJECT
+
+    def test_a_brief_agreeing_with_the_instruction_still_gates(self) -> None:
+        """One subject named twice is the ordinary phrasing and must keep its monitor."""
+        message = f"Babysit {self.URL} until every check is green."
+        monitor = infer_monitor(message, now=1_000.0, judge=self._spec())
+        assert monitor is not None and monitor.target == self.SUBJECT
+
+    def test_a_stored_loop_keeps_the_monitor_its_instruction_named(self) -> None:
+        """A stored loop in the blocked-on shape must not lose the watch base gave it."""
+        blocker = "https://github.com/kirodotdev/KiroCrew/pull/14017"
+        loop = _loop({"targets": [blocker]})
+        loop.message = f"Babysit {self.URL} to green."
+        loop.monitor = self._monitor()
+        subject = loop_subject(loop)
+        assert subject is not None and subject.subject == self.SUBJECT
+
+    def test_the_brief_does_not_resolve_an_ambiguous_instruction(self) -> None:
+        """An instruction naming TWO pull requests infers nothing, and stays unresolved.
+
+        ``targets.infer`` refuses this text deliberately, so letting the brief pick one
+        of the two named subjects would resolve that ambiguity by the side door -- and
+        the one it picks is the blocker, which is the harm.
+        """
+        blocker = "https://github.com/kirodotdev/KiroCrew/pull/14017"
+        message = f"Babysit {self.URL}; blocked on {blocker} landing first."
+        assert probe_targets.infer(message) is None, "the premise: the message is ambiguous"
+        assert probe_targets.names_pull_request(message) is True
+        assert infer_subject(message, {"targets": [blocker]}) is None
+
+    @pytest.mark.asyncio
+    async def test_an_ungated_loop_gets_no_monitor_from_a_brief(self, tmp_path) -> None:
+        """``gate=False`` is a cadence contract, and a brief must not gate it by the side door."""
+        svc = AutoNudgeService(base_dir=tmp_path)
+        loop = await svc.add(
+            slot_key="chat-1-123",
+            message=self.MESSAGE,
+            idle_secs=300,
+            judge=self._spec(),
+            gate=False,
+        )
+        svc._cancel_timer(loop.id)
+        assert loop.monitor is None
